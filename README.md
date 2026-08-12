@@ -72,6 +72,10 @@ DISPLAY=:99 ./target/release/serf self/x11-demo.self   # opens a window, draws
 DISPLAY=:99 xwd -root -silent > shot.xwd               # look at the result
 ```
 
+`run-tests.sh` runs that demo against an `Xvfb` it starts itself, so the suite
+never pops a window. `SERF_X11=real ./run-tests.sh` uses `$DISPLAY` instead
+(XQuartz, a visible window); `SERF_X11=off` skips it.
+
 ## What it is
 
 | | |
