@@ -1,0 +1,13 @@
+[package]
+name = "serf"
+version = "0.1.0"
+edition = "2021"
+description = "A Self VM in Rust: scanner, parser, bytecode compiler, interpreter, and the C++ VM's snapshot format"
+license = "Apache-2.0"
+
+[[bin]]
+name = "serf"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
