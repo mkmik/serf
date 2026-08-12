@@ -302,16 +302,6 @@ fn mirror_proto_index(vm: &Vm, v: &Value) -> usize {
 
 pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, String> {
     let v = |x: Value| Ok(P::Val(x));
-    // A programming change moves the world's timestamp, as it does in the C++
-    // VM. Caches keyed on it refill only when it moves: the outliner's button
-    // cache is obsolete when `programmingTimestamp != buttonCacheFillTime`,
-    // and a fill time it never wrote reads back as 0.
-    if matches!(
-        name,
-        "_AddSlots:" | "_RemoveSlot:" | "_MirrorDefine:" | "_MirrorContentsAt:Put:" | "_MirrorCopyAnnotation:"
-    ) {
-        vm.timestamp += 1;
-    }
     match name {
         // ------------------------------------------------------ arithmetic
         "_IntAdd:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntAdd:")(a.checked_add(b)), |a, b| a + b)?),
@@ -686,6 +676,14 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 b.slots = slots;
                 b.payload = payload;
             }
+            // A successful define is the world's one programming change, so it
+            // is the only thing that moves the timestamp -- `define_prim` holds
+            // the C++ VM's only `increment_programming_timestamp` call
+            // (objects/oop.cpp). Caches keyed on it refill when it moves: a
+            // module is obsolete when `savedTimestamp /= freezingTimestamp`,
+            // and the outliner's button cache when it differs from the fill
+            // time, which reads back as 0 where it was never written.
+            vm.timestamp += 1;
             v(recv.clone())
         }
         // "Evaluates the method in the context of the reflectee of the
