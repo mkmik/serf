@@ -1210,7 +1210,7 @@ impl<'a> Builder<'a> {
             major: VM_MAJOR,
             minor: VM_MINOR,
             version: SNAPSHOT_VERSION,
-            timestamp: 0,
+            timestamp: self.vm.timestamp as i32,
             snapshot_code: false,
             vm_date: "serf".into(),
             sizes: [EDEN as i32, SURV as i32, old_size as i32, 1024 * 1024, 512 * 1024, 512 * 1024, 512 * 1024],

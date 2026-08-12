@@ -76,6 +76,16 @@ if [ -f core.snap ]; then
   echo "parsing ok"
 fi
 
+# A loaded world keeps its header's programming timestamp, so the caches that
+# stamp themselves with it are obsolete while empty. The outliner's button
+# cache is one: filled on cmd+click, and looked up by name right after.
+if [ -f Clean-4.4.snap ]; then
+  got=$($R --load Clean-4.4.snap 2>/dev/null \
+    --run "[selfObjectModel ensureButtonCacheIsFull. selfObjectModel buttonCache includesKey: 'addSlot'] value" | tail -1)
+  [ "$got" = "true" ] || { echo "button cache never filled: got [$got]"; exit 1; }
+  echo "button cache ok"
+fi
+
 # X11 foreign calls, if a server is reachable
 if [ -n "$DISPLAY" ] && command -v xdpyinfo >/dev/null && xdpyinfo >/dev/null 2>&1; then
   out=$($R self/x11-demo.self 2>&1 | tail -1)

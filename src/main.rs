@@ -117,6 +117,10 @@ fn repl(vm: &mut Vm) {
 /// Read a C++-format snapshot and bind its lobby as `snapshotLobby` in globals.
 fn load_image(vm: &mut Vm, path: &str) -> Result<usize, String> {
     let snap = image::Snapshot::read(std::path::Path::new(path))?;
+    // The header's Timestamp is the world's programming timestamp, so a loaded
+    // world carries on where it left off. Starting from 0 instead leaves every
+    // cache that stamps itself looking current when it is empty.
+    vm.timestamp = snap.timestamp as i64;
     let mut ld = image_obj::Loader::new(&snap, vm);
     let lobby = ld.value(snap.vm_oops[0])?;
     let t = ld.value(snap.vm_oops[2])?;

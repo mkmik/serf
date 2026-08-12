@@ -302,6 +302,16 @@ fn mirror_proto_index(vm: &Vm, v: &Value) -> usize {
 
 pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, String> {
     let v = |x: Value| Ok(P::Val(x));
+    // A programming change moves the world's timestamp, as it does in the C++
+    // VM. Caches keyed on it refill only when it moves: the outliner's button
+    // cache is obsolete when `programmingTimestamp != buttonCacheFillTime`,
+    // and a fill time it never wrote reads back as 0.
+    if matches!(
+        name,
+        "_AddSlots:" | "_RemoveSlot:" | "_MirrorDefine:" | "_MirrorContentsAt:Put:" | "_MirrorCopyAnnotation:"
+    ) {
+        vm.timestamp += 1;
+    }
     match name {
         // ------------------------------------------------------ arithmetic
         "_IntAdd:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntAdd:")(a.checked_add(b)), |a, b| a + b)?),
