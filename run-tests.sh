@@ -98,9 +98,27 @@ if [ -f Clean-4.4.snap ]; then
   echo "button cache ok"
 fi
 
-# X11 foreign calls, if a server is reachable
-if [ -n "$DISPLAY" ] && command -v xdpyinfo >/dev/null && xdpyinfo >/dev/null 2>&1; then
-  out=$($R self/x11-demo.self 2>&1 | tail -1)
-  [ "$out" = "drew" ] || { echo "x11 demo failed: $out"; exit 1; }
-  echo "x11 demo ok"
+# X11 foreign calls. Headless by default: our own Xvfb, which -displayfd lets
+# pick a free display and tells us when it is ready to accept connections.
+# SERF_X11=real runs the same check against $DISPLAY instead, so the window
+# actually appears (XQuartz); SERF_X11=off skips it.
+XVFB=${XVFB:-/opt/X11/bin/Xvfb}
+[ -x "$XVFB" ] || XVFB=$(command -v Xvfb || true)
+D=
+case "${SERF_X11:-headless}" in
+  off) ;;
+  real) D=$DISPLAY ;;
+  *) if [ -x "$XVFB" ]; then
+       "$XVFB" -displayfd 3 -screen 0 640x480x24 3>"$T/dpy" >/dev/null 2>&1 &
+       xvfb=$!
+       trap 'kill $xvfb 2>/dev/null; rm -rf "$T"' EXIT
+       n=0
+       while [ ! -s "$T/dpy" ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+       [ -s "$T/dpy" ] && D=":$(cat "$T/dpy")"
+     fi ;;
+esac
+if [ -n "$D" ]; then
+  out=$(DISPLAY=$D $R self/x11-demo.self 2>&1 | tail -1)
+  [ "$out" = "drew" ] || { echo "x11 demo failed on $D: $out"; exit 1; }
+  echo "x11 demo ok ($D)"
 fi
