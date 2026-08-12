@@ -48,8 +48,23 @@ const ERRNO_NAMES: &[&str] = &[
     "EAUTH", "ENEEDAUTH", "EPWROFF", "EDEVERR", "EOVERFLOW", "EBADEXEC", "EBADARCH", "ESHLIBVERS", "EBADMACHO",
 ];
 
+/// `errno` lives behind a different accessor per libc: `__error` on the BSDs
+/// and macOS, `__errno_location` on glibc and musl. Naming only the first left
+/// the Linux build failing to link.
+///
+/// ponytail: ERRNO_NAMES above is the BSD numbering, which agrees with Linux
+/// only up to ERANGE (34). A Linux EAGAIN (11) answers 'EDEADLK', which the
+/// console's non-blocking read is looking for by name. Pick the table by
+/// target as well when a world is actually driven on Linux.
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 extern "C" {
     #[link_name = "__error"]
+    fn libc_errno() -> *mut i32;
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
+extern "C" {
+    #[link_name = "__errno_location"]
     fn libc_errno() -> *mut i32;
 }
 
