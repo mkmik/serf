@@ -14,6 +14,14 @@ Paths below like `vm/…` and `objects/…` refer to the C++ Self implementation
 `Clean-4.4.snap` as shipped there, and `core.snap`/`morphic.snap` built from
 `objects/` by that VM — carry the Self copyright; see [LICENSE.self](LICENSE.self).
 
+That implementation is vendored as a git submodule under `reference/self`, so
+those paths resolve locally — `reference/self/vm/…`, `reference/self/objects/…` —
+as a reference and test bench while implementing serf:
+
+```sh
+git submodule update --init          # or clone with --recurse-submodules
+```
+
 ### serf's own world
 
 ```sh

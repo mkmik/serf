@@ -1,0 +1,3 @@
+[submodule "reference/self"]
+	path = reference/self
+	url = https://github.com/russellallen/self
