@@ -49,7 +49,8 @@ const ERRNO_NAMES: &[&str] = &[
 ];
 
 extern "C" {
-    #[link_name = "__error"]
+    #[cfg_attr(target_os = "macos", link_name = "__error")]
+    #[cfg_attr(target_os = "linux", link_name = "__errno_location")]
     fn libc_errno() -> *mut i32;
 }
 
