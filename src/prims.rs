@@ -599,7 +599,11 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             };
             let src = m.source.as_ref();
             v(match name {
-                "_MirrorCodes" => vm.bytes_with(vm.t_bytevector.clone(), m.code.clone()),
+                // codes are a *string*, not a byteVector: methodMap::fix_up_method
+                // ends with setCodes(new_string(...)), and the world counts on it
+                // -- bytecodeFormat instructionSetForCodes: sends `firstByte`,
+                // which only traits string has.
+                "_MirrorCodes" => vm.bytes_with(vm.t_string.clone(), m.code.clone()),
                 // the sub-blocks of a method live in its literals, which is
                 // how anything walking a method reaches them
                 "_MirrorLiterals" => vm.vector(m.lits.clone()),
