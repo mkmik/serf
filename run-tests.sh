@@ -74,6 +74,18 @@ if [ -f core.snap ]; then
   want="7 'line 1: expected an expression (near Eof)' "
   [ "$got" = "$want" ] || { echo "parsing: got [$got] want [$want]"; exit 1; }
   echo "parsing ok"
+
+  # Only a define moves the programming timestamp, as in the C++ VM, where
+  # define_prim holds the sole increment_programming_timestamp call. Bumping it
+  # for _AddSlots: too would leave the module cache obsolete after changes the
+  # real VM ignores, so every refill re-walks the lobby and re-warns about
+  # slots that belong to no module.
+  got=$($R --load core.snap 2>/dev/null \
+    -e "[| t. o | o: (| x = 3 |). t: 0 _ProgrammingTimestamp. o _Mirror _MirrorDefine: (| y = 4 |) _Mirror. 0 _ProgrammingTimestamp - t] value" \
+    -e "[| t. o | o: (| x = 3 |). t: 0 _ProgrammingTimestamp. o _AddSlots: (| y = 4 |). 0 _ProgrammingTimestamp - t] value" | tr '\n' ' ')
+  want="1 0 "
+  [ "$got" = "$want" ] || { echo "programming timestamp: got [$got] want [$want]"; exit 1; }
+  echo "programming timestamp ok"
 fi
 
 # A loaded world keeps its header's programming timestamp, so the caches that
