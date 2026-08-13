@@ -672,7 +672,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let o = as_obj(&r, name)?;
             let i = o.borrow().find(&n);
             match i {
-                Some(i) => o.borrow_mut().slots[i].value = args[1].clone(),
+                Some(i) => o.borrow_mut().assign(i, args[1].clone()),
                 None => return Err("slotNameError".into()),
             }
             v(recv.clone())
@@ -693,6 +693,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 b.slots = slots;
                 b.payload = payload;
             }
+            crate::value::lookup_gen_bump();
             // A successful define is the world's one programming change, so it
             // is the only thing that moves the timestamp -- `define_prim` holds
             // the C++ VM's only `increment_programming_timestamp` call
@@ -823,7 +824,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 if let Some(o) = obj.as_obj() {
                     let i = o.borrow().find("processStatus0");
                     if let Some(i) = i {
-                        o.borrow_mut().slots[i].value = nb;
+                        o.borrow_mut().assign(i, nb);
                     }
                 }
             }
@@ -878,7 +879,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                     if let Some(o) = recv.as_obj() {
                         let i = o.borrow().find("returnValue");
                         if let Some(i) = i {
-                            o.borrow_mut().slots[i].value = r;
+                            o.borrow_mut().assign(i, r);
                         }
                     }
                     "terminated"
@@ -1114,6 +1115,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let with_colon = format!("{}:", n);
             let o = as_obj(recv, name)?;
             let before = o.borrow().slots.len();
+            crate::value::lookup_gen_bump();
             o.borrow_mut().slots.retain(|s| &*s.name != n && &*s.name != with_colon);
             if o.borrow().slots.len() == before {
                 return Err("slotNameError".into());
@@ -1144,7 +1146,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let o = as_obj(recv, name)?;
             let i = o.borrow().find(&n);
             match i {
-                Some(i) => o.borrow_mut().slots[i].value = args[1].clone(),
+                Some(i) => o.borrow_mut().assign(i, args[1].clone()),
                 None => return Err("slotNameError".into()),
             }
             v(recv.clone())
