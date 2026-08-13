@@ -54,7 +54,10 @@ impl Frame {
     }
 }
 
-/// Everything a frame stack keeps alive.
+/// Everything a frame stack keeps alive. Not `tail_of`: those activations are
+/// held for their identity as a non-local return target, and nothing ever reads
+/// their slots through this list. Whatever *can* read them -- the block that
+/// captured one -- is an object, and reaching that object traces the scope.
 pub fn frame_roots(fs: &[Frame], f: &mut dyn FnMut(Root)) {
     for fr in fs.iter() {
         f(Root::Scope(fr.scope.clone()));

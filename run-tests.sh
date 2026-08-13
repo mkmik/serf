@@ -10,6 +10,12 @@ trap 'rm -rf "$T"' EXIT
 
 $R self/test.self
 
+# again with a young generation small enough to scavenge hundreds of times,
+# checking the write barrier against a full scan of the old generation as it
+# goes: a missed root or a missed barrier shows up as a wrong answer here
+SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R self/test.self >/dev/null
+echo "gc checks ok"
+
 cat > "$T/w.self" <<'EOF'
 globals _AddSlots: ( | demo = (| parent* = traits object.
     n <- 7.
