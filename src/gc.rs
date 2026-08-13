@@ -103,6 +103,8 @@ pub struct Gc {
     pub stress: bool,
     pub verify: bool,
     pub stats: bool,
+    /// report each pause as it starts and ends
+    pub trace: bool,
     pub off: bool,
     pub minors: Cell<u64>,
     pub majors: Cell<u64>,
@@ -153,6 +155,7 @@ impl Gc {
             stress,
             verify: std::env::var_os("SERF_GC_VERIFY").is_some(),
             stats: std::env::var_os("SERF_GC_STATS").is_some(),
+            trace: std::env::var_os("SERF_GC_TRACE").is_some(),
             off: std::env::var("SERF_GC").map_or(false, |v| v == "off"),
             minors: Cell::new(0),
             majors: Cell::new(0),
@@ -817,7 +820,23 @@ pub fn collect(vm: &mut Vm, major: bool) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let before = if g.stats { g.count() } else { 0 };
+    let before = if g.stats || g.trace { g.count() } else { 0 };
+    // The world stops here and starts again at the bottom of this function.
+    // There is one Self process on one thread, and this runs between two
+    // bytecodes, so "stopped" is the whole VM: no allocation, no interpretation
+    // and no foreign call happens until the collection is done.
+    if g.trace {
+        eprintln!(
+            "[gc] stop the world: {}, {} objects, young {}/{}, old {}, remembered {}{}",
+            if major { "major" } else { "minor" },
+            before,
+            g.young_used(),
+            g.young[0].len(),
+            g.old_used(),
+            g.remembered.borrow().len(),
+            if g.want_major.get() { ", asked for by the world" } else { "" },
+        );
+    }
 
     if major {
         mark_all(vm, g);
@@ -839,6 +858,14 @@ pub fn collect(vm: &mut Vm, major: bool) {
 
     g.want.set(false);
     g.want_major.set(false);
+    if g.trace {
+        eprintln!(
+            "[gc] resume the world: paused {}us, {} objects freed, {} promoted",
+            t0.elapsed().as_micros(),
+            before.saturating_sub(g.count()),
+            promoted,
+        );
+    }
     if g.stats {
         eprintln!(
             "[gc] {} {}us objs {}->{} promoted {} young {}/{} old {} remembered {}",

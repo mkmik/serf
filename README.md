@@ -136,7 +136,15 @@ is reachable from the `Vm`. The interpreter lends its activation stack to the
 compilation — which keep half-built graphs in Rust locals — suspend collection
 outright.
 
+A collection **stops the world**, and the world is everything: serf runs one
+Self process on one thread, so between the two lines `SERF_GC_TRACE` prints
+nothing interprets, allocates or calls out. Nothing is incremental or
+concurrent. On a loaded Morphic world a scavenge pauses for a few ms and a full
+collection for ~30 ms.
+
 ```sh
+SERF_GC_TRACE=1  ./target/release/serf …   # a line as each pause starts and
+                                           # ends, with what it cost
 SERF_GC=off      ./target/release/serf …   # never collect
 SERF_GC_STRESS=1 ./target/release/serf …   # collect after every allocation and
                                            # never recycle a handle, so touching
