@@ -721,6 +721,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_MirrorCopyAnnotation:" => {
             let r = reflectee(recv)?;
             vm.anno_obj.insert(key_of(&r), args[0].clone());
+            vm.note_anno(&args[0]);
             v(recv.clone())
         }
         // add or replace a slot on a copy of the reflectee, answering a
@@ -751,6 +752,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             });
             if let Some(a) = args.get(4) {
                 vm.anno_slot.insert((key_of(&copy), n.clone()), a.clone());
+                vm.note_anno(a);
             }
             let mslots = as_obj(recv, name)?.borrow().slots.clone();
             v(Value::obj(mslots, Payload::Mirror(copy)))

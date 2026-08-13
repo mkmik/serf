@@ -21,6 +21,19 @@ SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R self/test.self >/dev/null
 # actually exist -- test.self's heap is too small to build one
 [ -f core.snap ] && SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R --load core.snap \
   -e "(1 to: 200) do: [|:i| (i printString , 'x') hash ]" >/dev/null 2>&1
+# an annotation lives in a Rust-side table, out of reach of the remembered set,
+# so a scavenge finds it only through `Vm::note_anno`. Write a young one, churn
+# until it would have been collected, then read it back: without the barrier
+# this panics on a freed handle. Stress mode never reuses an id, so a miss is a
+# panic rather than an annotation that quietly turns into someone else.
+if [ -f core.snap ]; then
+  got=$(SERF_GC_STRESS=1 $R --load core.snap --run "[|:x. m. q| \
+    m: (reflect: (| y = 1 |)). \
+    m: (m _MirrorCopyAnnotation: ('ann-' , 'young')). \
+    200 timesRepeat: [ q: ('a' , 'b') ]. \
+    m _MirrorAnnotation] value: 0" 2>&1 | tail -1)
+  [ "$got" = "'ann-young'" ] || { echo "annotation barrier: got [$got]"; exit 1; }
+fi
 echo "gc checks ok"
 
 # scrape a running VM on the port it picked for itself

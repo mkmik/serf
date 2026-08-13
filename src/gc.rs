@@ -733,7 +733,7 @@ fn scavenge(vm: &mut Vm, g: &'static Gc) -> usize {
         }
     }
 
-    vm.each_root(&mut |r| walk_root(&mut s, r));
+    vm.each_root(false, &mut |r| walk_root(&mut s, r));
     for h in rs {
         if matches!(g.entry(h).loc, Loc::Old { .. }) {
             s.scan(h);
@@ -743,6 +743,15 @@ fn scavenge(vm: &mut Vm, g: &'static Gc) -> usize {
     if g.verify {
         s.verify_old();
     }
+
+    // the annotation barrier list is rebuilt the way the remembered set is:
+    // whatever this scavenge promoted is old now, and the next major is what
+    // traces it. A value whose table entry has since gone stays until it is
+    // promoted -- floating garbage, bounded by `PROMOTE_AGE` scavenges.
+    vm.anno_young.retain(|x| match x {
+        Value::Obj(h) => matches!(g.entry(*h).loc, Loc::Young { .. }),
+        _ => false,
+    });
 
     // whatever is still sitting in the from space was never reached: dropping
     // it is the free, and it costs one pass over the space we are done with
@@ -790,7 +799,7 @@ impl Visit for Mark {
 /// reachable through a young one.
 fn mark_all(vm: &Vm, g: &'static Gc) {
     let mut m = Mark { g, seen: Seen::default(), queue: vec![] };
-    vm.each_root(&mut |r| walk_root(&mut m, r));
+    vm.each_root(true, &mut |r| walk_root(&mut m, r));
     while let Some(h) = m.queue.pop() {
         let cel = g.cel(h);
         let r = cel.borrow();

@@ -198,6 +198,10 @@ fn load_image(vm: &mut Vm, path: &str) -> Result<usize, String> {
     vm.image_strings = Some(vstr);
     vm.anno_obj = std::mem::take(&mut ld.anno_obj);
     vm.anno_slot = std::mem::take(&mut ld.anno_slot);
+    // a load hands back young objects, so every annotation starts on the
+    // barrier list; the first few scavenges prune it to nothing as they
+    // promote them
+    vm.anno_young = vm.anno_obj.values().chain(vm.anno_slot.values()).cloned().collect();
     vm.id_hash = std::mem::take(&mut ld.id_hash);
     vm.obj_kind = std::mem::take(&mut ld.obj_kind);
     for target in [vm.globals.clone(), lobby.clone()] {

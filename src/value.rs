@@ -306,6 +306,13 @@ pub struct Vm {
     /// the image writer puts them back.
     pub anno_obj: std::collections::HashMap<usize, Value>,
     pub anno_slot: std::collections::HashMap<(usize, String), Value>,
+    /// Annotation values that may still be young. The two tables above are
+    /// Rust side, so they cannot be in the collector's remembered set; this
+    /// is their write barrier, and a scavenge takes it as the root set rather
+    /// than walking a loaded world's couple of hundred thousand entries. An
+    /// old annotation needs no barrier: old objects neither move nor die
+    /// outside a major collection, and a major walks both tables in full.
+    pub anno_young: Vec<Value>,
     /// Identity hashes carried over from a snapshot. Self keeps an object's
     /// hash in its mark word, so hashed collections survive a save; computing
     /// a fresh one on load would leave every dictionary in the image unable
@@ -426,6 +433,7 @@ impl Vm {
             image_strings: None,
             anno_obj: std::collections::HashMap::new(),
             anno_slot: std::collections::HashMap::new(),
+            anno_young: vec![],
             id_hash: std::collections::HashMap::new(),
             obj_kind: std::collections::HashMap::new(),
             ffi: crate::ffi::Ffi::default(),
@@ -452,7 +460,10 @@ impl Vm {
     /// contents are traced here, and `sweep_weak` then drops whole entries
     /// whose key object turned out to be dead. An entry therefore outlives its
     /// object by one collection, which costs nothing and avoids a fixpoint.
-    pub fn each_root(&self, f: &mut dyn FnMut(Root)) {
+    /// `major` when the caller is a mark & sweep, which may free an old
+    /// object and so has to see every reference the VM holds. A scavenge only
+    /// needs the ones that could name something young.
+    pub fn each_root(&self, major: bool, f: &mut dyn FnMut(Root)) {
         let mut v = |x: &Value| f(Root::Val(*x));
         for x in [
             &self.lobby,
@@ -483,19 +494,34 @@ impl Vm {
         for x in self.canonical.values().chain(self.flags.values()) {
             v(x);
         }
-        // ponytail: a loaded world has one of these per annotated slot -- a
-        // couple of hundred thousand for morphic -- and a scavenge walks them
-        // all to find the handful that are young. Worth a young/old split of
-        // the tables only if the young generation is ever made small enough
-        // for that constant to show.
-        for x in self.anno_obj.values().chain(self.anno_slot.values()) {
-            v(x);
+        // A loaded world has one of these per annotated slot -- a couple of
+        // hundred thousand for morphic, where walking them was about a third
+        // of every scavenge (5.8ms -> 3.9ms once it stopped). Only a major
+        // has to see them: an old object neither moves nor dies outside one,
+        // so a scavenge takes the write barrier's list instead.
+        if major {
+            for x in self.anno_obj.values().chain(self.anno_slot.values()) {
+                v(x);
+            }
+        } else {
+            for x in self.anno_young.iter() {
+                v(x);
+            }
         }
         for x in self.temp_roots.iter() {
             v(x);
         }
         for fs in self.stacks.iter().chain(self.procs.values()) {
             crate::interp::frame_roots(fs, f);
+        }
+    }
+
+    /// Record an annotation value as a scavenge root. Call after every insert
+    /// into `anno_obj` or `anno_slot`; an old value costs nothing but one
+    /// scavenge's worth of list.
+    pub fn note_anno(&mut self, v: &Value) {
+        if matches!(v, Value::Obj(_)) {
+            self.anno_young.push(*v);
         }
     }
 
