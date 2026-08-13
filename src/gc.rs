@@ -86,6 +86,11 @@ pub struct Gc {
     old_bump: Cell<u32>,
     old_free: RefCell<Vec<Loc>>,
     old_live: Cell<usize>,
+    /// live handles, kept as a running total so that reporting the heap size
+    /// does not have to walk the whole table
+    live: Cell<usize>,
+    /// objects allocated since the VM started
+    allocs: Cell<u64>,
     /// old generation size at which the next collection is a major one
     next_major: Cell<usize>,
     /// old objects written since the last scavenge, so it need not scan them all
@@ -103,8 +108,6 @@ pub struct Gc {
     pub stress: bool,
     pub verify: bool,
     pub stats: bool,
-    /// report each pause as it starts and ends
-    pub trace: bool,
     pub off: bool,
     pub minors: Cell<u64>,
     pub majors: Cell<u64>,
@@ -147,6 +150,8 @@ impl Gc {
             old_bump: Cell::new(OLD_CHUNK),
             old_free: RefCell::new(vec![]),
             old_live: Cell::new(0),
+            live: Cell::new(0),
+            allocs: Cell::new(0),
             next_major: Cell::new(MIN_OLD),
             remembered: RefCell::new(vec![]),
             want: Cell::new(false),
@@ -155,7 +160,6 @@ impl Gc {
             stress,
             verify: std::env::var_os("SERF_GC_VERIFY").is_some(),
             stats: std::env::var_os("SERF_GC_STATS").is_some(),
-            trace: std::env::var_os("SERF_GC_TRACE").is_some(),
             off: std::env::var("SERF_GC").map_or(false, |v| v == "off"),
             minors: Cell::new(0),
             majors: Cell::new(0),
@@ -181,6 +185,7 @@ impl Gc {
     /// same reason -- a scavenge that cannot run out of room needs no unwind
     /// path (universe.cpp:87).
     fn alloc(&'static self, o: Obj) -> ObjRef {
+        self.allocs.set(self.allocs.get() + 1);
         let i = self.bump.get();
         let loc = if (i as usize) < self.young[0].len() {
             self.bump.set(i + 1);
@@ -239,6 +244,7 @@ impl Gc {
 
     fn new_id(&'static self, loc: Loc) -> ObjRef {
         let e = Entry { loc, age: 0, dirty: false, mark: false };
+        self.live.set(self.live.get() + 1);
         if let Some(id) = self.free_ids.borrow_mut().pop() {
             self.table.borrow_mut()[id as usize] = e;
             return ObjRef(id);
@@ -290,6 +296,7 @@ impl Gc {
     /// free list unless we are keeping freed handles poisoned.
     fn free_id(&'static self, id: u32) {
         self.set_entry(ObjRef(id), Entry { loc: Loc::Free, age: 0, dirty: false, mark: false });
+        self.live.set(self.live.get() - 1);
         // in stress mode ids are never reused, so a reference the collector
         // failed to trace lands on a Free entry and panics at the exact site
         // instead of silently attaching to whatever object took the id over
@@ -347,7 +354,11 @@ impl Gc {
 
     /// Live handles, i.e. objects the heap is holding on to.
     pub fn count(&'static self) -> usize {
-        self.table.borrow().iter().filter(|e| e.loc != Loc::Free).count()
+        self.live.get()
+    }
+
+    pub fn young_capacity(&'static self) -> usize {
+        self.young[0].len()
     }
 }
 
@@ -820,23 +831,7 @@ pub fn collect(vm: &mut Vm, major: bool) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let before = if g.stats || g.trace { g.count() } else { 0 };
-    // The world stops here and starts again at the bottom of this function.
-    // There is one Self process on one thread, and this runs between two
-    // bytecodes, so "stopped" is the whole VM: no allocation, no interpretation
-    // and no foreign call happens until the collection is done.
-    if g.trace {
-        eprintln!(
-            "[gc] stop the world: {}, {} objects, young {}/{}, old {}, remembered {}{}",
-            if major { "major" } else { "minor" },
-            before,
-            g.young_used(),
-            g.young[0].len(),
-            g.old_used(),
-            g.remembered.borrow().len(),
-            if g.want_major.get() { ", asked for by the world" } else { "" },
-        );
-    }
+    let before = g.count();
 
     if major {
         mark_all(vm, g);
@@ -858,14 +853,20 @@ pub fn collect(vm: &mut Vm, major: bool) {
 
     g.want.set(false);
     g.want_major.set(false);
-    if g.trace {
-        eprintln!(
-            "[gc] resume the world: paused {}us, {} objects freed, {} promoted",
-            t0.elapsed().as_micros(),
-            before.saturating_sub(g.count()),
-            promoted,
-        );
-    }
+
+    // the pause is the whole collection: one thread, stopped at a safepoint
+    crate::metrics::record(crate::metrics::Collection {
+        major,
+        pause: t0.elapsed(),
+        freed: (before - g.count()) as u64,
+        promoted: promoted as u64,
+        allocated: g.allocs.get(),
+        young: g.young_used() as u64,
+        young_capacity: g.young_capacity() as u64,
+        old: g.old_used() as u64,
+        remembered: g.remembered.borrow().len() as u64,
+    });
+
     if g.stats {
         eprintln!(
             "[gc] {} {}us objs {}->{} promoted {} young {}/{} old {} remembered {}",

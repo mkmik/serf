@@ -7,6 +7,7 @@ mod image;
 mod image_obj;
 mod interp;
 mod lexer;
+mod metrics;
 mod parser;
 mod prims;
 mod value;
@@ -399,6 +400,16 @@ fn boot(vm: &mut Vm) {
 }
 
 fn main() {
+    // A port the OS picks, so any number of VMs can run at once; it goes to
+    // stderr, where the rest of the VM's own chatter goes. SERF_METRICS=off
+    // for somewhere that cannot or should not listen.
+    if std::env::var("SERF_METRICS").as_deref() != Ok("off") {
+        match metrics::serve() {
+            Ok(p) => eprintln!("serf: metrics on http://127.0.0.1:{}/metrics", p),
+            Err(e) => eprintln!("serf: no metrics server: {}", e),
+        }
+    }
+
     let mut vm = Vm::new();
     if let Err(e) = eval_source(&mut vm, INIT.as_bytes(), "init.self", false) {
         eprintln!("bootstrap failed: {}", e);

@@ -87,6 +87,7 @@ never pops a window. `SERF_X11=real ./run-tests.sh` uses `$DISPLAY` instead
 | `src/value.rs` | objects, slots, and the multiple-parent lookup |
 | `src/prims.rs` | primitives (`_IntAdd:`, `_Clone`, `_AddSlots:`, …) |
 | `src/gc.rs` | the object heap: a generational collector, after `memory/` |
+| `src/metrics.rs` | Prometheus metrics for it, over a one-page HTTP server |
 | `src/image.rs` | snapshot file format, after `memory/universe.cpp` and `space.cpp` |
 | `src/image_obj.rs` | snapshot words <-> serf objects: maps, slot descriptors, layout |
 | `self/init.self` | the world: traits object/boolean/block/number/indexable |
@@ -136,15 +137,7 @@ is reachable from the `Vm`. The interpreter lends its activation stack to the
 compilation — which keep half-built graphs in Rust locals — suspend collection
 outright.
 
-A collection **stops the world**, and the world is everything: serf runs one
-Self process on one thread, so between the two lines `SERF_GC_TRACE` prints
-nothing interprets, allocates or calls out. Nothing is incremental or
-concurrent. On a loaded Morphic world a scavenge pauses for a few ms and a full
-collection for ~30 ms.
-
 ```sh
-SERF_GC_TRACE=1  ./target/release/serf …   # a line as each pause starts and
-                                           # ends, with what it cost
 SERF_GC=off      ./target/release/serf …   # never collect
 SERF_GC_STRESS=1 ./target/release/serf …   # collect after every allocation and
                                            # never recycle a handle, so touching
@@ -159,6 +152,32 @@ SERF_GC_YOUNG=n  ./target/release/serf …   # objects per semispace (65536)
 
 `memory scavenge` and `memory garbageCollect` work from Self, through
 `_Scavenge` and `_GarbageCollect`; both take effect at the next safepoint.
+
+### Metrics
+
+Every VM serves Prometheus metrics on a port the OS picks, so any number of
+them can run at once, and says which on startup:
+
+```
+$ ./target/release/serf morphic.snap
+serf: metrics on http://127.0.0.1:53318/metrics
+```
+
+```
+serf_gc_collections_total{generation="young"}         37
+serf_gc_pause_seconds_bucket{generation="young",…}    histogram of pauses
+serf_gc_pause_seconds_max{generation="young"}         0.001746208
+serf_gc_objects_allocated_total                       1867249
+serf_gc_objects_freed_total                           1866756
+serf_gc_objects_promoted_total                        491
+serf_gc_young_objects / serf_gc_old_objects           heap occupancy
+serf_gc_young_capacity_objects                        65536
+serf_gc_remembered_objects                            2
+```
+
+A collection is stop-the-world — one thread, and it only runs at a safepoint —
+so `serf_gc_pause_seconds` is the whole pause, not a component of it.
+`SERF_METRICS=off` to keep the port shut.
 
 ## Images
 
