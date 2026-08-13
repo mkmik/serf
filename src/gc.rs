@@ -1000,7 +1000,7 @@ mod tests {
         assert!(matches!(loc_of(dh), Loc::Old { .. }));
         let old = gc().old_used();
 
-        vm.globals.as_obj().unwrap().borrow_mut().slots.retain(|s| &*s.name != "doomed");
+        vm.globals.as_obj().unwrap().borrow_mut().slots.retain(|s| crate::value::sym_str(s.name) != "doomed");
         collect(&mut vm, false);
         assert_ne!(loc_of(dh), Loc::Free, "a minor collection swept the old generation");
         collect(&mut vm, true);
@@ -1104,7 +1104,7 @@ fn every_holder_of_a_shared_method_stays_remembered() {
               remembered, o1.as_obj().unwrap().0, o2.as_obj().unwrap().0);
 
     // o1 dies; o2 is now the only path to the method and its literal
-    vm.globals.as_obj().unwrap().borrow_mut().slots.retain(|s| &*s.name != "o1");
+    vm.globals.as_obj().unwrap().borrow_mut().slots.retain(|s| crate::value::sym_str(s.name) != "o1");
     collect(&mut vm, true);
     assert_ne!(loc_of(yh), Loc::Free, "a live literal of a shared method was collected");
 }

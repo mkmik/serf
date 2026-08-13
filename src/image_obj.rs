@@ -589,7 +589,7 @@ struct Item {
     v: Value,
     kind: Kind,
     /// names of slots stored in the object (assignable ones)
-    obj_slots: Vec<Rc<str>>,
+    obj_slots: Vec<Sym>,
     words: usize,
     addr: u32,
 }
@@ -659,7 +659,7 @@ impl<'a> Builder<'a> {
         i
     }
 
-    fn add(&mut self, v: Value, kind: Kind, obj_slots: Vec<Rc<str>>, words: usize) -> usize {
+    fn add(&mut self, v: Value, kind: Kind, obj_slots: Vec<Sym>, words: usize) -> usize {
         let key = match &v { Value::Obj(o) => o.id(), _ => 0 };
         let i = self.items.len();
         if key != 0 {
@@ -681,12 +681,12 @@ impl<'a> Builder<'a> {
         // assignable slots are the ones with a matching `name:` writer
         let (assignable, kind, extra) = {
             let b = o.borrow();
-            let mut a: Vec<Rc<str>> = vec![];
+            let mut a: Vec<Sym> = vec![];
             for s in &b.slots {
                 if s.kind == SlotKind::Assign {
-                    let t = s.name.trim_end_matches(':');
-                    if let Some(d) = b.slots.iter().find(|x| &*x.name == t && x.kind != SlotKind::Assign) {
-                        a.push(d.name.clone());
+                    let t = sym_str(s.name).trim_end_matches(':');
+                    if let Some(d) = b.slots.iter().find(|x| sym_str(x.name) == t && x.kind != SlotKind::Assign) {
+                        a.push(d.name);
                     }
                 }
             }
@@ -772,7 +772,7 @@ impl<'a> Builder<'a> {
             (b.slots.clone(), kids, ms)
         };
         for s in &slots {
-            self.string(s.name.as_bytes());
+            self.string(sym_str(s.name).as_bytes());
             self.visit(&s.value)?;
             if let Some(a) = self.vm.anno_slot.get(&(value_key(v), s.name.to_string())).cloned() {
                 self.visit(&a)?;
@@ -1078,7 +1078,7 @@ impl<'a> Builder<'a> {
             if kind != Kind::Method && kind != Kind::Block {
                 let slots = v.as_obj().unwrap().borrow().slots.clone();
                 for s in &slots {
-                    let ni = self.string(s.name.as_bytes());
+                    let ni = self.string(sym_str(s.name).as_bytes());
                     let nm = self.items[ni].addr | MEM_TAG;
                     let sa = match self.vm.anno_slot.get(&(value_key(&v), s.name.to_string())).cloned() {
                         Some(a) => self.tagged(&a)?,
@@ -1087,7 +1087,7 @@ impl<'a> Builder<'a> {
                     if s.kind == SlotKind::Assign {
                         let _ = sa;
                         continue; // derived from the data slot being an obj slot
-                    } else if obj_slots.iter().any(|n| n == &s.name) {
+                    } else if obj_slots.iter().any(|n| *n == s.name) {
                         descs.extend_from_slice(&[
                             nm,
                             slot_type_bits(SlotClass::Obj, s.kind == SlotKind::Parent, false),

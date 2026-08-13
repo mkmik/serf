@@ -45,9 +45,88 @@ pub enum SlotKind {
     Assign,
 }
 
-#[derive(Clone)]
+/// An interned slot name. Two things want this. A `Slot` has to be `Copy` for
+/// the young generation to abandon a from-space by resetting a length rather
+/// than by running a destructor per dead slot, and an `Rc<str>` has one. And
+/// comparing names is what lookup spends its time on, which a `u32` compare
+/// settles without touching the string at all.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Sym(u32);
+
+/// Pre-interned, because interning hashes the name and this one is on the
+/// allocation path: every string and byte vector is born with a parent slot.
+pub const SYM_PARENT: Sym = Sym(0);
+const PREINTERNED: [&str; 1] = ["parent"];
+
+thread_local! {
+    /// Names are leaked, so `sym_str` can hand out a `&'static str` with no
+    /// guard to hold and nothing to clone -- the same trade the heap makes.
+    /// A world interns its slot names once; there is no unbounded source of
+    /// them to make the leak grow.
+    static SYMS: RefCell<(Vec<&'static str>, HashMap<&'static str, Sym>)> =
+        RefCell::new({
+            let mut names = vec![];
+            let mut ids = HashMap::new();
+            for (i, n) in PREINTERNED.iter().enumerate() {
+                names.push(*n);
+                ids.insert(*n, Sym(i as u32));
+            }
+            (names, ids)
+        });
+}
+
+pub fn sym(name: &str) -> Sym {
+    SYMS.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(&s) = t.1.get(name) {
+            return s;
+        }
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        let s = Sym(t.0.len() as u32);
+        t.0.push(leaked);
+        t.1.insert(leaked, s);
+        s
+    })
+}
+
+pub fn sym_str(s: Sym) -> &'static str {
+    SYMS.with(|t| t.borrow().0[s.0 as usize])
+}
+
+impl From<&str> for Sym {
+    fn from(s: &str) -> Sym {
+        sym(s)
+    }
+}
+
+#[cfg(test)]
+mod sym_tests {
+    use super::*;
+
+    /// `SYM_PARENT` is a constant, so it is only right for as long as the
+    /// table really does hand out the pre-interned names first, in order.
+    #[test]
+    fn the_preinterned_names_keep_their_numbers() {
+        for (i, n) in PREINTERNED.iter().enumerate() {
+            assert_eq!(sym(n), Sym(i as u32), "{n}");
+            assert_eq!(sym_str(Sym(i as u32)), *n);
+        }
+        assert_eq!(sym("parent"), SYM_PARENT);
+        // interning is by content: a name built at runtime is the same symbol
+        assert_eq!(sym(&format!("par{}", "ent")), SYM_PARENT);
+        assert_ne!(sym("parent "), SYM_PARENT);
+    }
+}
+
+impl std::fmt::Display for Sym {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(sym_str(*self))
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct Slot {
-    pub name: Rc<str>,
+    pub name: Sym,
     pub kind: SlotKind,
     pub value: Value,
 }
@@ -297,17 +376,22 @@ impl Value {
 }
 
 pub fn slot(name: &str, kind: SlotKind, value: Value) -> Slot {
-    Slot { name: name.into(), kind, value }
+    Slot { name: sym(name), kind, value }
 }
 
 impl Obj {
+    /// By interned name. Every hot caller already has one; `find` is for the
+    /// cold ones that hold a string and pay a hash to get here.
+    pub fn find_sym(&self, name: Sym) -> Option<usize> {
+        self.slots.iter().position(|s| s.name == name)
+    }
     pub fn find(&self, name: &str) -> Option<usize> {
-        self.slots.iter().position(|s| &*s.name == name)
+        self.find_sym(sym(name))
     }
     /// Add or replace by name.
     pub fn put(&mut self, s: Slot) {
         lookup_gen_bump();
-        match self.find(&s.name) {
+        match self.find_sym(s.name) {
             Some(i) => self.slots[i] = s,
             None => self.slots.push(s),
         }
@@ -642,12 +726,12 @@ impl Vm {
     }
 
     pub fn bytes_with(&self, parent: Value, b: Vec<u8>) -> Value {
-        Value::obj(vec![slot("parent", SlotKind::Parent, parent)], Payload::Bytes(b))
+        Value::obj(vec![Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: parent }], Payload::Bytes(b))
     }
 
     pub fn vector(&self, v: Vec<Value>) -> Value {
         Value::obj(
-            vec![slot("parent", SlotKind::Parent, self.t_vector.clone())],
+            vec![Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: self.t_vector }],
             Payload::Vector(v),
         )
     }

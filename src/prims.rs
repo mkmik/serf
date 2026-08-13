@@ -200,14 +200,14 @@ fn unmirror(v: &Value) -> Value {
 /// does: an assignment name (`x:`) names the data slot it writes. Answers the
 /// slot's index and whether it was reached by its assignment name.
 fn slot_desc(slots: &[Slot], n: &str) -> Result<(usize, bool), String> {
-    let i = slots.iter().position(|s| &*s.name == n).ok_or("slotNameError")?;
+    let i = slots.iter().position(|s| sym_str(s.name) == n).ok_or("slotNameError")?;
     if slots[i].kind != SlotKind::Assign {
         return Ok((i, false));
     }
     let base = &n[..n.len() - 1];
     let j = slots
         .iter()
-        .position(|s| &*s.name == base && s.kind != SlotKind::Assign)
+        .position(|s| sym_str(s.name) == base && s.kind != SlotKind::Assign)
         .ok_or("slotNameError")?;
     Ok((j, true))
 }
@@ -550,7 +550,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_MirrorNames" => {
             let r = reflectee(recv)?;
             let names: Vec<Value> = match r.as_obj() {
-                Some(o) => o.borrow().slots.iter().map(|s| vm.string(&s.name)).collect(),
+                Some(o) => o.borrow().slots.iter().map(|s| vm.string(sym_str(s.name))).collect(),
                 None => vec![],
             };
             v(vm.vector(names))
@@ -571,7 +571,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                     // assignable == there is an `x:` to write it with
                     "_MirrorIsAssignableAt:" => {
                         let a = format!("{}:", b.slots[i].name);
-                        b.slots.iter().any(|s| s.kind == SlotKind::Assign && *s.name == *a)
+                        b.slots.iter().any(|s| s.kind == SlotKind::Assign && sym_str(s.name) == a)
                     }
                     // serf drops argument slots when it loads a method: they
                     // only mean anything inside an activation, which serf keeps
@@ -642,7 +642,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let assign = format!("{}:", base);
             let kept = slots
                 .into_iter()
-                .filter(|s| *s.name != *base && *s.name != *assign)
+                .filter(|s| sym_str(s.name) != base && sym_str(s.name) != assign)
                 .collect();
             let copy = Value::obj(kept, payload);
             let mslots = as_obj(recv, name)?.borrow().slots.clone();
@@ -1118,7 +1118,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let o = as_obj(recv, name)?;
             let before = o.borrow().slots.len();
             crate::value::lookup_gen_bump();
-            o.borrow_mut().slots.retain(|s| &*s.name != n && &*s.name != with_colon);
+            o.borrow_mut().slots.retain(|s| sym_str(s.name) != n && sym_str(s.name) != with_colon);
             if o.borrow().slots.len() == before {
                 return Err("slotNameError".into());
             }
@@ -1126,7 +1126,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         }
         "_SlotNames" => {
             let names: Vec<Value> = match recv.as_obj() {
-                Some(o) => o.borrow().slots.iter().map(|s| vm.string(&s.name)).collect(),
+                Some(o) => o.borrow().slots.iter().map(|s| vm.string(sym_str(s.name))).collect(),
                 None => vec![],
             };
             v(vm.vector(names))

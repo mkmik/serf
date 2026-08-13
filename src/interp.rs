@@ -690,7 +690,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     };
 
                     if kind == SlotKind::Assign {
-                        let target = sname.trim_end_matches(':').to_string();
+                        let target = sym_str(sname).trim_end_matches(':').to_string();
                         let mut b = hit.holder.borrow_mut();
                         match b.find(&target) {
                             Some(i) => b.assign(i, cur_args[0].clone()),
