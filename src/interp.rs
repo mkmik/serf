@@ -167,7 +167,7 @@ fn clear_cause_of_error(vm: &Vm) {
     if let Some(o) = p.as_obj() {
         let i = o.borrow().find("causeOfError");
         if let Some(i) = i {
-            o.borrow_mut().slots[i].value = nil;
+            o.borrow_mut().assign(i, nil);
         }
     }
 }
@@ -645,7 +645,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         let target = sname.trim_end_matches(':').to_string();
                         let mut b = hit.holder.borrow_mut();
                         match b.find(&target) {
-                            Some(i) => b.slots[i].value = cur_args[0].clone(),
+                            Some(i) => b.assign(i, cur_args[0].clone()),
                             None => {
                                 drop(b);
                                 return Err(err(frames, format!("assignment slot '{}' has no data slot", sname)));

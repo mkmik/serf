@@ -850,6 +850,8 @@ pub fn collect(vm: &mut Vm, major: bool) {
     // so this drops only the ones whose object turned out to be dead. Handle
     // ids are recycled, so a survivor would later reattach to a stranger.
     vm.sweep_weak(&|id| g.is_dead(id));
+    // the same recycling would let a memoised lookup reattach a stale hit
+    crate::value::lookup_gen_bump();
 
     g.want.set(false);
     g.want_major.set(false);

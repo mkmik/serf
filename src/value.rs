@@ -9,9 +9,22 @@
 //! `Value` is `Copy` and identity is the handle.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub use crate::gc::ObjRef;
+
+thread_local! {
+    /// The programming timestamp of the object graph itself: bumped by
+    /// anything that can change what a lookup finds -- adding or removing a
+    /// slot, writing a parent slot, `_MirrorDefine:` -- and by a collection,
+    /// because dead handle ids are recycled. `Vm::lookup` memoises against it.
+    static LOOKUP_GEN: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn lookup_gen_bump() {
+    LOOKUP_GEN.with(|g| g.set(g.get() + 1));
+}
 
 #[derive(Clone, Copy)]
 pub enum Value {
@@ -153,15 +166,25 @@ impl Obj {
     }
     /// Add or replace by name.
     pub fn put(&mut self, s: Slot) {
+        lookup_gen_bump();
         match self.find(&s.name) {
             Some(i) => self.slots[i] = s,
             None => self.slots.push(s),
         }
     }
+    /// Write a slot's value. A parent write rewires the object graph and so
+    /// invalidates memoised lookups; a data write cannot change one.
+    pub fn assign(&mut self, i: usize, v: Value) {
+        if self.slots[i].kind == SlotKind::Parent {
+            lookup_gen_bump();
+        }
+        self.slots[i].value = v;
+    }
 }
 
 // ---------------------------------------------------------------- lookup
 
+#[derive(Clone, Copy)]
 pub enum LookupErr {
     NotFound,
     Ambiguous,
@@ -178,9 +201,22 @@ pub enum Root {
 }
 
 /// Where a selector was found: a slot index in some holder object.
+#[derive(Clone, Copy)]
 pub struct Hit {
     pub holder: ObjRef,
     pub idx: usize,
+}
+
+/// Memoised `lookup` results, selector -> start object -> outcome. Entries are
+/// valid only for the `LOOKUP_GEN` they were filled at; the whole cache is
+/// dropped when the generation moves, which also covers recycled handle ids.
+/// ponytail: whole-cache flush on any shape change; per-object invalidation
+/// if a mutation-heavy workload ever thrashes it.
+#[derive(Default)]
+pub struct LookupCache {
+    gen: u64,
+    len: usize,
+    map: HashMap<Rc<str>, HashMap<ObjRef, Result<Hit, LookupErr>>>,
 }
 
 pub struct Vm {
@@ -246,6 +282,9 @@ pub struct Vm {
     /// first, so a string serf hands the world must be the world's own object
     /// or it compares unequal to every literal.
     pub canonical: std::collections::HashMap<Vec<u8>, Value>,
+    /// see `lookup`; not a GC root -- entries never outlive their generation,
+    /// and a collection bumps it
+    pub lookup_cache: RefCell<LookupCache>,
 }
 
 impl Vm {
@@ -340,6 +379,7 @@ impl Vm {
             c_heap: vec![],
             flags: std::collections::HashMap::new(),
             canonical: std::collections::HashMap::new(),
+            lookup_cache: RefCell::new(LookupCache::default()),
         }
     }
 
@@ -457,14 +497,48 @@ impl Vm {
     }
 
     pub fn lookup(&self, recv: &Value, sel: &str) -> Result<Hit, LookupErr> {
+        // an immediate's search starts in its traits, so cache it there and
+        // every int shares one entry
+        let key = match recv.as_obj() {
+            Some(o) => o,
+            None => self.implicit_parent(recv).unwrap().as_obj().unwrap(),
+        };
+        let gen = LOOKUP_GEN.with(|g| g.get());
+        {
+            let mut c = self.lookup_cache.borrow_mut();
+            if c.gen != gen {
+                c.map.clear();
+                c.len = 0;
+                c.gen = gen;
+            } else if let Some(r) = c.map.get(sel).and_then(|m| m.get(&key)) {
+                return *r;
+            }
+        }
         let mut hits: Vec<Hit> = vec![];
         let mut seen: Vec<ObjRef> = vec![];
         self.search(recv, sel, &mut hits, &mut seen);
-        match hits.len() {
+        let r = match hits.len() {
             0 => Err(LookupErr::NotFound),
-            1 => Ok(hits.pop().unwrap()),
+            1 => Ok(hits[0]),
             _ => Err(LookupErr::Ambiguous),
+        };
+        let mut c = self.lookup_cache.borrow_mut();
+        // ponytail: crude size cap; an LRU if a world ever legitimately holds
+        // this many live (receiver, selector) pairs
+        if c.len >= 1 << 20 {
+            c.map.clear();
+            c.len = 0;
         }
+        match c.map.get_mut(sel) {
+            Some(m) => {
+                m.insert(key, r);
+            }
+            None => {
+                c.map.entry(sel.into()).or_default().insert(key, r);
+            }
+        }
+        c.len += 1;
+        r
     }
 
     /// Undirected resend: skip the holder's own slots, search only its parents.
@@ -473,16 +547,7 @@ impl Vm {
         let mut seen: Vec<ObjRef> = vec![];
         if let Some(o) = holder.as_obj() {
             seen.push(o);
-            let parents: Vec<Value> = o
-                .borrow()
-                .slots
-                .iter()
-                .filter(|s| s.kind == SlotKind::Parent)
-                .map(|s| s.value.clone())
-                .collect();
-            for p in parents {
-                self.search(&p, sel, &mut hits, &mut seen);
-            }
+            self.search_parents(o, sel, &mut hits, &mut seen);
         }
         match hits.len() {
             0 => Err(LookupErr::NotFound),
@@ -509,14 +574,21 @@ impl Vm {
             }
             return; // a local slot shadows every parent
         }
-        let parents: Vec<Value> = o
-            .borrow()
-            .slots
-            .iter()
-            .filter(|s| s.kind == SlotKind::Parent)
-            .map(|s| s.value.clone())
-            .collect();
-        for p in parents {
+        self.search_parents(o, sel, hits, seen);
+    }
+
+    /// Recurse into each parent, re-borrowing per slot rather than collecting
+    /// the parents into a vector: nothing can mutate the object mid-search.
+    fn search_parents(&self, o: ObjRef, sel: &str, hits: &mut Vec<Hit>, seen: &mut Vec<ObjRef>) {
+        let n = o.borrow().slots.len();
+        for i in 0..n {
+            let b = o.borrow();
+            let s = &b.slots[i];
+            if s.kind != SlotKind::Parent {
+                continue;
+            }
+            let p = s.value;
+            drop(b);
             self.search(&p, sel, hits, seen);
         }
     }
