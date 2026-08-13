@@ -341,7 +341,7 @@ impl<'a> Loader<'a> {
         let m = self.heap.read_map(map_star)?;
 
         // publish a placeholder first: the object graph is cyclic
-        let shell = Value::obj(vec![], Payload::None);
+        let shell = Value::obj([], Payload::None);
         self.done.insert(addr, shell.clone());
 
         // mark word is `marked<1> age<7> hash<22> tag<2>` (markOop.hh); a
@@ -407,7 +407,7 @@ impl<'a> Loader<'a> {
             }
             let mv = match m.block.map(|b| b[2]).filter(|w| w & TAG_MASK == MEM_TAG) {
                 Some(w) => self.object(w & !TAG_MASK)?,
-                None => Value::obj(vec![], Payload::Method(bm)),
+                None => Value::obj([], Payload::Method(bm)),
             };
             let bt = self.value(self.block_traits)?;
             slots.push(Slot { name: "parent".into(), kind: SlotKind::Parent, value: bt });
@@ -446,7 +446,7 @@ impl<'a> Loader<'a> {
         {
             let o = shell.as_obj().unwrap();
             let mut b = o.borrow_mut();
-            b.slots = slots;
+            b.slots = slots.into();
             b.payload = payload;
         }
         if m.annotation & TAG_MASK == MEM_TAG {

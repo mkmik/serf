@@ -35,6 +35,7 @@ struct Gen {
 struct Metrics {
     gens: [Gen; 2],
     allocated: AtomicU64,
+    slots_spilled: AtomicU64,
     promoted: AtomicU64,
     freed: AtomicU64,
     young: AtomicU64,
@@ -59,6 +60,7 @@ static M: Metrics = Metrics {
         },
     ],
     allocated: AtomicU64::new(0),
+    slots_spilled: AtomicU64::new(0),
     promoted: AtomicU64::new(0),
     freed: AtomicU64::new(0),
     young: AtomicU64::new(0),
@@ -87,6 +89,13 @@ pub struct Collection {
 /// two never interleave. Not a lock the VM itself ever touches.
 #[cfg(test)]
 pub static TOTALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// An object outgrew the slots that fit in its cell and had to take a vector.
+/// Counted because `INLINE_SLOTS` is a guess, and this is what says whether it
+/// is the right one for a real world.
+pub fn slots_spilled() {
+    M.slots_spilled.fetch_add(1, Relaxed);
+}
 
 pub fn record(c: Collection) {
     let g = &M.gens[if c.major { OLD } else { YOUNG }];
@@ -157,6 +166,7 @@ pub fn encode() -> String {
     }
     for (name, help, kind, v) in [
         ("serf_gc_objects_allocated_total", "Objects allocated.", "counter", M.allocated.load(Relaxed)),
+        ("serf_gc_slots_spilled_total", "Objects whose slots outgrew the cell and took a vector.", "counter", M.slots_spilled.load(Relaxed)),
         ("serf_gc_objects_freed_total", "Objects reclaimed.", "counter", M.freed.load(Relaxed)),
         ("serf_gc_objects_promoted_total", "Objects tenured into the old generation.", "counter", M.promoted.load(Relaxed)),
         ("serf_gc_young_objects", "Objects in the young generation, as of the last collection.", "gauge", M.young.load(Relaxed)),

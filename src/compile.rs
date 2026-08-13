@@ -118,7 +118,7 @@ pub fn build_object(vm: &mut Vm, o: &ObjLit, file: &Rc<str>) -> Result<Value, St
         let value = match &d.init {
             Some(Expr::ObjLit(inner)) if is_method_literal(inner) => {
                 let m = compile_method(vm, inner, &d.name, file)?;
-                Value::obj(vec![], Payload::Method(m))
+                Value::obj([], Payload::Method(m))
             }
             Some(e) => eval_const(vm, e, file)?,
             None => vm.nil.clone(),
@@ -148,7 +148,7 @@ pub fn build_body(vm: &mut Vm, o: &ObjLit, file: &str) -> Result<Value, String> 
     let file: Rc<str> = file.into();
     if is_method_literal(o) {
         let m = compile_method(vm, o, "<doIt>", &file)?;
-        return Ok(Value::obj(vec![], Payload::Method(m)));
+        return Ok(Value::obj([], Payload::Method(m)));
     }
     build_object(vm, o, &file)
 }
@@ -283,7 +283,7 @@ impl<'a> C<'a> {
     fn block(&mut self, o: &ObjLit) -> Result<Value, String> {
         let sel = block_selector(o.args.len());
         let m = self.push_method(o, &sel, true)?;
-        let mval = Value::obj(vec![], Payload::Method(m.clone()));
+        let mval = Value::obj([], Payload::Method(m.clone()));
         Ok(Value::obj(
             vec![
                 slot("parent", SlotKind::Parent, self.vm.t_block.clone()),

@@ -509,7 +509,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             }
         }
         // an empty proxy, so serf can hold a C pointer without an image
-        "_ProxyNew" => v(Value::obj(vec![], Payload::Proxy(Some(0)))),
+        "_ProxyNew" => v(Value::obj([], Payload::Proxy(Some(0)))),
 
         // ------------------------------------------------- foreign objects
         "_ForeignIsLive" => v(vm.boolean(proxy_ptr(recv).is_some())),
@@ -640,8 +640,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             // an obj slot and the `x:` that writes it are one slot to Self
             let base = slots[i].name.to_string();
             let assign = format!("{}:", base);
-            let kept = slots
-                .into_iter()
+            let kept: Slots = slots
+                .iter()
+                .copied()
                 .filter(|s| sym_str(s.name) != base && sym_str(s.name) != assign)
                 .collect();
             let copy = Value::obj(kept, payload);
@@ -816,7 +817,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let proto = vm.image_roots.as_ref().map(|r| r[10].clone());
             let slots = match &proto {
                 Some(p) => as_obj(p, name)?.borrow().slots.clone(),
-                None => vec![],
+                None => Slots::default(),
             };
             let obj = Value::obj(slots, Payload::None);
             // A process starts newborn. Cloning the prototype carries over
@@ -909,7 +910,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 return v(p);
             }
             if vm.vm_proc.is_none() {
-                vm.vm_proc = Some(Value::obj(vec![], Payload::None));
+                vm.vm_proc = Some(Value::obj([], Payload::None));
             }
             v(vm.vm_proc.clone().unwrap())
         }
@@ -1107,7 +1108,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_AddSlots:" => {
             let src = as_obj(&args[0], name)?.borrow().slots.clone();
             let dst = as_obj(recv, name)?;
-            for s in src {
+            for s in src.iter().copied() {
                 dst.borrow_mut().put(s);
             }
             v(recv.clone())
@@ -1271,7 +1272,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
             t.as_obj().unwrap().borrow_mut().payload = Payload::Proxy(Some(0));
             return Ok(P::Val(t.clone()));
         }
-        return Ok(P::Val(Value::obj(vec![], Payload::Proxy(Some(0)))));
+        return Ok(P::Val(Value::obj([], Payload::Proxy(Some(0)))));
     }
     if prim
         .split_once("_delete")
@@ -1297,7 +1298,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
                 t.as_obj().unwrap().borrow_mut().payload = Payload::Proxy(Some(p));
                 Ok(P::Val(t))
             }
-            None => Ok(P::Val(Value::obj(vec![], Payload::Proxy(Some(p))))),
+            None => Ok(P::Val(Value::obj([], Payload::Proxy(Some(p))))),
         };
     }
     if let Some(e) = crate::struct_table::FIELD.iter().find(|e| prim.starts_with(e.0)) {
@@ -1332,7 +1333,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
                             t.as_obj().unwrap().borrow_mut().payload = Payload::Proxy(Some(raw));
                             Ok(P::Val(t))
                         }
-                        None => Ok(P::Val(Value::obj(vec![], Payload::Proxy(Some(raw))))),
+                        None => Ok(P::Val(Value::obj([], Payload::Proxy(Some(raw))))),
                     }
                 }
                 "bool" => Ok(P::Val(vm.boolean(raw != 0))),
@@ -1506,7 +1507,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
                     as_obj(&t, name)?.borrow_mut().payload = Payload::Proxy(Some(r));
                     v_of(t)
                 }
-                None => v_of(Value::obj(vec![], Payload::Proxy(Some(r)))),
+                None => v_of(Value::obj([], Payload::Proxy(Some(r)))),
             }
         }
         "int_or_errno" => {

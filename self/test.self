@@ -145,4 +145,18 @@ t check: 'ic shadow' Is: (ic fetch: icChild)  Should: 'own'.
 t check: 'ic int'    Is: (ic twice: 3)        Should: 6.
 t check: 'ic float'  Is: (ic twice: 2.5)      Should: 5.0.
 
+"--- slots live in the object's cell while they fit and spill to a vector when
+     they do not, so both sides of that branch need exercising: an object born
+     with more than fits, and one grown past it a slot at a time."
+globals _AddSlots: ( | big = (| parent* = traits object.
+    a = 1. b = 2. c = 3. d = 4. e = 5. f = 6.
+    sum = ( a + b + c + d + e + f ) |) | ).
+t check: 'spilled'    Is: big sum              Should: 21.
+big _AddSlots: (| g = 7 |).
+t check: 'spill grew' Is: big sum + big g      Should: 28.
+globals _AddSlots: ( | grew = (| parent* = traits object. a = 1 |) | ).
+grew _AddSlots: (| b = 2 |). grew _AddSlots: (| c = 3 |).
+grew _AddSlots: (| d = 4 |). grew _AddSlots: (| e = 5 |).
+t check: 'grew past'  Is: grew a + grew e      Should: 6.
+
 t n print. ' tests passed' printLine.

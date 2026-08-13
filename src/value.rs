@@ -132,8 +132,131 @@ pub struct Slot {
 }
 
 pub struct Obj {
-    pub slots: Vec<Slot>,
+    pub slots: Slots,
     pub payload: Payload,
+}
+
+/// How many slots live in the cell itself. A young space is a fixed array of
+/// cells allocated once and reused forever, so a slot that fits inline costs
+/// no `malloc` when the object is born and no `free` when it dies -- the
+/// scavenge abandons the from-space by forgetting it, which is what a copying
+/// collector is supposed to do.
+///
+/// ponytail: 4, which holds a string's parent slot and a small clone, at 24
+/// bytes a slot and two semispaces. Raise it if a real world's objects turn
+/// out to spill often -- `serf_gc_slots_spilled` says how often they do.
+pub const INLINE_SLOTS: usize = 4;
+
+const EMPTY_SLOT: Slot = Slot { name: SYM_PARENT, kind: SlotKind::Data, value: Value::Int(0) };
+
+/// An object's slots: inline while they fit, on the heap when they do not.
+/// Derefs to `[Slot]`, so reading them reads the same as a vector did.
+#[derive(Clone)]
+pub enum Slots {
+    Inline { n: u8, a: [Slot; INLINE_SLOTS] },
+    Spilled(Vec<Slot>),
+}
+
+impl Default for Slots {
+    fn default() -> Slots {
+        Slots::Inline { n: 0, a: [EMPTY_SLOT; INLINE_SLOTS] }
+    }
+}
+
+impl Slots {
+    pub fn from_slice(s: &[Slot]) -> Slots {
+        if s.len() <= INLINE_SLOTS {
+            let mut a = [EMPTY_SLOT; INLINE_SLOTS];
+            a[..s.len()].copy_from_slice(s);
+            Slots::Inline { n: s.len() as u8, a }
+        } else {
+            crate::metrics::slots_spilled();
+            Slots::Spilled(s.to_vec())
+        }
+    }
+
+    pub fn push(&mut self, s: Slot) {
+        match self {
+            Slots::Inline { n, a } if (*n as usize) < INLINE_SLOTS => {
+                a[*n as usize] = s;
+                *n += 1;
+            }
+            Slots::Inline { n, a } => {
+                let mut v = a[..*n as usize].to_vec();
+                v.push(s);
+                crate::metrics::slots_spilled();
+                *self = Slots::Spilled(v);
+            }
+            Slots::Spilled(v) => v.push(s),
+        }
+    }
+
+    pub fn retain(&mut self, f: impl FnMut(&Slot) -> bool) {
+        match self {
+            Slots::Inline { n, a } => {
+                let mut v = a[..*n as usize].to_vec();
+                v.retain(f);
+                *n = v.len() as u8;
+                a[..v.len()].copy_from_slice(&v);
+            }
+            Slots::Spilled(v) => v.retain(f),
+        }
+    }
+}
+
+impl std::ops::Deref for Slots {
+    type Target = [Slot];
+    fn deref(&self) -> &[Slot] {
+        match self {
+            Slots::Inline { n, a } => &a[..*n as usize],
+            Slots::Spilled(v) => v,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Slots {
+    fn deref_mut(&mut self) -> &mut [Slot] {
+        match self {
+            Slots::Inline { n, a } => &mut a[..*n as usize],
+            Slots::Spilled(v) => v,
+        }
+    }
+}
+
+impl FromIterator<Slot> for Slots {
+    fn from_iter<T: IntoIterator<Item = Slot>>(it: T) -> Slots {
+        let v: Vec<Slot> = it.into_iter().collect();
+        Slots::from_slice(&v)
+    }
+}
+
+impl<'a> IntoIterator for &'a Slots {
+    type Item = &'a Slot;
+    type IntoIter = std::slice::Iter<'a, Slot>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// An object is built from a fixed-size array where the count is known, which
+/// is most places, and from a vector where it is not. The array form is the
+/// one that costs nothing: it never touches the heap on the way in.
+impl<const N: usize> From<[Slot; N]> for Slots {
+    fn from(a: [Slot; N]) -> Slots {
+        Slots::from_slice(&a)
+    }
+}
+
+impl From<&[Slot]> for Slots {
+    fn from(s: &[Slot]) -> Slots {
+        Slots::from_slice(s)
+    }
+}
+
+impl From<Vec<Slot>> for Slots {
+    fn from(v: Vec<Slot>) -> Slots {
+        Slots::from_slice(&v)
+    }
 }
 
 pub enum Payload {
@@ -335,8 +458,8 @@ pub fn give_vals(mut v: Vec<Value>) {
 }
 
 impl Value {
-    pub fn obj(slots: Vec<Slot>, payload: Payload) -> Value {
-        Value::Obj(crate::gc::alloc(slots, payload))
+    pub fn obj(slots: impl Into<Slots>, payload: Payload) -> Value {
+        Value::Obj(crate::gc::alloc(slots.into(), payload))
     }
     pub fn id_eq(&self, o: &Value) -> bool {
         match (self, o) {
@@ -520,7 +643,7 @@ pub struct Vm {
 
 impl Vm {
     pub fn new() -> Vm {
-        let mk = || Value::obj(vec![], Payload::None);
+        let mk = || Value::obj([], Payload::None);
         let nil = mk();
         let tru = mk();
         let fals = mk();
@@ -726,7 +849,7 @@ impl Vm {
     }
 
     pub fn bytes_with(&self, parent: Value, b: Vec<u8>) -> Value {
-        Value::obj(vec![Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: parent }], Payload::Bytes(b))
+        Value::obj([Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: parent }], Payload::Bytes(b))
     }
 
     pub fn vector(&self, v: Vec<Value>) -> Value {

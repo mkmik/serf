@@ -16,7 +16,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::rc::Rc;
 
-use crate::value::{Method, Obj, Payload, Root, Scope, Slot, Value, Vm};
+use crate::value::{Method, Obj, Payload, Root, Scope, Slots, Value, Vm};
 
 /// One object slot in a space. Empty means free (young: not yet bumped over,
 /// or already evacuated; old: swept).
@@ -380,7 +380,7 @@ impl Drop for NoGc {
     }
 }
 
-pub fn alloc(slots: Vec<Slot>, payload: Payload) -> ObjRef {
+pub fn alloc(slots: Slots, payload: Payload) -> ObjRef {
     gc().alloc(Obj { slots, payload })
 }
 
@@ -951,10 +951,10 @@ mod tests {
         // these collect, and a collection records into process-wide totals
         let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
-        let keep = Value::obj(vec![], Payload::None);
+        let keep = Value::obj([], Payload::None);
         let kh = keep.as_obj().unwrap();
         root(&vm, "keep", keep);
-        let lost = Value::obj(vec![], Payload::None).as_obj().unwrap();
+        let lost = Value::obj([], Payload::None).as_obj().unwrap();
         let before = gc().count();
         collect(&mut vm, false);
         assert!(gc().count() < before, "nothing was collected");
@@ -968,7 +968,7 @@ mod tests {
         // these collect, and a collection records into process-wide totals
         let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
-        let holder = Value::obj(vec![], Payload::None);
+        let holder = Value::obj([], Payload::None);
         let hh = holder.as_obj().unwrap();
         root(&vm, "holder", holder);
         for _ in 0..PROMOTE_AGE + 1 {
@@ -978,7 +978,7 @@ mod tests {
 
         // a young object reachable only through a tenured one: the scavenge
         // does not scan the old generation, so only the write barrier can save it
-        let young = Value::obj(vec![], Payload::None);
+        let young = Value::obj([], Payload::None);
         let yh = young.as_obj().unwrap();
         hh.borrow_mut().put(slot("y", SlotKind::Data, young));
         collect(&mut vm, false);
@@ -991,7 +991,7 @@ mod tests {
         // these collect, and a collection records into process-wide totals
         let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
-        let doomed = Value::obj(vec![], Payload::None);
+        let doomed = Value::obj([], Payload::None);
         let dh = doomed.as_obj().unwrap();
         root(&vm, "doomed", doomed);
         for _ in 0..PROMOTE_AGE + 1 {
@@ -1025,7 +1025,7 @@ mod tests {
             home: None,
             dead: Cell::new(false),
         });
-        let blk = Value::obj(vec![], Payload::Block(method(), Some(scope.clone())));
+        let blk = Value::obj([], Payload::Block(method(), Some(scope.clone())));
         let bh = blk.as_obj().unwrap();
         root(&vm, "blk", blk);
         for _ in 0..PROMOTE_AGE + 1 {
@@ -1033,7 +1033,7 @@ mod tests {
         }
         assert!(matches!(loc_of(bh), Loc::Old { .. }));
 
-        let inner = Value::obj(vec![], Payload::None);
+        let inner = Value::obj([], Payload::None);
         let ih = inner.as_obj().unwrap();
         scope.slots.borrow_mut().push(inner);
         collect(&mut vm, false);
@@ -1045,10 +1045,10 @@ mod tests {
         // these collect, and a collection records into process-wide totals
         let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
-        let live = Value::obj(vec![], Payload::None);
+        let live = Value::obj([], Payload::None);
         let lh = live.as_obj().unwrap();
         root(&vm, "live", live);
-        let dead = Value::obj(vec![], Payload::None).as_obj().unwrap();
+        let dead = Value::obj([], Payload::None).as_obj().unwrap();
         vm.id_hash.insert(lh.id(), 1);
         vm.id_hash.insert(dead.id(), 2);
         collect(&mut vm, false);
@@ -1079,18 +1079,18 @@ fn method_with(lits: Vec<Value>) -> Rc<Method> {
 fn every_holder_of_a_shared_method_stays_remembered() {
     let mut vm = Vm::new();
     // young literal, reachable only through the method
-    let y = Value::obj(vec![], Payload::None);
+    let y = Value::obj([], Payload::None);
     let yh = y.as_obj().unwrap();
     let m = method_with(vec![y]);
 
     // fill the young space so the next allocations are pretenured
     let cap = gc().young[0].len();
     while gc().young_used() < cap {
-        let _ = Value::obj(vec![], Payload::None);
+        let _ = Value::obj([], Payload::None);
     }
 
-    let o1 = Value::obj(vec![], Payload::Method(m.clone()));
-    let o2 = Value::obj(vec![], Payload::Method(m.clone()));
+    let o1 = Value::obj([], Payload::Method(m.clone()));
+    let o2 = Value::obj([], Payload::Method(m.clone()));
     assert!(matches!(loc_of(o1.as_obj().unwrap()), Loc::Old { .. }), "o1 was not pretenured");
     assert!(matches!(loc_of(o2.as_obj().unwrap()), Loc::Old { .. }), "o2 was not pretenured");
     root(&vm, "o1", o1);
