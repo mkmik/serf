@@ -167,13 +167,14 @@ pub enum LookupErr {
     Ambiguous,
 }
 
-/// One edge into the object graph. Scopes and methods are not heap objects --
-/// they are reference counted, and holding one alive keeps the `Value`s inside
-/// it alive too -- so the collector has to be told about them separately.
+/// One edge into the object graph. A `Scope` is not a heap object -- it is
+/// reference counted, and holding one alive keeps the `Value`s inside it alive
+/// too -- so the collector has to be told about it separately. A `Method` needs
+/// no such case: one is only ever reached through the scope it runs in or the
+/// object that holds it.
 pub enum Root {
     Val(Value),
     Scope(Rc<Scope>),
-    Method(Rc<Method>),
 }
 
 /// Where a selector was found: a slot index in some holder object.
@@ -381,6 +382,11 @@ impl Vm {
         for x in self.canonical.values().chain(self.flags.values()) {
             v(x);
         }
+        // ponytail: a loaded world has one of these per annotated slot -- a
+        // couple of hundred thousand for morphic -- and a scavenge walks them
+        // all to find the handful that are young. Worth a young/old split of
+        // the tables only if the young generation is ever made small enough
+        // for that constant to show.
         for x in self.anno_obj.values().chain(self.anno_slot.values()) {
             v(x);
         }

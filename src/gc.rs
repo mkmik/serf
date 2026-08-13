@@ -429,11 +429,13 @@ trait Visit {
     fn value(&mut self, v: Value);
 }
 
+/// Every live `Rc<Method>` is held by a `Scope`, by a `Payload::Method` or
+/// `Payload::Block`, so there is no such thing as a free-floating method root
+/// and `Root` needs no variant for one.
 fn walk_root<V: Visit>(v: &mut V, r: Root) {
     match r {
         Root::Val(x) => v.value(x),
         Root::Scope(s) => walk_scope(v, &s),
-        Root::Method(m) => walk_method(v, &m),
     }
 }
 
@@ -800,7 +802,7 @@ pub fn collect(vm: &mut Vm, major: bool) {
     g.want_major.set(false);
     if g.stats {
         eprintln!(
-            "[gc] {} {}us objs {}->{} promoted {} young {}/{} old {}",
+            "[gc] {} {}us objs {}->{} promoted {} young {}/{} old {} remembered {}",
             if major { "major" } else { "minor" },
             t0.elapsed().as_micros(),
             before,
@@ -809,6 +811,7 @@ pub fn collect(vm: &mut Vm, major: bool) {
             g.young_used(),
             g.young[0].len(),
             g.old_used(),
+            g.remembered.borrow().len(),
         );
     }
 }
