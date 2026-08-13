@@ -42,6 +42,16 @@ fn eval_in_echo(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), St
 /// Evaluate source with a given object as `self` -- for running an image's
 /// own code, where implicit sends must land in the image's world.
 fn eval_in(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String> {
+    // `me` is this function's only reference to the receiver while `show` runs
+    // a send of its own, in whose activations it does not appear
+    let n_roots = vm.temp_roots.len();
+    vm.temp_roots.push(me);
+    let r = eval_in_rooted(vm, src, file, me);
+    vm.temp_roots.truncate(n_roots);
+    r
+}
+
+fn eval_in_rooted(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String> {
     for e in parser::parse_program(src)? {
         let m = compile::compile_statement(vm, &e, file)?;
         let scope = interp::new_scope(m, me.clone(), me.clone(), vec![], None);
@@ -56,9 +66,10 @@ fn eval_in(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String>
 /// Ask the object to print itself; fall back to the VM printer.
 fn show(vm: &mut Vm, v: &Value) -> String {
     // `v` is a Rust local across a send, so the collector needs to be told
+    let n_roots = vm.temp_roots.len();
     vm.temp_roots.push(*v);
     let printed = interp::send(vm, v.clone(), "printString", vec![]);
-    vm.temp_roots.pop();
+    vm.temp_roots.truncate(n_roots);
     if let Ok(s) = printed {
         if let Some(t) = s.as_str() {
             return t;

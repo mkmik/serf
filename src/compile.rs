@@ -100,12 +100,16 @@ pub fn compile_statement(vm: &mut Vm, e: &Expr, file: &str) -> Result<Rc<Method>
 }
 
 pub fn compile_method(vm: &mut Vm, o: &ObjLit, sel: &str, file: &Rc<str>) -> Result<Rc<Method>, String> {
+    let _g = crate::gc::NoGc::new();
     let mut c = C { vm, mbs: vec![], file: file.clone() };
     c.push_method(o, sel, false)
 }
 
 /// An object literal with no code: a constant object, built now.
 pub fn build_object(vm: &mut Vm, o: &ObjLit, file: &Rc<str>) -> Result<Value, String> {
+    // nesting a NoGc is free, and these two are `pub`: a caller that reached
+    // them directly would be building slots in a Rust local across `eval_const`
+    let _g = crate::gc::NoGc::new();
     if !o.args.is_empty() {
         return Err("argument slots are only allowed in methods".into());
     }

@@ -14,8 +14,10 @@
 //! an ordinary `Ref<Obj>` with no lifetime to thread and no `unsafe`.
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::collections::HashSet;
+use std::rc::Rc;
 
-use crate::value::{Obj, Payload, Slot};
+use crate::value::{Method, Obj, Payload, Root, Scope, Slot, Value, Vm};
 
 /// One object slot in a space. Empty means free (young: not yet bumped over,
 /// or already evacuated; old: swept).
@@ -52,6 +54,10 @@ const PROMOTE_AGE: u8 = 2;
 
 const OLD_CHUNK: u32 = 1 << 15;
 
+/// Do not bother with a major collection until the old generation is at least
+/// this big; below it the mark phase costs more than the garbage is worth.
+const MIN_OLD: usize = 1 << 16;
+
 fn env_usize(name: &str, dflt: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
 }
@@ -61,11 +67,19 @@ fn space(n: usize) -> &'static [Cel] {
     Box::leak(v.into_boxed_slice())
 }
 
+fn owners(n: usize) -> &'static [Cell<u32>] {
+    let v: Vec<Cell<u32>> = (0..n).map(|_| Cell::new(0)).collect();
+    Box::leak(v.into_boxed_slice())
+}
+
 pub struct Gc {
     table: RefCell<Vec<Entry>>,
     free_ids: RefCell<Vec<u32>>,
     /// the two semispaces; `from` says which one is being allocated into
     young: [&'static [Cel]; 2],
+    /// which handle owns each young slot, so a scavenge can free the objects
+    /// left behind in the from space without scanning the whole handle table
+    owner: [&'static [Cell<u32>]; 2],
     from: Cell<u8>,
     bump: Cell<u32>,
     chunks: RefCell<Vec<&'static [Cel]>>,
@@ -73,13 +87,20 @@ pub struct Gc {
     old_bump: Cell<u32>,
     old_free: RefCell<Vec<Loc>>,
     old_live: Cell<usize>,
+    /// old generation size at which the next collection is a major one
+    next_major: Cell<usize>,
     /// old objects written since the last scavenge, so it need not scan them all
     remembered: RefCell<Vec<ObjRef>>,
     /// the young space filled up: collect at the next safepoint
     want: Cell<bool>,
+    /// ...and make that collection a major one (`_GarbageCollect` asked)
+    want_major: Cell<bool>,
     /// nesting depth of phases that keep roots in Rust locals we do not walk
     /// (image load and save, compilation). Nonzero means "do not collect".
     pub disabled: Cell<u32>,
+    /// collect at the first safepoint after *any* allocation, and never reuse
+    /// a handle id, so a reference the collector failed to trace panics where
+    /// it is used instead of quietly reattaching to a recycled object
     pub stress: bool,
     pub verify: bool,
     pub stats: bool,
@@ -108,23 +129,29 @@ pub fn gc() -> &'static Gc {
 
 impl Gc {
     fn new() -> Gc {
-        let n = env_usize("SERF_GC_YOUNG", 1 << 16);
+        let stress = std::env::var_os("SERF_GC_STRESS").is_some();
+        // stress collects after every allocation, so a big young space would
+        // only make every scavenge sweep more empty cells
+        let n = env_usize("SERF_GC_YOUNG", if stress { 512 } else { 1 << 16 });
         Gc {
             // handle 0 is never handed out: the VM's side tables key
             // immediates as 0, and an object must not collide with them
             table: RefCell::new(vec![Entry { loc: Loc::Free, age: 0, dirty: false, mark: false }]),
             free_ids: RefCell::new(vec![]),
             young: [space(n), space(n)],
+            owner: [owners(n), owners(n)],
             from: Cell::new(0),
             bump: Cell::new(0),
             chunks: RefCell::new(vec![]),
             old_bump: Cell::new(OLD_CHUNK),
             old_free: RefCell::new(vec![]),
             old_live: Cell::new(0),
+            next_major: Cell::new(MIN_OLD),
             remembered: RefCell::new(vec![]),
             want: Cell::new(false),
+            want_major: Cell::new(false),
             disabled: Cell::new(0),
-            stress: std::env::var_os("SERF_GC_STRESS").is_some(),
+            stress,
             verify: std::env::var_os("SERF_GC_VERIFY").is_some(),
             stats: std::env::var_os("SERF_GC_STATS").is_some(),
             off: std::env::var("SERF_GC").map_or(false, |v| v == "off"),
@@ -156,7 +183,10 @@ impl Gc {
         let loc = if (i as usize) < self.young[0].len() {
             self.bump.set(i + 1);
             let l = Loc::Young { space: self.from.get(), idx: i };
-            if (i as usize) * 4 >= self.young[0].len() * 3 {
+            // stress asks for a collection after every allocation, which is
+            // dense enough to catch any missed root but skips the millions of
+            // bytecodes that allocate nothing
+            if self.stress || (i as usize) * 4 >= self.young[0].len() * 3 {
                 self.want.set(true);
             }
             l
@@ -165,7 +195,15 @@ impl Gc {
             self.alloc_old()
         };
         *self.at(loc).borrow_mut() = Some(o);
-        self.new_id(loc)
+        let h = self.new_id(loc);
+        match loc {
+            Loc::Young { space, idx } => self.owner[space as usize][idx as usize].set(h.0),
+            // a pretenured object is born old with its slots already filled in,
+            // and no write barrier has fired for it: if any of them names a
+            // young object the next scavenge has to know
+            _ => self.record(h),
+        }
+        h
     }
 
     /// A slot in the old generation: a swept one if there is one, else bump,
@@ -228,7 +266,73 @@ impl Gc {
 
     /// True when a collection is due. Checked at the interpreter's safepoint.
     pub fn wanted(&'static self) -> bool {
-        !self.off && self.disabled.get() == 0 && (self.want.get() || self.stress)
+        !self.off && self.disabled.get() == 0 && self.want.get()
+    }
+
+    /// Ask for a collection at the next safepoint. `_GarbageCollect` and
+    /// friends go through this rather than collecting on the spot: a primitive
+    /// runs with the interpreter's Rust locals underneath it, which are not
+    /// roots. A request made while collection is disabled stays pending.
+    pub fn request(&'static self, major: bool) {
+        self.want.set(true);
+        if major {
+            self.want_major.set(true);
+        }
+    }
+
+    fn set_entry(&'static self, h: ObjRef, e: Entry) {
+        self.table.borrow_mut()[h.0 as usize] = e;
+    }
+
+    /// Retire a handle. Its object is already gone; the id goes back on the
+    /// free list unless we are keeping freed handles poisoned.
+    fn free_id(&'static self, id: u32) {
+        self.set_entry(ObjRef(id), Entry { loc: Loc::Free, age: 0, dirty: false, mark: false });
+        // in stress mode ids are never reused, so a reference the collector
+        // failed to trace lands on a Free entry and panics at the exact site
+        // instead of silently attaching to whatever object took the id over
+        if !self.stress {
+            self.free_ids.borrow_mut().push(id);
+        }
+    }
+
+    /// Set the mark bit; true if this is the first time, i.e. the object's
+    /// contents still have to be walked.
+    fn mark(&'static self, h: ObjRef) -> bool {
+        let mut t = self.table.borrow_mut();
+        let e = &mut t[h.0 as usize];
+        if e.loc == Loc::Free {
+            panic!("use of collected object {}", h.0);
+        }
+        if e.mark {
+            return false;
+        }
+        e.mark = true;
+        true
+    }
+
+    fn clear_marks(&'static self) {
+        for e in self.table.borrow_mut().iter_mut() {
+            e.mark = false;
+        }
+    }
+
+    /// Every handle currently living in the old generation. Copied out, because
+    /// the callers go on to move objects and free handles.
+    fn old_handles(&'static self) -> Vec<ObjRef> {
+        self.table
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.loc, Loc::Old { .. }))
+            .map(|(i, _)| ObjRef(i as u32))
+            .collect()
+    }
+
+    /// For the weak side tables: did the object with this identity die? Handle
+    /// 0 is the tables' key for immediates, which never die.
+    fn is_dead(&'static self, id: usize) -> bool {
+        id != 0 && self.table.borrow().get(id).map_or(false, |e| e.loc == Loc::Free)
     }
 
     pub fn young_used(&'static self) -> usize {
@@ -282,5 +386,572 @@ impl ObjRef {
     /// unlike the address it replaces, which a later object could reuse.
     pub fn id(self) -> usize {
         self.0 as usize
+    }
+}
+
+// ------------------------------------------------------------------ tracing
+
+/// The visited sets are keyed by address and are hit once per frame, so a deep
+/// stack hashes millions of times per collection: SipHash is far too slow for
+/// that and a multiply-rotate (rustc's own FxHash) is plenty for pointers.
+#[derive(Default)]
+struct PtrHash(u64);
+
+impl std::hash::Hasher for PtrHash {
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_usize(*b as usize);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type PtrSet = HashSet<usize, std::hash::BuildHasherDefault<PtrHash>>;
+
+/// Scopes and methods already walked in this collection, by address. Frames
+/// share their lexical chains, so a deep stack would otherwise be quadratic.
+/// Safe against address reuse: nothing is dropped while a traversal runs.
+#[derive(Default)]
+struct Seen {
+    scopes: PtrSet,
+    methods: PtrSet,
+}
+
+/// The two collectors walk the object graph the same way and differ only in
+/// what they do with each `Value` they find.
+trait Visit {
+    fn seen(&mut self) -> &mut Seen;
+    fn value(&mut self, v: Value);
+}
+
+fn walk_root<V: Visit>(v: &mut V, r: Root) {
+    match r {
+        Root::Val(x) => v.value(x),
+        Root::Scope(s) => walk_scope(v, &s),
+        Root::Method(m) => walk_method(v, &m),
+    }
+}
+
+fn walk_obj<V: Visit>(v: &mut V, o: &Obj) {
+    for s in o.slots.iter() {
+        v.value(s.value);
+    }
+    match &o.payload {
+        Payload::Vector(xs) => {
+            for x in xs.iter() {
+                v.value(*x);
+            }
+        }
+        Payload::Mirror(x) => v.value(*x),
+        Payload::Method(m) => walk_method(v, m),
+        Payload::Block(m, sc) => {
+            walk_method(v, m);
+            if let Some(sc) = sc {
+                walk_scope(v, sc);
+            }
+        }
+        Payload::None | Payload::Bytes(_) | Payload::Proxy(_) => {}
+    }
+}
+
+fn walk_method<V: Visit>(v: &mut V, m: &Rc<Method>) {
+    if !v.seen().methods.insert(Rc::as_ptr(m) as usize) {
+        return;
+    }
+    for x in m.lits.iter().chain(m.slot_inits.iter()) {
+        v.value(*x);
+    }
+    // the source string of a loaded method is an ordinary heap object, and it
+    // is the one reference in here that is easy to miss
+    if let Some((s, _, _)) = m.source {
+        v.value(s);
+    }
+}
+
+/// Iterative on purpose: a block that captures the activation that created it
+/// makes the lexical chain as deep as the recursion that built it, which would
+/// blow the Rust stack. Borrows rather than clones the chain -- `s` holds it
+/// all alive -- because this runs once per frame and refcount traffic on a
+/// 300k-deep stack is not free.
+fn walk_scope<V: Visit>(v: &mut V, s: &Rc<Scope>) {
+    if !v.seen().scopes.insert(Rc::as_ptr(s) as usize) {
+        return;
+    }
+    let mut todo: Vec<&Scope> = Vec::new();
+    let mut cur: &Scope = s;
+    loop {
+        v.value(cur.recv);
+        v.value(cur.holder);
+        for x in cur.slots.borrow().iter() {
+            v.value(*x);
+        }
+        walk_method(v, &cur.method);
+        for next in [&cur.lexical, &cur.home] {
+            if let Some(n) = next {
+                if v.seen().scopes.insert(Rc::as_ptr(n) as usize) {
+                    todo.push(n);
+                }
+            }
+        }
+        match todo.pop() {
+            Some(n) => cur = n,
+            None => return,
+        }
+    }
+}
+
+/// An old object holding this cannot be dropped from the remembered set: a
+/// `Scope`'s slots are mutated through a plain `RefCell` (`interp.rs`'s
+/// assignment bytecode), with no barrier to notice a young value being stored
+/// into a scope that only an old block still reaches.
+fn holds_scope(o: &Obj) -> bool {
+    matches!(o.payload, Payload::Block(_, Some(_)))
+}
+
+// --------------------------------------------------------------- scavenging
+
+/// A minor collection: copy the young survivors into the to-space (or the old
+/// generation), then drop everything left behind.
+///
+/// Cheney's algorithm with one difference: an object moves by writing a single
+/// handle-table entry, so *no reference anywhere is ever rewritten*. Scanning
+/// exists only to find young referents, never to fix pointers up.
+struct Scav {
+    g: &'static Gc,
+    seen: Seen,
+    from: u8,
+    to: u8,
+    to_bump: u32,
+    /// evacuated but not yet scanned
+    queue: Vec<ObjRef>,
+    promoted: usize,
+    /// set by `value` when the value it just handled lives in the young
+    /// generation, so the object being scanned can be (re)remembered
+    saw_young: bool,
+    /// verify mode: report young referents an old object should already have
+    /// been remembered for
+    checking: bool,
+    violations: usize,
+}
+
+impl Visit for Scav {
+    fn seen(&mut self) -> &mut Seen {
+        &mut self.seen
+    }
+
+    /// One handle-table lookup per reference, which on a deep stack happens
+    /// millions of times per collection.
+    fn value(&mut self, v: Value) {
+        let h = match v {
+            Value::Obj(h) => h,
+            _ => return,
+        };
+        let e = self.g.entry(h);
+        match e.loc {
+            // still in the from space: this is the reference that moves it
+            Loc::Young { space, idx } if space == self.from => {
+                if self.checking {
+                    self.violations += 1;
+                }
+                if matches!(self.evacuate(h, e, idx as usize), Loc::Young { .. }) {
+                    self.saw_young = true;
+                }
+            }
+            // already copied into the to space this collection
+            Loc::Young { .. } => self.saw_young = true,
+            Loc::Old { .. } => {}
+            // a live reference to a freed handle: only possible if a root was
+            // missed, and in stress mode the id was never reused, so say so
+            Loc::Free => panic!("use of collected object {}", h.0),
+        }
+    }
+}
+
+impl Scav {
+    /// Move one object out of the from space; answers where it went.
+    fn evacuate(&mut self, h: ObjRef, e: Entry, idx: usize) -> Loc {
+        let g = self.g;
+        let obj = g.young[self.from as usize][idx]
+            .borrow_mut()
+            .take()
+            .expect("young object missing from its slot");
+        let age = e.age.saturating_add(1);
+        // promotion cannot fail: the old generation grows a chunk on demand,
+        // which is what lets the to-space overflow tenure instead of abort
+        let loc = if age >= PROMOTE_AGE || self.to_bump as usize >= g.young[0].len() {
+            self.promoted += 1;
+            g.alloc_old()
+        } else {
+            let i = self.to_bump;
+            self.to_bump += 1;
+            g.owner[self.to as usize][i as usize].set(h.0);
+            Loc::Young { space: self.to, idx: i }
+        };
+        *g.at(loc).borrow_mut() = Some(obj);
+        // dirty is dropped: a promoted object earns its place in the remembered
+        // set back in `scan`, once we know whether it still points at young
+        g.set_entry(h, Entry { loc, age, dirty: false, mark: e.mark });
+        self.queue.push(h);
+        loc
+    }
+
+    /// Walk one object's references, evacuating the young ones. Answers whether
+    /// it must be on the remembered set -- which is the self-cleaning card of
+    /// rSet.cpp:131, decided per object rather than per 32-word card.
+    fn scan(&mut self, h: ObjRef) {
+        let loc = self.g.entry(h).loc;
+        if loc == Loc::Free {
+            return;
+        }
+        let cel = self.g.at(loc);
+        let r = cel.borrow();
+        let o = match r.as_ref() {
+            Some(o) => o,
+            None => return,
+        };
+        self.saw_young = false;
+        walk_obj(self, o);
+        let keep = self.saw_young || holds_scope(o);
+        drop(r);
+        if keep {
+            // no-op unless the object is old, which is exactly right
+            self.g.record(h);
+        }
+    }
+
+    fn drain(&mut self) {
+        while let Some(h) = self.queue.pop() {
+            self.scan(h);
+        }
+    }
+
+    /// Verify mode: after the remembered set has done its job, no old object
+    /// may still name a from-space object. One that does was written without
+    /// the barrier firing.
+    fn verify_old(&mut self) {
+        self.checking = true;
+        for h in self.g.old_handles() {
+            let before = self.violations;
+            self.scan(h);
+            if self.violations > before {
+                eprintln!(
+                    "[gc] VERIFY FAILED: old object {} holds {} young reference(s) \
+                     the remembered set did not know about -- the write barrier is broken",
+                    h.0,
+                    self.violations - before
+                );
+            }
+        }
+        self.checking = false;
+        // the barrier may be broken, but the heap must still come out
+        // consistent: whatever the check found has been evacuated, so finish
+        // copying it
+        self.drain();
+    }
+}
+
+fn scavenge(vm: &mut Vm, g: &'static Gc) -> usize {
+    let from = g.from.get();
+    let mut s = Scav {
+        g,
+        seen: Seen::default(),
+        from,
+        to: 1 - from,
+        to_bump: 0,
+        queue: vec![],
+        promoted: 0,
+        saw_young: false,
+        checking: false,
+        violations: 0,
+    };
+
+    // the remembered set is rebuilt from scratch as objects are scanned:
+    // `Gc::record` refills it, so clearing the dirty bits here keeps bit and
+    // membership in step
+    let rs = std::mem::take(&mut *g.remembered.borrow_mut());
+    {
+        let mut t = g.table.borrow_mut();
+        for h in rs.iter() {
+            t[h.0 as usize].dirty = false;
+        }
+    }
+
+    vm.each_root(&mut |r| walk_root(&mut s, r));
+    for h in rs {
+        if matches!(g.entry(h).loc, Loc::Old { .. }) {
+            s.scan(h);
+        }
+    }
+    s.drain();
+    if g.verify {
+        s.verify_old();
+    }
+
+    // whatever is still sitting in the from space was never reached: dropping
+    // it is the free, and it costs one pass over the space we are done with
+    let cap = g.young[0].len();
+    let bump = (g.bump.get() as usize).min(cap);
+    for i in 0..bump {
+        let dead = g.young[from as usize][i].borrow_mut().take();
+        if dead.is_some() {
+            g.free_id(g.owner[from as usize][i].get());
+        }
+        drop(dead);
+    }
+
+    g.bump.set(s.to_bump);
+    g.from.set(s.to);
+    s.promoted
+}
+
+// -------------------------------------------------------------- mark & sweep
+
+struct Mark {
+    g: &'static Gc,
+    seen: Seen,
+    queue: Vec<ObjRef>,
+}
+
+impl Visit for Mark {
+    fn seen(&mut self) -> &mut Seen {
+        &mut self.seen
+    }
+
+    fn value(&mut self, v: Value) {
+        if let Value::Obj(h) = v {
+            if self.g.mark(h) {
+                self.queue.push(h);
+            }
+        }
+    }
+}
+
+/// Mark the whole reachable graph, young and old: an old object is often only
+/// reachable through a young one.
+fn mark_all(vm: &Vm, g: &'static Gc) {
+    let mut m = Mark { g, seen: Seen::default(), queue: vec![] };
+    vm.each_root(&mut |r| walk_root(&mut m, r));
+    while let Some(h) = m.queue.pop() {
+        let cel = g.cel(h);
+        let r = cel.borrow();
+        if let Some(o) = r.as_ref() {
+            walk_obj(&mut m, o);
+        }
+    }
+}
+
+/// Drop every unmarked old object and put its slot on the free list. Runs
+/// before the scavenge, so that a dead old object cannot drag its young
+/// referents through one more copy.
+fn sweep_old(g: &'static Gc) {
+    for h in g.old_handles() {
+        let e = g.entry(h);
+        if e.mark {
+            continue;
+        }
+        let dead = g.at(e.loc).borrow_mut().take();
+        drop(dead);
+        g.old_free.borrow_mut().push(e.loc);
+        g.old_live.set(g.old_live.get() - 1);
+        g.free_id(h.0);
+    }
+}
+
+// ------------------------------------------------------------------- driver
+
+/// Collect. `major` runs a mark & sweep of the old generation as well.
+///
+/// Only ever called from the interpreter's safepoint (or from a primitive's
+/// request, which the safepoint picks up): everything the VM can still reach
+/// has to be in `Vm::each_root` by then, and `disabled` covers the phases whose
+/// roots live in Rust locals instead.
+pub fn collect(vm: &mut Vm, major: bool) {
+    let g = gc();
+    if g.off || g.disabled.get() > 0 {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let before = if g.stats { g.count() } else { 0 };
+
+    if major {
+        mark_all(vm, g);
+        sweep_old(g);
+    }
+    let promoted = scavenge(vm, g);
+    if major {
+        g.clear_marks();
+        g.next_major.set(std::cmp::max(MIN_OLD, g.old_live.get() * 2));
+        g.majors.set(g.majors.get() + 1);
+    } else {
+        g.minors.set(g.minors.get() + 1);
+    }
+
+    // side tables keyed by identity: their entries are traced as roots above,
+    // so this drops only the ones whose object turned out to be dead. Handle
+    // ids are recycled, so a survivor would later reattach to a stranger.
+    vm.sweep_weak(&|id| g.is_dead(id));
+
+    g.want.set(false);
+    g.want_major.set(false);
+    if g.stats {
+        eprintln!(
+            "[gc] {} {}us objs {}->{} promoted {} young {}/{} old {}",
+            if major { "major" } else { "minor" },
+            t0.elapsed().as_micros(),
+            before,
+            g.count(),
+            promoted,
+            g.young_used(),
+            g.young[0].len(),
+            g.old_used(),
+        );
+    }
+}
+
+/// The safepoint's entry point: collect if anything asked for it, majoring when
+/// the old generation has outgrown the threshold set by the last major.
+pub fn collect_if_wanted(vm: &mut Vm) {
+    let g = gc();
+    if !g.wanted() {
+        return;
+    }
+    collect(vm, g.want_major.get() || g.old_live.get() >= g.next_major.get());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{slot, SlotKind};
+
+    // one heap per thread, and the test harness gives each test its own
+    fn loc_of(h: ObjRef) -> Loc {
+        gc().entry(h).loc
+    }
+
+    fn root(vm: &Vm, name: &str, v: Value) {
+        vm.globals.as_obj().unwrap().borrow_mut().put(slot(name, SlotKind::Data, v));
+    }
+
+    fn method() -> Rc<Method> {
+        Rc::new(Method {
+            sel: "t".into(),
+            nargs: 0,
+            arg_slots: vec![],
+            slot_names: vec![],
+            slot_flags: vec![],
+            slot_inits: vec![],
+            code: vec![],
+            lits: vec![],
+            lit_strs: vec![],
+            is_block: false,
+            file: "t".into(),
+            line: 0,
+            source: None,
+        })
+    }
+
+    #[test]
+    fn scavenge_keeps_the_reachable_and_frees_the_rest() {
+        let mut vm = Vm::new();
+        let keep = Value::obj(vec![], Payload::None);
+        let kh = keep.as_obj().unwrap();
+        root(&vm, "keep", keep);
+        let lost = Value::obj(vec![], Payload::None).as_obj().unwrap();
+        let before = gc().count();
+        collect(&mut vm, false);
+        assert!(gc().count() < before, "nothing was collected");
+        assert_eq!(loc_of(lost), Loc::Free, "an unreachable object survived");
+        assert!(matches!(loc_of(kh), Loc::Young { .. }), "a survivor was tenured too early");
+        assert!(kh.borrow().slots.is_empty(), "the survivor is not usable");
+    }
+
+    #[test]
+    fn tenuring_and_the_remembered_set() {
+        let mut vm = Vm::new();
+        let holder = Value::obj(vec![], Payload::None);
+        let hh = holder.as_obj().unwrap();
+        root(&vm, "holder", holder);
+        for _ in 0..PROMOTE_AGE + 1 {
+            collect(&mut vm, false);
+        }
+        assert!(matches!(loc_of(hh), Loc::Old { .. }), "surviving objects are not tenured");
+
+        // a young object reachable only through a tenured one: the scavenge
+        // does not scan the old generation, so only the write barrier can save it
+        let young = Value::obj(vec![], Payload::None);
+        let yh = young.as_obj().unwrap();
+        hh.borrow_mut().put(slot("y", SlotKind::Data, young));
+        collect(&mut vm, false);
+        assert_ne!(loc_of(yh), Loc::Free, "the remembered set lost a young referent");
+        assert!(hh.borrow().slots[0].value.id_eq(&Value::Obj(yh)), "the reference moved");
+    }
+
+    #[test]
+    fn only_a_major_frees_the_old_generation() {
+        let mut vm = Vm::new();
+        let doomed = Value::obj(vec![], Payload::None);
+        let dh = doomed.as_obj().unwrap();
+        root(&vm, "doomed", doomed);
+        for _ in 0..PROMOTE_AGE + 1 {
+            collect(&mut vm, false);
+        }
+        assert!(matches!(loc_of(dh), Loc::Old { .. }));
+        let old = gc().old_used();
+
+        vm.globals.as_obj().unwrap().borrow_mut().slots.retain(|s| &*s.name != "doomed");
+        collect(&mut vm, false);
+        assert_ne!(loc_of(dh), Loc::Free, "a minor collection swept the old generation");
+        collect(&mut vm, true);
+        assert_eq!(loc_of(dh), Loc::Free, "a major collection did not sweep it");
+        assert!(gc().old_used() < old, "the old generation did not shrink");
+    }
+
+    /// The one edge with no write barrier behind it: a `Scope`'s slots are
+    /// mutated through a plain `RefCell`, so an old object holding a captured
+    /// scope has to stay remembered for good.
+    #[test]
+    fn a_captured_scope_is_traced_after_tenuring() {
+        let mut vm = Vm::new();
+        let scope = Rc::new(Scope {
+            method: method(),
+            recv: Value::Int(0),
+            holder: Value::Int(0),
+            slots: RefCell::new(vec![]),
+            lexical: None,
+            home: None,
+            dead: Cell::new(false),
+        });
+        let blk = Value::obj(vec![], Payload::Block(method(), Some(scope.clone())));
+        let bh = blk.as_obj().unwrap();
+        root(&vm, "blk", blk);
+        for _ in 0..PROMOTE_AGE + 1 {
+            collect(&mut vm, false);
+        }
+        assert!(matches!(loc_of(bh), Loc::Old { .. }));
+
+        let inner = Value::obj(vec![], Payload::None);
+        let ih = inner.as_obj().unwrap();
+        scope.slots.borrow_mut().push(inner);
+        collect(&mut vm, false);
+        assert_ne!(loc_of(ih), Loc::Free, "a value stored into a captured scope was lost");
+    }
+
+    #[test]
+    fn weak_tables_lose_their_dead_keys() {
+        let mut vm = Vm::new();
+        let live = Value::obj(vec![], Payload::None);
+        let lh = live.as_obj().unwrap();
+        root(&vm, "live", live);
+        let dead = Value::obj(vec![], Payload::None).as_obj().unwrap();
+        vm.id_hash.insert(lh.id(), 1);
+        vm.id_hash.insert(dead.id(), 2);
+        collect(&mut vm, false);
+        assert_eq!(vm.id_hash.get(&lh.id()), Some(&1), "a live object lost its identity hash");
+        assert!(!vm.id_hash.contains_key(&dead.id()), "a dead object kept its identity hash");
     }
 }

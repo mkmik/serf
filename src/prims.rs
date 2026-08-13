@@ -861,11 +861,10 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             // the process we are displacing is a Rust local for the length of
             // the run, and the world may hold it nowhere else
             let prev = vm.current_proc.replace(recv.clone());
+            let n_roots = vm.temp_roots.len();
             vm.temp_roots.extend(prev);
             let outcome = crate::interp::run_stack(vm, &mut stack);
-            if prev.is_some() {
-                vm.temp_roots.pop();
-            }
+            vm.temp_roots.truncate(n_roots);
             vm.current_proc = prev;
             let cause = match outcome {
                 Ok(crate::interp::Outcome::Yielded { rcvr, arg }) => {

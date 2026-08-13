@@ -106,10 +106,13 @@ Two things worth knowing about the interpreter:
 
 * Activations live in a `Vec`, not on the Rust stack, so Self recursion is
   bounded by memory (500k frames, then a clean error) rather than by a segfault.
-* A send in tail position reuses the caller's frame **when nothing else holds
-  its scope** (`Rc::strong_count == 1`). That check is what keeps `^` out of a
-  block from ever targeting a frame that tail-calling threw away, and it is why
-  `whileTrue:` — genuine recursion in Self — runs in constant space.
+* A send in tail position always reuses the caller's frame, which is why
+  `whileTrue:` — genuine recursion in Self — runs in constant space. An
+  activation that tail-calls has not returned, so the callee's frame carries
+  it: a `^` out of one of its blocks finds the continuation there and returns
+  through it. (Before there was a collector this was decided by asking whether
+  anything else still held the scope, which only worked because `Rc` freed a
+  discarded block immediately.)
 
 ## Garbage collection
 
