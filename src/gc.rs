@@ -939,6 +939,8 @@ mod tests {
 
     #[test]
     fn scavenge_keeps_the_reachable_and_frees_the_rest() {
+        // these collect, and a collection records into process-wide totals
+        let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
         let keep = Value::obj(vec![], Payload::None);
         let kh = keep.as_obj().unwrap();
@@ -954,6 +956,8 @@ mod tests {
 
     #[test]
     fn tenuring_and_the_remembered_set() {
+        // these collect, and a collection records into process-wide totals
+        let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
         let holder = Value::obj(vec![], Payload::None);
         let hh = holder.as_obj().unwrap();
@@ -975,6 +979,8 @@ mod tests {
 
     #[test]
     fn only_a_major_frees_the_old_generation() {
+        // these collect, and a collection records into process-wide totals
+        let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
         let doomed = Value::obj(vec![], Payload::None);
         let dh = doomed.as_obj().unwrap();
@@ -998,6 +1004,8 @@ mod tests {
     /// scope has to stay remembered for good.
     #[test]
     fn a_captured_scope_is_traced_after_tenuring() {
+        // these collect, and a collection records into process-wide totals
+        let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
         let scope = Rc::new(Scope {
             method: method(),
@@ -1025,6 +1033,8 @@ mod tests {
 
     #[test]
     fn weak_tables_lose_their_dead_keys() {
+        // these collect, and a collection records into process-wide totals
+        let _totals = crate::metrics::TOTALS.lock().unwrap_or_else(|e| e.into_inner());
         let mut vm = Vm::new();
         let live = Value::obj(vec![], Payload::None);
         let lh = live.as_obj().unwrap();

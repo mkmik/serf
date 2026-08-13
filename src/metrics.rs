@@ -81,6 +81,13 @@ pub struct Collection {
     pub remembered: u64,
 }
 
+/// `M` is one set of counters for the whole process, but `cargo test` runs
+/// tests as threads: any test that collects records into the same totals the
+/// exposition test asserts exact values on. Both sides take this first, so the
+/// two never interleave. Not a lock the VM itself ever touches.
+#[cfg(test)]
+pub static TOTALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn record(c: Collection) {
     let g = &M.gens[if c.major { OLD } else { YOUNG }];
     let ns = c.pause.as_nanos() as u64;
@@ -198,6 +205,17 @@ mod tests {
 
     #[test]
     fn a_collection_shows_up_in_the_exposition() {
+        // the totals are the whole process's, and other tests collect into
+        // them: hold the lock and measure what this one call added, rather
+        // than asserting numbers only a first-to-run test could see
+        let _totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+        let g = &M.gens[YOUNG];
+        let at_1ms = g.buckets[3].load(Relaxed);
+        let at_2ms5 = g.buckets[4].load(Relaxed);
+        let count = g.collections.load(Relaxed);
+        let sum_ns = g.pause_ns.load(Relaxed);
+        let freed = M.freed.load(Relaxed);
+
         record(Collection {
             major: false,
             pause: Duration::from_micros(1500),
@@ -209,16 +227,21 @@ mod tests {
             old: 3,
             remembered: 1,
         });
-        let o = encode();
+
+        assert_eq!(BUCKETS[3], 0.001);
+        assert_eq!(BUCKETS[4], 0.0025);
         // 1.5ms falls in the 2.5ms bucket and not in the 1ms one
-        assert!(o.contains("serf_gc_pause_seconds_bucket{generation=\"young\",le=\"0.001\"} 0\n"), "{o}");
-        assert!(o.contains("serf_gc_pause_seconds_bucket{generation=\"young\",le=\"0.0025\"} 1\n"), "{o}");
-        assert!(o.contains("serf_gc_pause_seconds_count{generation=\"young\"} 1\n"), "{o}");
-        assert!(o.contains("serf_gc_pause_seconds_sum{generation=\"young\"} 0.0015\n"), "{o}");
-        assert!(o.contains("serf_gc_pause_seconds_max{generation=\"young\"} 0.0015\n"), "{o}");
-        assert!(o.contains("serf_gc_objects_freed_total 40\n"), "{o}");
+        assert_eq!(g.buckets[3].load(Relaxed) - at_1ms, 0);
+        assert_eq!(g.buckets[4].load(Relaxed) - at_2ms5, 1);
+        assert_eq!(g.collections.load(Relaxed) - count, 1);
+        assert_eq!(g.pause_ns.load(Relaxed) - sum_ns, 1_500_000);
+        assert_eq!(M.freed.load(Relaxed) - freed, 40);
+        assert!(g.pause_max_ns.load(Relaxed) >= 1_500_000);
+
+        // gauges are last-write-wins, and under the lock this call was last
+        let o = encode();
         assert!(o.contains("serf_gc_old_objects 3\n"), "{o}");
         // an untouched generation still reports itself, so a scrape never gaps
-        assert!(o.contains("serf_gc_collections_total{generation=\"old\"} 0\n"), "{o}");
+        assert!(o.contains("serf_gc_collections_total{generation=\"old\"} "), "{o}");
     }
 }
