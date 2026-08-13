@@ -26,6 +26,10 @@ pub fn lookup_gen_bump() {
     LOOKUP_GEN.with(|g| g.set(g.get() + 1));
 }
 
+pub fn lookup_gen() -> u64 {
+    LOOKUP_GEN.with(|g| g.get())
+}
+
 #[derive(Clone, Copy)]
 pub enum Value {
     Int(i64),
@@ -94,6 +98,63 @@ pub struct Method {
     /// ponytail: None means "no source"; give the parser spans if editing
     /// methods from within a loaded world ever needs to write one back.
     pub source: Option<(Value, i64, i64)>,
+    /// Inline caches, one per literal; sized on the method's first send. Not
+    /// a GC root: an entry is only read at the generation it was filled at,
+    /// and a collection bumps that.
+    pub sites: RefCell<Vec<Site>>,
+}
+
+/// A send site's inline cache: the last receiver seen there, and what lookup
+/// found for it. serf's compiler emits a fresh literal per send, so a literal
+/// index *is* a site id; the C++ compiler shares literals between sends of the
+/// same selector, where this degrades to one entry per (method, selector).
+///
+/// ponytail: monomorphic -- one entry, no polymorphic slots. Most sites never
+/// see a second receiver; widen it to 4 when a miss counter says otherwise.
+#[derive(Clone, Copy)]
+pub struct Site {
+    /// arity of the selector in this literal, a pure function of it -- so
+    /// unlike `hit` it never goes stale. `u32::MAX` until first computed.
+    nargs: u32,
+    /// receiver key, what it found, and the `LOOKUP_GEN` that was true at
+    hit: Option<(u64, ObjRef, Hit)>,
+}
+
+impl Default for Site {
+    fn default() -> Site {
+        Site { nargs: u32::MAX, hit: None }
+    }
+}
+
+impl Method {
+    fn sites(&self) -> std::cell::RefMut<'_, Vec<Site>> {
+        let mut s = self.sites.borrow_mut();
+        if s.len() < self.lits.len() {
+            s.resize(self.lits.len(), Site::default());
+        }
+        s
+    }
+
+    /// How many arguments the selector in literal `i` takes.
+    pub fn site_nargs(&self, i: usize, sel: &str) -> usize {
+        let mut s = self.sites();
+        if s[i].nargs == u32::MAX {
+            s[i].nargs = crate::compile::arg_count(sel) as u32;
+        }
+        s[i].nargs as usize
+    }
+
+    /// What site `i` last found for receiver key `k`, if that is still good.
+    pub fn site_hit(&self, i: usize, k: ObjRef) -> Option<Hit> {
+        match self.sites()[i].hit {
+            Some((g, r, h)) if r == k && g == lookup_gen() => Some(h),
+            _ => None,
+        }
+    }
+
+    pub fn site_fill(&self, i: usize, k: ObjRef, h: Hit) {
+        self.sites()[i].hit = Some((lookup_gen(), k, h));
+    }
 }
 
 /// One activation's mutable state. Lives on the heap because blocks capture it.
@@ -496,14 +557,19 @@ impl Vm {
         }
     }
 
-    pub fn lookup(&self, recv: &Value, sel: &str) -> Result<Hit, LookupErr> {
-        // an immediate's search starts in its traits, so cache it there and
-        // every int shares one entry
-        let key = match recv.as_obj() {
+    /// The object a search actually starts from, and so what a memoised
+    /// lookup is keyed on: an immediate has none of its own slots, so it
+    /// starts in its traits and every int shares one entry.
+    pub fn lookup_key(&self, recv: &Value) -> ObjRef {
+        match recv.as_obj() {
             Some(o) => o,
             None => self.implicit_parent(recv).unwrap().as_obj().unwrap(),
-        };
-        let gen = LOOKUP_GEN.with(|g| g.get());
+        }
+    }
+
+    pub fn lookup(&self, recv: &Value, sel: &str) -> Result<Hit, LookupErr> {
+        let key = self.lookup_key(recv);
+        let gen = lookup_gen();
         {
             let mut c = self.lookup_cache.borrow_mut();
             if c.gen != gen {

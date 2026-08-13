@@ -124,4 +124,25 @@ t check: 'fib'      Is: ((| parent* = traits object.
     fib: n = ( n < 2 ifTrue: [ n ] False: [ (fib: n - 1) + (fib: n - 2) ] ) |) fib: 20)
                     Should: 6765.
 
+"--- inline caches: one send site, sent to over and over. Every check below
+     runs the *same* `o v` in `fetch:`, so the site's cached hit is what is
+     under test: it has to notice an unrelated receiver, an inherited slot,
+     an immediate (whose lookup starts in its traits, not in itself), and a
+     slot added later that shadows what it found."
+globals _AddSlots: ( | ic = (| parent* = traits object.
+    fetch: o = ( o v ).
+    twice: x = ( x + x ).
+    proto = (| parent* = traits object. v = 'proto' |).
+    other = (| parent* = traits object. v = 'other' |).
+| ) | ).
+globals _AddSlots: ( | icChild = (| parent* = ic proto |) | ).
+
+t check: 'ic fill'   Is: (ic fetch: ic proto) Should: 'proto'.
+t check: 'ic poly'   Is: (ic fetch: ic other) Should: 'other'.
+t check: 'ic parent' Is: (ic fetch: icChild)  Should: 'proto'.
+icChild _AddSlots: (| v = 'own' |).
+t check: 'ic shadow' Is: (ic fetch: icChild)  Should: 'own'.
+t check: 'ic int'    Is: (ic twice: 3)        Should: 6.
+t check: 'ic float'  Is: (ic twice: 2.5)      Should: 5.0.
+
 t n print. ' tests passed' printLine.

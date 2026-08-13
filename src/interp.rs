@@ -195,6 +195,7 @@ pub fn stack_for_send(vm: &mut Vm, recv: Value, sel: &str, args: Vec<Value>) -> 
         file: "<process>".into(),
         line: 0,
         source: None,
+        sites: Default::default(),
     });
     let mut a = vec![recv.clone()];
     a.extend(args);
@@ -224,6 +225,7 @@ pub fn send(vm: &mut Vm, recv: Value, sel: &str, args: Vec<Value>) -> Result<Val
         file: "<vm>".into(),
         line: 0,
         source: None,
+        sites: Default::default(),
     });
     let mut a = vec![recv];
     a.extend(args);
@@ -459,7 +461,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     Some(s) => s,
                     None => return Err(err(frames, "selector must be a string".into())),
                 };
-                let argc = arg_count(&sel);
+                let argc = frames.last().unwrap().scope.method.site_nargs(idx, &sel);
                 let (mut cur_recv, mut cur_args) = {
                     let f = frames.last_mut().unwrap();
                     if f.stack.len() < argc + normal as usize {
@@ -478,6 +480,14 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let mut cur_del = delegatee.take();
                 let mut cur_resend = resend;
                 resend = false;
+                // This send's inline cache, good for one trip round the loop
+                // only: a retry (a primitive's fail block, undefinedSelector)
+                // carries a different selector, and the cache belongs to the
+                // site, not to whatever is being sent from it. Primitives and
+                // resends never reach `lookup` by this path, so they leave the
+                // site empty rather than filling it with someone else's hit.
+                let mut site = (!cur_resend && cur_del.is_none() && !cur_sel.starts_with('_'))
+                    .then_some(idx);
 
                 loop {
                     // _Restart re-enters the current activation from the top,
@@ -564,7 +574,20 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     }
 
                     let holder = frames.last().unwrap().scope.holder.clone();
-                    let found = if cur_resend {
+                    let found = if let Some(s) = site.take() {
+                        let m = &frames.last().unwrap().scope.method;
+                        let key = vm.lookup_key(&cur_recv);
+                        match m.site_hit(s, key) {
+                            Some(h) => Ok(h),
+                            None => {
+                                let r = vm.lookup(&cur_recv, &cur_sel);
+                                if let Ok(h) = r {
+                                    m.site_fill(s, key, h);
+                                }
+                                r
+                            }
+                        }
+                    } else if cur_resend {
                         vm.lookup_in_parents(&holder, &cur_sel)
                     } else if let Some(d) = cur_del.take() {
                         match vm.lookup(&holder, &d) {

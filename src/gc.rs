@@ -924,6 +924,7 @@ mod tests {
             file: "t".into(),
             line: 0,
             source: None,
+            sites: Default::default(),
         })
     }
 
@@ -1042,6 +1043,7 @@ fn method_with(lits: Vec<Value>) -> Rc<Method> {
         file: "t".into(),
         line: 0,
         source: None,
+        sites: Default::default(),
     })
 }
 

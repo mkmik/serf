@@ -262,6 +262,7 @@ impl<'a> C<'a> {
             file: self.file.clone(),
             line: mb.line,
             source: None,
+            sites: Default::default(),
         }))
     }
 

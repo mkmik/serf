@@ -535,6 +535,7 @@ impl<'a> Loader<'a> {
             file: self.heap.string_at(file).unwrap_or_default().as_str().into(),
             line: smi(line).max(0) as u32,
             source,
+            sites: Default::default(),
         });
         self.methods.insert(map_star, m.clone());
         Ok(m)
