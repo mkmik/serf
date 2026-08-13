@@ -15,7 +15,7 @@ use crate::value::*;
 
 pub fn value_key(v: &Value) -> usize {
     match v {
-        Value::Obj(o) => Rc::as_ptr(o) as usize,
+        Value::Obj(o) => o.id(),
         _ => 0,
     }
 }
@@ -659,7 +659,7 @@ impl<'a> Builder<'a> {
     }
 
     fn add(&mut self, v: Value, kind: Kind, obj_slots: Vec<Rc<str>>, words: usize) -> usize {
-        let key = match &v { Value::Obj(o) => Rc::as_ptr(o) as usize, _ => 0 };
+        let key = match &v { Value::Obj(o) => o.id(), _ => 0 };
         let i = self.items.len();
         if key != 0 {
             self.index.insert(key, i);
@@ -674,7 +674,7 @@ impl<'a> Builder<'a> {
             Some(o) => o.clone(),
             None => return Ok(None), // immediates live in the referring word
         };
-        if let Some(&i) = self.index.get(&(Rc::as_ptr(&o) as usize)) {
+        if let Some(&i) = self.index.get(&o.id()) {
             return Ok(Some(i));
         }
         // assignable slots are the ones with a matching `name:` writer
@@ -712,7 +712,7 @@ impl<'a> Builder<'a> {
             let text = v.bytes().unwrap();
             // a string that came from an image keeps its own identity; only
             // serf-native strings are canonicalised by content here
-            if self.vm.obj_kind.contains_key(&(Rc::as_ptr(&o) as usize)) {
+            if self.vm.obj_kind.contains_key(&o.id()) {
                 let i = self.add(v.clone(), Kind::Str, vec![], 4);
                 let off = self.bytes.len() as u32;
                 self.bytes.extend_from_slice(&text);
@@ -724,7 +724,7 @@ impl<'a> Builder<'a> {
                 return Ok(Some(i));
             }
             let i = self.string(&text);
-            self.index.insert(Rc::as_ptr(&o) as usize, i);
+            self.index.insert(o.id(), i);
             return Ok(Some(i));
         }
 
@@ -849,7 +849,7 @@ impl<'a> Builder<'a> {
             Value::Obj(o) => {
                 let i = *self
                     .index
-                    .get(&(Rc::as_ptr(o) as usize))
+                    .get(&o.id())
                     .ok_or("object was not visited")?;
                 self.items[i].addr | MEM_TAG
             }
@@ -1262,6 +1262,9 @@ fn map_body_len(body: &[u32]) -> usize {
 /// Build a snapshot: of a loaded image's roots if one is present, else of
 /// serf's own world.
 pub fn build(vm: &Vm) -> Result<Snapshot, String> {
+    // the builder's work list is a Rust local holding every object it has laid
+    // out so far, and it allocates strings and vectors as it goes
+    let _g = crate::gc::NoGc::new();
     let mut b = Builder::new(vm);
     if let Some(vs) = &vm.image_strings {
         // reuse the image's own canonical strings, so identities survive

@@ -7,8 +7,36 @@ cargo test --release --quiet
 R=./target/release/serf
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
+# the suite runs the VM a few dozen times; it need not listen a few dozen times
+export SERF_METRICS=off
 
 $R self/test.self
+
+# again with a young generation small enough to scavenge hundreds of times,
+# checking the write barrier against a full scan of the old generation as it
+# goes: a missed root shows up as a wrong answer or a panic, a missed barrier
+# makes the check itself fail the run
+SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R self/test.self >/dev/null
+# and against a real world, which is where old objects and old->young writes
+# actually exist -- test.self's heap is too small to build one
+[ -f core.snap ] && SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R --load core.snap \
+  -e "(1 to: 200) do: [|:i| (i printString , 'x') hash ]" >/dev/null 2>&1
+echo "gc checks ok"
+
+# scrape a running VM on the port it picked for itself
+if command -v curl >/dev/null; then
+  SERF_METRICS=on $R -e "[ | i <- 0. v | [ i < 2000000 ] whileTrue: [ v: (vector copySize: 8). i: i + 1 ]. i ] value" \
+    >/dev/null 2>"$T/m" &
+  pid=$!
+  n=0
+  while [ $n -lt 50 ] && ! grep -q 127.0.0.1 "$T/m" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+  port=$(sed -n 's|.*127\.0\.0\.1:\([0-9]*\).*|\1|p' "$T/m")
+  curl -s "http://127.0.0.1:$port/metrics" > "$T/scrape" || true
+  wait $pid
+  grep -q '^serf_gc_pause_seconds_count{generation="young"} [1-9]' "$T/scrape" || {
+    echo "metrics: nothing scraped from port [$port]"; cat "$T/scrape"; exit 1; }
+  echo "metrics ok"
+fi
 
 cat > "$T/w.self" <<'EOF'
 globals _AddSlots: ( | demo = (| parent* = traits object.

@@ -3,15 +3,17 @@
 //! Follows vm/src/any/objects: everything is an object with named slots;
 //! inheritance is delegation through slots marked as parents. Unlike the C++
 //! VM there are no maps -- every object carries its own slot vector.
-//! ponytail: no maps, no GC (Rc); cycles leak. Add a tracing collector only if
-//! a real workload needs it.
+//! ponytail: no maps.
+//!
+//! An object lives in the heap in `gc.rs`; a `Value` names one by handle, so a
+//! `Value` is `Copy` and identity is the handle.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-pub type ObjRef = Rc<RefCell<Obj>>;
+pub use crate::gc::ObjRef;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -102,19 +104,19 @@ impl Scope {
 
 impl Value {
     pub fn obj(slots: Vec<Slot>, payload: Payload) -> Value {
-        Value::Obj(Rc::new(RefCell::new(Obj { slots, payload })))
+        Value::Obj(crate::gc::alloc(slots, payload))
     }
     pub fn id_eq(&self, o: &Value) -> bool {
         match (self, o) {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Obj(a), Value::Obj(b)) => Rc::ptr_eq(a, b),
+            (Value::Obj(a), Value::Obj(b)) => a == b,
             _ => false,
         }
     }
-    pub fn as_obj(&self) -> Option<&ObjRef> {
+    pub fn as_obj(&self) -> Option<ObjRef> {
         match self {
-            Value::Obj(o) => Some(o),
+            Value::Obj(o) => Some(*o),
             _ => None,
         }
     }
@@ -165,6 +167,16 @@ pub enum LookupErr {
     Ambiguous,
 }
 
+/// One edge into the object graph. A `Scope` is not a heap object -- it is
+/// reference counted, and holding one alive keeps the `Value`s inside it alive
+/// too -- so the collector has to be told about it separately. A `Method` needs
+/// no such case: one is only ever reached through the scope it runs in or the
+/// object that holds it.
+pub enum Root {
+    Val(Value),
+    Scope(Rc<Scope>),
+}
+
 /// Where a selector was found: a slot index in some holder object.
 pub struct Hit {
     pub holder: ObjRef,
@@ -207,6 +219,15 @@ pub struct Vm {
     pub ffi: crate::ffi::Ffi,
     /// parked Self process stacks, keyed by process object identity
     pub procs: std::collections::HashMap<usize, Vec<crate::interp::Frame>>,
+    /// frame stacks lent to the Vm while the interpreter is somewhere it could
+    /// collect. A nested run (the scheduler stepping a process, a fail block,
+    /// `_Parse…`) leaves the outer stacks as Rust locals, where the collector
+    /// cannot see them, so `run_stack` lends its own across anything that
+    /// might re-enter.
+    pub stacks: Vec<Vec<crate::interp::Frame>>,
+    /// values held in Rust locals across a call that can re-enter the
+    /// interpreter, and so across a collection
+    pub temp_roots: Vec<Value>,
     /// the process the scheduler is currently running, for _ThisProcess
     pub current_proc: Option<Value>,
     /// stand-in process for code run outside the scheduler, which must not be
@@ -309,6 +330,8 @@ impl Vm {
             obj_kind: std::collections::HashMap::new(),
             ffi: crate::ffi::Ffi::default(),
             procs: std::collections::HashMap::new(),
+            stacks: vec![],
+            temp_roots: vec![],
             current_proc: None,
             vm_proc: None,
             signals_blocked: false,
@@ -318,6 +341,72 @@ impl Vm {
             flags: std::collections::HashMap::new(),
             canonical: std::collections::HashMap::new(),
         }
+    }
+
+    /// Everything the collector must treat as live. Miss one and the object it
+    /// names is collected out from under the VM, so this walks every field of
+    /// `Vm` that can hold a `Value`, however deeply.
+    ///
+    /// The address-keyed side tables are handled as weak-key tables: their
+    /// contents are traced here, and `sweep_weak` then drops whole entries
+    /// whose key object turned out to be dead. An entry therefore outlives its
+    /// object by one collection, which costs nothing and avoids a fixpoint.
+    pub fn each_root(&self, f: &mut dyn FnMut(Root)) {
+        let mut v = |x: &Value| f(Root::Val(*x));
+        for x in [
+            &self.lobby,
+            &self.globals,
+            &self.nil,
+            &self.tru,
+            &self.fals,
+            &self.t_smallint,
+            &self.t_float,
+            &self.t_string,
+            &self.t_bytevector,
+            &self.t_vector,
+            &self.t_block,
+        ] {
+            v(x);
+        }
+        for x in [&self.image_true, &self.image_false, &self.current_proc, &self.vm_proc] {
+            if let Some(x) = x {
+                v(x);
+            }
+        }
+        for x in self.image_roots.iter().chain(self.image_strings.iter()).flatten() {
+            v(x);
+        }
+        // canonical strings are strong, as the C++ VM's string table is at a
+        // scavenge (stringTable.hh:87). ponytail: prune them at a major
+        // collection if a long session ever accumulates too many.
+        for x in self.canonical.values().chain(self.flags.values()) {
+            v(x);
+        }
+        // ponytail: a loaded world has one of these per annotated slot -- a
+        // couple of hundred thousand for morphic -- and a scavenge walks them
+        // all to find the handful that are young. Worth a young/old split of
+        // the tables only if the young generation is ever made small enough
+        // for that constant to show.
+        for x in self.anno_obj.values().chain(self.anno_slot.values()) {
+            v(x);
+        }
+        for x in self.temp_roots.iter() {
+            v(x);
+        }
+        for fs in self.stacks.iter().chain(self.procs.values()) {
+            crate::interp::frame_roots(fs, f);
+        }
+    }
+
+    /// Drop side-table entries whose object died. Handle ids are recycled, so a
+    /// stale entry would otherwise reattach an annotation or an identity hash
+    /// to an unrelated object later on.
+    pub fn sweep_weak(&mut self, dead: &dyn Fn(usize) -> bool) {
+        self.anno_obj.retain(|k, _| !dead(*k));
+        self.anno_slot.retain(|(k, _), _| !dead(*k));
+        self.id_hash.retain(|k, _| !dead(*k));
+        self.obj_kind.retain(|k, _| !dead(*k));
+        self.procs.retain(|k, _| !dead(*k));
     }
 
     pub fn is_false(&self, v: &Value) -> bool {
@@ -369,7 +458,7 @@ impl Vm {
 
     pub fn lookup(&self, recv: &Value, sel: &str) -> Result<Hit, LookupErr> {
         let mut hits: Vec<Hit> = vec![];
-        let mut seen: Vec<*const RefCell<Obj>> = vec![];
+        let mut seen: Vec<ObjRef> = vec![];
         self.search(recv, sel, &mut hits, &mut seen);
         match hits.len() {
             0 => Err(LookupErr::NotFound),
@@ -381,9 +470,9 @@ impl Vm {
     /// Undirected resend: skip the holder's own slots, search only its parents.
     pub fn lookup_in_parents(&self, holder: &Value, sel: &str) -> Result<Hit, LookupErr> {
         let mut hits: Vec<Hit> = vec![];
-        let mut seen: Vec<*const RefCell<Obj>> = vec![];
+        let mut seen: Vec<ObjRef> = vec![];
         if let Some(o) = holder.as_obj() {
-            seen.push(Rc::as_ptr(o));
+            seen.push(o);
             let parents: Vec<Value> = o
                 .borrow()
                 .slots
@@ -402,22 +491,21 @@ impl Vm {
         }
     }
 
-    fn search(&self, recv: &Value, sel: &str, hits: &mut Vec<Hit>, seen: &mut Vec<*const RefCell<Obj>>) {
+    fn search(&self, recv: &Value, sel: &str, hits: &mut Vec<Hit>, seen: &mut Vec<ObjRef>) {
         let o = match recv {
-            Value::Obj(o) => o.clone(),
+            Value::Obj(o) => *o,
             _ => {
                 let p = self.implicit_parent(recv).unwrap();
                 return self.search(&p, sel, hits, seen);
             }
         };
-        let key = Rc::as_ptr(&o);
-        if seen.contains(&key) {
+        if seen.contains(&o) {
             return;
         }
-        seen.push(key);
+        seen.push(o);
         if let Some(idx) = o.borrow().find(sel) {
-            if !hits.iter().any(|h| Rc::ptr_eq(&h.holder, &o) && h.idx == idx) {
-                hits.push(Hit { holder: o.clone(), idx });
+            if !hits.iter().any(|h| h.holder == o && h.idx == idx) {
+                hits.push(Hit { holder: o, idx });
             }
             return; // a local slot shadows every parent
         }

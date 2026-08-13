@@ -1,9 +1,11 @@
 //! Bytecode interpreter.
 //!
 //! Activations live in an explicit `Vec<Frame>` rather than on the Rust stack,
-//! so Self-level recursion is bounded by memory, not by the host stack. Sends
-//! in tail position reuse the caller's frame when no block has captured it,
-//! which is what makes `whileTrue:` (recursive in Self) run in constant space.
+//! so Self-level recursion is bounded by memory, not by the host stack. A send
+//! in tail position always reuses the caller's frame, which is what makes
+//! `whileTrue:` (recursive in Self) run in constant space; the frame carries
+//! the activations it displaced, so a block returning non-locally to one of
+//! them still finds the continuation it belongs to.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -27,6 +29,55 @@ pub struct Frame {
     scope: Rc<Scope>,
     stack: Vec<Value>,
     pc: usize,
+    /// activations this frame tail-called away from. They have not returned --
+    /// their continuation is now this frame's -- so a block returning
+    /// non-locally to one of them has to find it here.
+    tail_of: Vec<Rc<Scope>>,
+}
+
+impl Frame {
+    fn new(scope: Rc<Scope>) -> Frame {
+        Frame { scope, stack: vec![], pc: 0, tail_of: vec![] }
+    }
+
+    /// This frame's activation and every one whose continuation it took over
+    /// have now genuinely returned.
+    fn retire(&self) {
+        self.scope.dead.set(true);
+        for s in self.tail_of.iter() {
+            s.dead.set(true);
+        }
+    }
+
+    fn is_home(&self, target: &Rc<Scope>) -> bool {
+        Rc::ptr_eq(&self.scope, target) || self.tail_of.iter().any(|s| Rc::ptr_eq(s, target))
+    }
+}
+
+/// Everything a frame stack keeps alive. Not `tail_of`: those activations are
+/// held for their identity as a non-local return target, and nothing ever reads
+/// their slots through this list. Whatever *can* read them -- the block that
+/// captured one -- is an object, and reaching that object traces the scope.
+pub fn frame_roots(fs: &[Frame], f: &mut dyn FnMut(Root)) {
+    for fr in fs.iter() {
+        f(Root::Scope(fr.scope.clone()));
+        for v in fr.stack.iter() {
+            f(Root::Val(*v));
+        }
+    }
+}
+
+/// Lend the frame stack to the `Vm` for the duration of `body`, so that a
+/// collection inside it can see the activations as roots. Every path that can
+/// re-enter the interpreter or reach a safepoint goes through here: an outer
+/// `run_stack`'s frames are otherwise a Rust local, invisible to the collector.
+/// Moving a `Vec` is two pointer writes, so this is cheap enough to do around
+/// every primitive call.
+fn lending<T>(vm: &mut Vm, frames: &mut Vec<Frame>, body: impl FnOnce(&mut Vm) -> T) -> T {
+    vm.stacks.push(std::mem::take(frames));
+    let r = body(vm);
+    *frames = vm.stacks.pop().unwrap();
+    r
 }
 
 /// Why `run_stack` came back.
@@ -148,7 +199,7 @@ pub fn stack_for_send(vm: &mut Vm, recv: Value, sel: &str, args: Vec<Value>) -> 
     let mut a = vec![recv.clone()];
     a.extend(args);
     let scope = new_scope(m, recv.clone(), recv, a, None);
-    vec![Frame { scope, stack: vec![], pc: 0 }]
+    vec![Frame::new(scope)]
 }
 
 /// Send a message from Rust (used by the REPL for `printString`).
@@ -234,7 +285,7 @@ fn clone_block(proto: &Value, scope: &Rc<Scope>) -> Value {
 /// a scheduler for code that yields for a service; a real one would pick the
 /// next process off the ready queue.
 pub fn run(vm: &mut Vm, scope: Rc<Scope>) -> Result<Value, Unwind> {
-    let mut frames = vec![Frame { scope, stack: vec![], pc: 0 }];
+    let mut frames = vec![Frame::new(scope)];
     loop {
         match run_stack(vm, &mut frames)? {
             Outcome::Done(v) => return Ok(v),
@@ -243,8 +294,12 @@ pub fn run(vm: &mut Vm, scope: Rc<Scope>) -> Result<Value, Unwind> {
                 // then transfers out. A real scheduler leaves such a process
                 // suspended and runs someone else; resuming it would fall
                 // into the code after the error, so stop instead.
-                let failed = cause_of_error(vm);
-                send(vm, arg, "doAction", vec![])?;
+                let n_roots = vm.temp_roots.len();
+                vm.temp_roots.push(arg);
+                let failed = lending(vm, &mut frames, cause_of_error);
+                let sent = lending(vm, &mut frames, |vm| send(vm, arg, "doAction", vec![]));
+                vm.temp_roots.truncate(n_roots);
+                sent?;
                 if let Some(msg) = failed {
                     clear_cause_of_error(vm);
                     return Err(err(&frames, msg));
@@ -257,6 +312,7 @@ pub fn run(vm: &mut Vm, scope: Rc<Scope>) -> Result<Value, Unwind> {
 /// A frame stack is a Self process's stack: run it until it finishes or
 /// yields, leaving it resumable either way.
 pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind> {
+    let heap = crate::gc::gc();
     // interbytecode state, per the C++ abstract_interpreter
     let mut index: usize = 0;
     let mut lex_level: usize = 0;
@@ -264,6 +320,15 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
     let mut resend = false;
 
     loop {
+        // The safepoint. Allocation only ever asks for a collection; it
+        // happens here, between two bytecodes, where the only live references
+        // are the ones `Vm::each_root` walks. The C++ VM arranges the same
+        // thing by poisoning the stack limit so the next method prologue traps
+        // (universe.hh:148).
+        if heap.wanted() {
+            lending(vm, frames, crate::gc::collect_if_wanted);
+        }
+
         let (at_end, op, x) = {
             let f = frames.last().unwrap();
             let code = &f.scope.method.code;
@@ -278,7 +343,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
         if at_end {
             let f = frames.pop().unwrap();
             let res = f.stack.last().cloned().unwrap_or_else(|| f.scope.recv.clone());
-            f.scope.dead.set(true);
+            f.retire();
             match frames.last_mut() {
                 None => return Ok(Outcome::Done(res)),
                 Some(c) => c.stack.push(res),
@@ -326,8 +391,8 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     }
                     loop {
                         let f = frames.pop().unwrap();
-                        let hit = Rc::ptr_eq(&f.scope, &target);
-                        f.scope.dead.set(true);
+                        let hit = f.is_home(&target);
+                        f.retire();
                         if hit {
                             match frames.last_mut() {
                                 None => return Ok(Outcome::Done(value)),
@@ -436,7 +501,17 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 fail = cur_args.pop();
                             }
                         }
-                        match prims::call(vm, base, &cur_recv, &cur_args) {
+                        // a primitive can re-enter the interpreter (the
+                        // scheduler stepping a process, `_Parse…` compiling),
+                        // and so can collect: everything live in this Rust
+                        // frame has to be reachable from the Vm first
+                        let n_roots = vm.temp_roots.len();
+                        vm.temp_roots.push(cur_recv);
+                        vm.temp_roots.extend_from_slice(&cur_args);
+                        vm.temp_roots.extend(fail);
+                        let called = lending(vm, frames, |vm| prims::call(vm, base, &cur_recv, &cur_args));
+                        vm.temp_roots.truncate(n_roots);
+                        match called {
                             Err(m) => match fail {
                                 Some(b) => {
                                     if std::env::var_os("SERF_TRACE_PRIMS").is_some() {
@@ -474,7 +549,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                             }
                             Ok(prims::P::Activate(m, r)) => {
                                 let ns = new_scope(m, r.clone(), r, vec![], None);
-                                frames.push(Frame { scope: ns, stack: vec![], pc: 0 });
+                                frames.push(Frame::new(ns));
                                 break;
                             }
                             Ok(prims::P::Send(r, s, a)) => {
@@ -519,7 +594,17 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                             // on demand and how morphs forward messages.
                             const ERR_SEL: &str =
                                 "undefinedSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:";
-                            let proc = match prims::call(vm, "_ThisProcess", &cur_recv, &[]) {
+                            // `_ThisProcess` only reads or allocates, so it
+                            // cannot collect -- but it is reached by a runtime
+                            // name like any other primitive, so it gets the
+                            // same treatment as the call at the top of the loop
+                            let n_roots = vm.temp_roots.len();
+                            vm.temp_roots.push(cur_recv);
+                            let this = lending(vm, frames, |vm| {
+                                prims::call(vm, "_ThisProcess", &cur_recv, &[])
+                            });
+                            vm.temp_roots.truncate(n_roots);
+                            let proc = match this {
                                 Ok(prims::P::Val(p)) if &*cur_sel != ERR_SEL => Some(p),
                                 _ => None,
                             };
@@ -599,16 +684,33 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
 
                     let ns = new_scope(m, nrecv, nholder, cur_args, lexical);
 
-                    // tail call: drop our frame first if nothing else can reach it
+                    // A send in tail position takes over our frame: there is
+                    // nothing left for us to do with the answer but hand it on.
+                    // We do not return, though -- a block of ours may still
+                    // return non-locally *through* us -- so the callee's frame
+                    // carries our activation as one it now stands for. Nothing
+                    // can reach an activation with no other reference, so those
+                    // are simply retired.
                     let tail = {
                         let f = frames.last().unwrap();
-                        f.pc >= f.scope.method.code.len()
-                            && f.stack.is_empty()
-                            && Rc::strong_count(&f.scope) == 1
+                        f.pc >= f.scope.method.code.len() && f.stack.is_empty()
                     };
+                    let mut carried = vec![];
                     if tail {
                         let old = frames.pop().unwrap();
-                        old.scope.dead.set(true);
+                        carried = old.tail_of;
+                        if Rc::strong_count(&old.scope) > 1 {
+                            carried.push(old.scope);
+                        } else {
+                            old.scope.dead.set(true);
+                        }
+                        // Blocks die with a collection, not with the send they
+                        // were passed to, so the list holds on to activations
+                        // that nothing can reach any more. Weeding it out on
+                        // every power of two keeps that amortised.
+                        if carried.len() >= 64 && carried.len().is_power_of_two() {
+                            carried.retain(|s| Rc::strong_count(s) > 1);
+                        }
                     }
                     if frames.len() >= vm.max_frames {
                         let mut h: std::collections::HashMap<String, usize> = Default::default();
@@ -623,7 +725,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         }
                         return Err(err(frames, "activation stack overflow".into()));
                     }
-                    frames.push(Frame { scope: ns, stack: vec![], pc: 0 });
+                    frames.push(Frame { tail_of: carried, ..Frame::new(ns) });
                     break;
                 }
             }

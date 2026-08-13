@@ -86,6 +86,8 @@ never pops a window. `SERF_X11=real ./run-tests.sh` uses `$DISPLAY` instead
 | `src/interp.rs` | the interpreter loop, after `vm/src/any/interpreter/` |
 | `src/value.rs` | objects, slots, and the multiple-parent lookup |
 | `src/prims.rs` | primitives (`_IntAdd:`, `_Clone`, `_AddSlots:`, …) |
+| `src/gc.rs` | the object heap: a generational collector, after `memory/` |
+| `src/metrics.rs` | Prometheus metrics for it, over a one-page HTTP server |
 | `src/image.rs` | snapshot file format, after `memory/universe.cpp` and `space.cpp` |
 | `src/image_obj.rs` | snapshot words <-> serf objects: maps, slot descriptors, layout |
 | `self/init.self` | the world: traits object/boolean/block/number/indexable |
@@ -105,10 +107,77 @@ Two things worth knowing about the interpreter:
 
 * Activations live in a `Vec`, not on the Rust stack, so Self recursion is
   bounded by memory (500k frames, then a clean error) rather than by a segfault.
-* A send in tail position reuses the caller's frame **when nothing else holds
-  its scope** (`Rc::strong_count == 1`). That check is what keeps `^` out of a
-  block from ever targeting a frame that tail-calling threw away, and it is why
-  `whileTrue:` — genuine recursion in Self — runs in constant space.
+* A send in tail position always reuses the caller's frame, which is why
+  `whileTrue:` — genuine recursion in Self — runs in constant space. An
+  activation that tail-calls has not returned, so the callee's frame carries
+  it: a `^` out of one of its blocks finds the continuation there and returns
+  through it. (Before there was a collector this was decided by asking whether
+  anything else still held the scope, which only worked because `Rc` freed a
+  discarded block immediately.)
+
+## Garbage collection
+
+Generation Scavenging, as in `memory/`: a young generation of two semispaces
+that surviving objects are copied between, and an old generation swept by mark
+and sweep. An object that survives two scavenges is tenured. A `Value` is a
+handle — an index into a table saying where the object currently is — so moving
+an object is one table store and no reference anywhere else changes. That is
+also what makes `_Define` cheap: the C++ VM scans the whole heap to switch
+pointers (`memory/universe.cpp:315`), serf assigns.
+
+Old objects that are written to are remembered, so a scavenge scans them and
+not the whole old generation; the remembered set is exact rather than
+card-marked, because `ObjRef::borrow_mut` is the only way to mutate an object
+and can therefore do the recording itself.
+
+Allocation never collects: it fills the young space and asks for a collection,
+which happens at a safepoint between two bytecodes, where every live reference
+is reachable from the `Vm`. The interpreter lends its activation stack to the
+`Vm` across anything that can re-enter it, and image load, image save and
+compilation — which keep half-built graphs in Rust locals — suspend collection
+outright.
+
+```sh
+SERF_GC=off      ./target/release/serf …   # never collect
+SERF_GC_STRESS=1 ./target/release/serf …   # collect after every allocation and
+                                           # never recycle a handle, so touching
+                                           # a missed root panics on the spot
+SERF_GC_VERIFY=1 ./target/release/serf …   # scan every old object, not just the
+                                           # remembered ones: one that was
+                                           # written without the barrier firing
+                                           # fails the run
+SERF_GC_STATS=1  ./target/release/serf …   # a line per collection
+SERF_GC_YOUNG=n  ./target/release/serf …   # objects per semispace (65536)
+```
+
+`memory scavenge` and `memory garbageCollect` work from Self, through
+`_Scavenge` and `_GarbageCollect`; both take effect at the next safepoint.
+
+### Metrics
+
+Every VM serves Prometheus metrics on a port the OS picks, so any number of
+them can run at once, and says which on startup:
+
+```
+$ ./target/release/serf morphic.snap
+serf: metrics on http://127.0.0.1:53318/metrics
+```
+
+```
+serf_gc_collections_total{generation="young"}         37
+serf_gc_pause_seconds_bucket{generation="young",…}    histogram of pauses
+serf_gc_pause_seconds_max{generation="young"}         0.001746208
+serf_gc_objects_allocated_total                       1867249
+serf_gc_objects_freed_total                           1866756
+serf_gc_objects_promoted_total                        491
+serf_gc_young_objects / serf_gc_old_objects           heap occupancy
+serf_gc_young_capacity_objects                        65536
+serf_gc_remembered_objects                            2
+```
+
+A collection is stop-the-world — one thread, and it only runs at a safepoint —
+so `serf_gc_pause_seconds` is the whole pause, not a component of it.
+`SERF_METRICS=off` to keep the port shut.
 
 ## Images
 
@@ -287,9 +356,8 @@ stack.
 * **No JIT and no maps.** Every object owns its slot vector and lookup is a
   linear scan. ~1.5M sends/s; a 3M-iteration loop takes ~4s. Add maps and
   inline caches when that number matters.
-* **No GC.** `Rc` everywhere, so cycles (which the world is full of) leak. The
-  world is small and never collected; add a tracing collector before running
-  anything long-lived.
+* **No compaction and no finalization.** The old generation is swept into a
+  free list, never compacted, and nothing runs when an object dies.
 * **No processes, no `IfFail:` protocol, no debugger.** Errors abort to the
   REPL with a Self-level backtrace.
 * **No `{ }` slot annotations**, so the Self 4 world fileouts in `objects/`

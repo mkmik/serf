@@ -1,11 +1,13 @@
 mod compile;
 mod ffi;
+mod gc;
 mod glue_table;
 mod struct_table;
 mod image;
 mod image_obj;
 mod interp;
 mod lexer;
+mod metrics;
 mod parser;
 mod prims;
 mod value;
@@ -41,6 +43,16 @@ fn eval_in_echo(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), St
 /// Evaluate source with a given object as `self` -- for running an image's
 /// own code, where implicit sends must land in the image's world.
 fn eval_in(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String> {
+    // `me` is this function's only reference to the receiver while `show` runs
+    // a send of its own, in whose activations it does not appear
+    let n_roots = vm.temp_roots.len();
+    vm.temp_roots.push(me);
+    let r = eval_in_rooted(vm, src, file, me);
+    vm.temp_roots.truncate(n_roots);
+    r
+}
+
+fn eval_in_rooted(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String> {
     for e in parser::parse_program(src)? {
         let m = compile::compile_statement(vm, &e, file)?;
         let scope = interp::new_scope(m, me.clone(), me.clone(), vec![], None);
@@ -54,7 +66,12 @@ fn eval_in(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String>
 
 /// Ask the object to print itself; fall back to the VM printer.
 fn show(vm: &mut Vm, v: &Value) -> String {
-    if let Ok(s) = interp::send(vm, v.clone(), "printString", vec![]) {
+    // `v` is a Rust local across a send, so the collector needs to be told
+    let n_roots = vm.temp_roots.len();
+    vm.temp_roots.push(*v);
+    let printed = interp::send(vm, v.clone(), "printString", vec![]);
+    vm.temp_roots.truncate(n_roots);
+    if let Ok(s) = printed {
         if let Some(t) = s.as_str() {
             return t;
         }
@@ -116,6 +133,10 @@ fn repl(vm: &mut Vm) {
 
 /// Read a C++-format snapshot and bind its lobby as `snapshotLobby` in globals.
 fn load_image(vm: &mut Vm, path: &str) -> Result<usize, String> {
+    // The whole image graph hangs off the loader's own tables until it is
+    // installed in the Vm, and objects are published half-built, so nothing may
+    // collect until the load is done.
+    let _g = gc::NoGc::new();
     let snap = image::Snapshot::read(std::path::Path::new(path))?;
     // The header's Timestamp is the world's programming timestamp, so a loaded
     // world carries on where it left off. Starting from 0 instead leaves every
@@ -309,7 +330,7 @@ fn world_stats(vm: &Vm) -> String {
             value::Value::Int(i) => { ints = ints.wrapping_add(*i); continue }
             value::Value::Float(f) => { floats += 1; ints = ints.wrapping_add(f.to_bits() as i64); continue }
             value::Value::Obj(o) => {
-                if !seen.insert(std::rc::Rc::as_ptr(o) as usize) { continue }
+                if !seen.insert(o.id()) { continue }
             }
         }
         objs += 1;
@@ -358,9 +379,11 @@ fn world_stats(vm: &Vm) -> String {
         "objects {} slots {} (parent {} assign {}) annotations {}\n\
          byte objects {} ({} bytes)  vectors {} ({} elements)\n\
          methods {} ({} bytecodes, {} literals)  blocks {}  floats {}  int-checksum {}\n\
-         parents by payload {:?}",
+         parents by payload {:?}\n\
+         heap {} objects (young {} old {})",
         objs, slots, parents, assigns, annos, strs, strbytes, vecs, vecelems,
-        meths, code, lits, blocks, floats, ints, bykind
+        meths, code, lits, blocks, floats, ints, bykind,
+        gc::gc().count(), gc::gc().young_used(), gc::gc().old_used()
     )
 }
 
@@ -377,6 +400,16 @@ fn boot(vm: &mut Vm) {
 }
 
 fn main() {
+    // A port the OS picks, so any number of VMs can run at once; it goes to
+    // stderr, where the rest of the VM's own chatter goes. SERF_METRICS=off
+    // for somewhere that cannot or should not listen.
+    if std::env::var("SERF_METRICS").as_deref() != Ok("off") {
+        match metrics::serve() {
+            Ok(p) => eprintln!("serf: metrics on http://127.0.0.1:{}/metrics", p),
+            Err(e) => eprintln!("serf: no metrics server: {}", e),
+        }
+    }
+
     let mut vm = Vm::new();
     if let Err(e) = eval_source(&mut vm, INIT.as_bytes(), "init.self", false) {
         eprintln!("bootstrap failed: {}", e);
@@ -422,7 +455,7 @@ fn main() {
                 let mut work: Vec<value::Value> = vm.image_roots.clone().unwrap_or_default();
                 while let Some(v) = work.pop() {
                     let o = match v.as_obj() { Some(o) => o.clone(), None => continue };
-                    if !seen.insert(std::rc::Rc::as_ptr(&o) as usize) { continue }
+                    if !seen.insert(o.id()) { continue }
                     let b = o.borrow();
                     for sl in &b.slots { work.push(sl.value.clone()) }
                     match &b.payload {

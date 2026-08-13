@@ -55,6 +55,18 @@ t check: 'nlr miss' Is: (finder find: 9 In: ((vector copySize: 2) at: 0 Put: 3))
 t check: 'nlr tail' Is: (| parent* = traits object.
     run: b = ( b value ). go = ( run: [ ^'escaped' ] ) |) go
                     Should: 'escaped'.
+"go tail-calls run:, so its frame is gone by the time the block returns
+ through it -- twice over, with a second tail call in between"
+t check: 'nlr through two tail calls' Is: (| parent* = traits object.
+    run: b = ( b value. 'wrong' ). mid: b = ( run: b ).
+    go = ( mid: [ ^'through' ] ) |) go
+                    Should: 'through'.
+"a block that outlives the activation it would return to: the tail call must
+ not swallow the answer of the send it handed its frame to"
+t check: 'tail call keeps the answer' Is: (| parent* = traits object.
+    keep <- 0. stash: b = ( keep: b. 'stashed' ).
+    go = ( stash: [ ^'wrong' ] ) |) go
+                    Should: 'stashed'.
 
 "--- inheritance: undirected and directed resends"
 traits _AddSlots: ( | animal = (| parent* = traits object. speak = ( 'noise' ) |) | ).

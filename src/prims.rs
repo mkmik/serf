@@ -92,7 +92,7 @@ fn as_i(v: &Value, who: &str) -> Result<i64, String> {
         _ => Err("badTypeError".into()),
     }
 }
-fn as_obj<'a>(v: &'a Value, who: &str) -> Result<&'a ObjRef, String> {
+fn as_obj(v: &Value, who: &str) -> Result<ObjRef, String> {
     let _ = who;
     v.as_obj().ok_or_else(|| "badTypeError".to_string())
 }
@@ -140,7 +140,7 @@ fn hash_of(v: &Value) -> i64 {
                 }
                 return (h >> 1) as i64;
             }
-            (Rc::as_ptr(o) as usize >> 3) as i64
+            o.id() as i64
         }
     }
 }
@@ -238,9 +238,9 @@ fn proxy_ptr(v: &Value) -> Option<u64> {
 /// since then get one from their address, in the same 22 bits.
 pub fn identity_hash(vm: &Vm, v: &Value) -> i64 {
     match v {
-        Value::Obj(o) => match vm.id_hash.get(&(Rc::as_ptr(o) as usize)) {
+        Value::Obj(o) => match vm.id_hash.get(&o.id()) {
             Some(h) => *h,
-            None => (Rc::as_ptr(o) as usize >> 3) as i64 & 0x3f_ffff,
+            None => o.id() as i64 & 0x3f_ffff,
         },
         _ => hash_of(v),
     }
@@ -248,7 +248,7 @@ pub fn identity_hash(vm: &Vm, v: &Value) -> i64 {
 
 fn key_of(v: &Value) -> usize {
     match v {
-        Value::Obj(o) => Rc::as_ptr(o) as usize,
+        Value::Obj(o) => o.id(),
         _ => 0,
     }
 }
@@ -463,6 +463,21 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             v(Value::obj(o.slots.clone(), payload))
         }
 
+        // ------------------------------------------------------------ memory
+        // `memory scavenge` and `memory garbageCollect` in systemOddballs.self.
+        // They collect at the next safepoint rather than here: this is a Rust
+        // frame with the interpreter's locals below it, so the only place the
+        // roots are all reachable is between two bytecodes.
+        // ponytail: _Tenure is a scavenge here, not "promote everything".
+        "_Scavenge" | "_Tenure" => {
+            crate::gc::gc().request(false);
+            v(*recv)
+        }
+        "_GarbageCollect" => {
+            crate::gc::gc().request(true);
+            v(*recv)
+        }
+
         // ------------------------------------------------------ indexables
         "_ByteSize" => v(Value::Int(match &as_obj(recv, name)?.borrow().payload {
             Payload::Bytes(b) => b.len() as i64,
@@ -584,7 +599,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 .or(dflt)
                 .unwrap_or_else(|| vm.nil_v()))
         }
-        "_MirrorReflecteeIdentityHash" => v(Value::Int((key_of(&reflectee(recv)?) >> 3) as i64)),
+        // mirror.self: "the hash of a mirror is the identity hash of its
+        // reflectee", so it has to be the same answer _IdentityHash gives
+        "_MirrorReflecteeIdentityHash" => v(Value::Int(identity_hash(vm, &reflectee(recv)?))),
         // A mirror on a *method* answers its source and its bytecodes
         // (methodMap::mirror_source and friends); a block method's source is
         // its enclosing method's, sliced by offset and length. This is what an
@@ -843,8 +860,13 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 }
                 None => return Err("noProcessError".into()),
             };
+            // the process we are displacing is a Rust local for the length of
+            // the run, and the world may hold it nowhere else
             let prev = vm.current_proc.replace(recv.clone());
+            let n_roots = vm.temp_roots.len();
+            vm.temp_roots.extend(prev);
             let outcome = crate::interp::run_stack(vm, &mut stack);
+            vm.temp_roots.truncate(n_roots);
             vm.current_proc = prev;
             let cause = match outcome {
                 Ok(crate::interp::Outcome::Yielded { rcvr, arg }) => {
@@ -1018,7 +1040,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let (dp, sp, n) = (dst_pos as usize, src_pos as usize, len as usize);
             let src = args[1].clone();
             let d = as_obj(recv, name)?;
-            let same = src.as_obj().map_or(false, |s| Rc::ptr_eq(s, d));
+            let same = src.as_obj().map_or(false, |s| s == d);
             let taken = if same { None } else { Some(as_obj(&src, name)?.borrow()) };
             let mut db = d.borrow_mut();
             let ok = match (&mut db.payload, taken.as_ref().map(|b| &b.payload)) {
