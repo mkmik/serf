@@ -92,6 +92,7 @@ struct C<'a> {
 
 /// Compile one top-level statement into a runnable method.
 pub fn compile_statement(vm: &mut Vm, e: &Expr, file: &str) -> Result<Rc<Method>, String> {
+    let _g = crate::gc::NoGc::new();
     let o = ObjLit { args: vec![], slots: vec![], body: vec![e.clone()], line: stmt_line(e) };
     let file: Rc<str> = file.into();
     let mut c = C { vm, mbs: vec![], file: file.clone() };
@@ -134,6 +135,12 @@ pub fn build_object(vm: &mut Vm, o: &ObjLit, file: &Rc<str>) -> Result<Value, St
 /// What a parsed body evaluates to: a method if it has code, otherwise the
 /// object its slots describe. Object::Eval in the C++ parser.
 pub fn build_body(vm: &mut Vm, o: &ObjLit, file: &str) -> Result<Value, String> {
+    // Compilation keeps literal vectors and half-built slot lists in Rust
+    // locals, and `eval_const` runs Self code from inside them, so the
+    // collector must stay out until the method exists. ponytail: bounded by
+    // the size of the source being compiled; give `C` a root list if a world
+    // ever compiles enough in one go to matter.
+    let _g = crate::gc::NoGc::new();
     let file: Rc<str> = file.into();
     if is_method_literal(o) {
         let m = compile_method(vm, o, "<doIt>", &file)?;

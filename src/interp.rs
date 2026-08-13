@@ -29,6 +29,29 @@ pub struct Frame {
     pc: usize,
 }
 
+/// Everything a frame stack keeps alive.
+pub fn frame_roots(fs: &[Frame], f: &mut dyn FnMut(Root)) {
+    for fr in fs.iter() {
+        f(Root::Scope(fr.scope.clone()));
+        for v in fr.stack.iter() {
+            f(Root::Val(*v));
+        }
+    }
+}
+
+/// Lend the frame stack to the `Vm` for the duration of `body`, so that a
+/// collection inside it can see the activations as roots. Every path that can
+/// re-enter the interpreter or reach a safepoint goes through here: an outer
+/// `run_stack`'s frames are otherwise a Rust local, invisible to the collector.
+/// Moving a `Vec` is two pointer writes, so this is cheap enough to do around
+/// every primitive call.
+fn lending<T>(vm: &mut Vm, frames: &mut Vec<Frame>, body: impl FnOnce(&mut Vm) -> T) -> T {
+    vm.stacks.push(std::mem::take(frames));
+    let r = body(vm);
+    *frames = vm.stacks.pop().unwrap();
+    r
+}
+
 /// Why `run_stack` came back.
 pub enum Outcome {
     Done(Value),
@@ -243,8 +266,11 @@ pub fn run(vm: &mut Vm, scope: Rc<Scope>) -> Result<Value, Unwind> {
                 // then transfers out. A real scheduler leaves such a process
                 // suspended and runs someone else; resuming it would fall
                 // into the code after the error, so stop instead.
-                let failed = cause_of_error(vm);
-                send(vm, arg, "doAction", vec![])?;
+                vm.temp_roots.push(arg);
+                let failed = lending(vm, &mut frames, cause_of_error);
+                let sent = lending(vm, &mut frames, |vm| send(vm, arg, "doAction", vec![]));
+                vm.temp_roots.pop();
+                sent?;
                 if let Some(msg) = failed {
                     clear_cause_of_error(vm);
                     return Err(err(&frames, msg));
@@ -264,6 +290,15 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
     let mut resend = false;
 
     loop {
+        // The safepoint. Allocation only ever asks for a collection; it
+        // happens here, between two bytecodes, where the only live references
+        // are the ones `Vm::each_root` walks. The C++ VM arranges the same
+        // thing by poisoning the stack limit so the next method prologue traps
+        // (universe.hh:148).
+        if crate::gc::gc().wanted() {
+            lending(vm, frames, crate::gc::collect_if_wanted);
+        }
+
         let (at_end, op, x) = {
             let f = frames.last().unwrap();
             let code = &f.scope.method.code;
@@ -436,7 +471,17 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 fail = cur_args.pop();
                             }
                         }
-                        match prims::call(vm, base, &cur_recv, &cur_args) {
+                        // a primitive can re-enter the interpreter (the
+                        // scheduler stepping a process, `_Parse…` compiling),
+                        // and so can collect: everything live in this Rust
+                        // frame has to be reachable from the Vm first
+                        let n_roots = vm.temp_roots.len();
+                        vm.temp_roots.push(cur_recv);
+                        vm.temp_roots.extend_from_slice(&cur_args);
+                        vm.temp_roots.extend(fail);
+                        let called = lending(vm, frames, |vm| prims::call(vm, base, &cur_recv, &cur_args));
+                        vm.temp_roots.truncate(n_roots);
+                        match called {
                             Err(m) => match fail {
                                 Some(b) => {
                                     if std::env::var_os("SERF_TRACE_PRIMS").is_some() {

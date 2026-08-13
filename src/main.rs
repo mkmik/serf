@@ -1,5 +1,6 @@
 mod compile;
 mod ffi;
+mod gc;
 mod glue_table;
 mod struct_table;
 mod image;
@@ -54,7 +55,11 @@ fn eval_in(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String>
 
 /// Ask the object to print itself; fall back to the VM printer.
 fn show(vm: &mut Vm, v: &Value) -> String {
-    if let Ok(s) = interp::send(vm, v.clone(), "printString", vec![]) {
+    // `v` is a Rust local across a send, so the collector needs to be told
+    vm.temp_roots.push(*v);
+    let printed = interp::send(vm, v.clone(), "printString", vec![]);
+    vm.temp_roots.pop();
+    if let Ok(s) = printed {
         if let Some(t) = s.as_str() {
             return t;
         }
@@ -116,6 +121,10 @@ fn repl(vm: &mut Vm) {
 
 /// Read a C++-format snapshot and bind its lobby as `snapshotLobby` in globals.
 fn load_image(vm: &mut Vm, path: &str) -> Result<usize, String> {
+    // The whole image graph hangs off the loader's own tables until it is
+    // installed in the Vm, and objects are published half-built, so nothing may
+    // collect until the load is done.
+    let _g = gc::NoGc::new();
     let snap = image::Snapshot::read(std::path::Path::new(path))?;
     // The header's Timestamp is the world's programming timestamp, so a loaded
     // world carries on where it left off. Starting from 0 instead leaves every
@@ -309,7 +318,7 @@ fn world_stats(vm: &Vm) -> String {
             value::Value::Int(i) => { ints = ints.wrapping_add(*i); continue }
             value::Value::Float(f) => { floats += 1; ints = ints.wrapping_add(f.to_bits() as i64); continue }
             value::Value::Obj(o) => {
-                if !seen.insert(std::rc::Rc::as_ptr(o) as usize) { continue }
+                if !seen.insert(o.id()) { continue }
             }
         }
         objs += 1;
@@ -358,9 +367,11 @@ fn world_stats(vm: &Vm) -> String {
         "objects {} slots {} (parent {} assign {}) annotations {}\n\
          byte objects {} ({} bytes)  vectors {} ({} elements)\n\
          methods {} ({} bytecodes, {} literals)  blocks {}  floats {}  int-checksum {}\n\
-         parents by payload {:?}",
+         parents by payload {:?}\n\
+         heap {} objects (young {} old {})",
         objs, slots, parents, assigns, annos, strs, strbytes, vecs, vecelems,
-        meths, code, lits, blocks, floats, ints, bykind
+        meths, code, lits, blocks, floats, ints, bykind,
+        gc::gc().count(), gc::gc().young_used(), gc::gc().old_used()
     )
 }
 
@@ -422,7 +433,7 @@ fn main() {
                 let mut work: Vec<value::Value> = vm.image_roots.clone().unwrap_or_default();
                 while let Some(v) = work.pop() {
                     let o = match v.as_obj() { Some(o) => o.clone(), None => continue };
-                    if !seen.insert(std::rc::Rc::as_ptr(&o) as usize) { continue }
+                    if !seen.insert(o.id()) { continue }
                     let b = o.borrow();
                     for sl in &b.slots { work.push(sl.value.clone()) }
                     match &b.payload {
