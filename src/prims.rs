@@ -599,7 +599,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 .or(dflt)
                 .unwrap_or_else(|| vm.nil_v()))
         }
-        "_MirrorReflecteeIdentityHash" => v(Value::Int((key_of(&reflectee(recv)?) >> 3) as i64)),
+        // mirror.self: "the hash of a mirror is the identity hash of its
+        // reflectee", so it has to be the same answer _IdentityHash gives
+        "_MirrorReflecteeIdentityHash" => v(Value::Int(identity_hash(vm, &reflectee(recv)?))),
         // A mirror on a *method* answers its source and its bytecodes
         // (methodMap::mirror_source and friends); a block method's source is
         // its enclosing method's, sliced by offset and length. This is what an

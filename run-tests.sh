@@ -12,8 +12,13 @@ $R self/test.self
 
 # again with a young generation small enough to scavenge hundreds of times,
 # checking the write barrier against a full scan of the old generation as it
-# goes: a missed root or a missed barrier shows up as a wrong answer here
+# goes: a missed root shows up as a wrong answer or a panic, a missed barrier
+# makes the check itself fail the run
 SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R self/test.self >/dev/null
+# and against a real world, which is where old objects and old->young writes
+# actually exist -- test.self's heap is too small to build one
+[ -f core.snap ] && SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R --load core.snap \
+  -e "(1 to: 200) do: [|:i| (i printString , 'x') hash ]" >/dev/null 2>&1
 echo "gc checks ok"
 
 cat > "$T/w.self" <<'EOF'

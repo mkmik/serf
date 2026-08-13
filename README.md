@@ -138,12 +138,13 @@ outright.
 
 ```sh
 SERF_GC=off      ./target/release/serf …   # never collect
-SERF_GC_STRESS=1 ./target/release/serf …   # collect at every safepoint, never
-                                           # recycle a handle, so touching a
-                                           # missed root panics on the spot
-SERF_GC_VERIFY=1 ./target/release/serf …   # ignore the remembered set and scan
-                                           # every old object: a difference
-                                           # means the write barrier is wrong
+SERF_GC_STRESS=1 ./target/release/serf …   # collect after every allocation and
+                                           # never recycle a handle, so touching
+                                           # a missed root panics on the spot
+SERF_GC_VERIFY=1 ./target/release/serf …   # scan every old object, not just the
+                                           # remembered ones: one that was
+                                           # written without the barrier firing
+                                           # fails the run
 SERF_GC_STATS=1  ./target/release/serf …   # a line per collection
 SERF_GC_YOUNG=n  ./target/release/serf …   # objects per semispace (65536)
 ```

@@ -14,7 +14,6 @@
 //! an ordinary `Ref<Obj>` with no lifetime to thread and no `unsafe`.
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::value::{Method, Obj, Payload, Root, Scope, Slot, Value, Vm};
@@ -411,22 +410,29 @@ impl std::hash::Hasher for PtrHash {
     }
 }
 
-type PtrSet = HashSet<usize, std::hash::BuildHasherDefault<PtrHash>>;
+type PtrMap = std::collections::HashMap<usize, bool, std::hash::BuildHasherDefault<PtrHash>>;
 
-/// Scopes and methods already walked in this collection, by address. Frames
-/// share their lexical chains, so a deep stack would otherwise be quadratic.
+/// Scopes and methods already walked in this collection, by address, each with
+/// the answer the walk came to: does it reach a young object? Frames share
+/// their lexical chains and a method is shared by every object holding it, so
+/// walking one twice would be quadratic on a deep stack -- but the second
+/// visitor still has to *learn* what the first one found, or it concludes the
+/// object it is scanning has no young references and drops it from the
+/// remembered set. Memoise the answer, not the visit.
 /// Safe against address reuse: nothing is dropped while a traversal runs.
 #[derive(Default)]
 struct Seen {
-    scopes: PtrSet,
-    methods: PtrSet,
+    scopes: PtrMap,
+    methods: PtrMap,
 }
 
 /// The two collectors walk the object graph the same way and differ only in
-/// what they do with each `Value` they find.
+/// what they do with each `Value` they find. Every walk answers whether what it
+/// walked still names a young object, which is what decides membership of the
+/// remembered set.
 trait Visit {
     fn seen(&mut self) -> &mut Seen;
-    fn value(&mut self, v: Value);
+    fn value(&mut self, v: Value) -> bool;
 }
 
 /// Every live `Rc<Method>` is held by a `Scope`, by a `Payload::Method` or
@@ -434,45 +440,56 @@ trait Visit {
 /// and `Root` needs no variant for one.
 fn walk_root<V: Visit>(v: &mut V, r: Root) {
     match r {
-        Root::Val(x) => v.value(x),
-        Root::Scope(s) => walk_scope(v, &s),
+        Root::Val(x) => {
+            v.value(x);
+        }
+        Root::Scope(s) => {
+            walk_scope(v, &s);
+        }
     }
 }
 
-fn walk_obj<V: Visit>(v: &mut V, o: &Obj) {
+fn walk_obj<V: Visit>(v: &mut V, o: &Obj) -> bool {
+    let mut young = false;
     for s in o.slots.iter() {
-        v.value(s.value);
+        young |= v.value(s.value);
     }
     match &o.payload {
         Payload::Vector(xs) => {
             for x in xs.iter() {
-                v.value(*x);
+                young |= v.value(*x);
             }
         }
-        Payload::Mirror(x) => v.value(*x),
-        Payload::Method(m) => walk_method(v, m),
+        Payload::Mirror(x) => young |= v.value(*x),
+        Payload::Method(m) => young |= walk_method(v, m),
         Payload::Block(m, sc) => {
-            walk_method(v, m);
+            young |= walk_method(v, m);
             if let Some(sc) = sc {
-                walk_scope(v, sc);
+                young |= walk_scope(v, sc);
             }
         }
         Payload::None | Payload::Bytes(_) | Payload::Proxy(_) => {}
     }
+    young
 }
 
-fn walk_method<V: Visit>(v: &mut V, m: &Rc<Method>) {
-    if !v.seen().methods.insert(Rc::as_ptr(m) as usize) {
-        return;
+fn walk_method<V: Visit>(v: &mut V, m: &Rc<Method>) -> bool {
+    let key = Rc::as_ptr(m) as usize;
+    if let Some(&young) = v.seen().methods.get(&key) {
+        return young;
     }
+    v.seen().methods.insert(key, false);
+    let mut young = false;
     for x in m.lits.iter().chain(m.slot_inits.iter()) {
-        v.value(*x);
+        young |= v.value(*x);
     }
     // the source string of a loaded method is an ordinary heap object, and it
     // is the one reference in here that is easy to miss
     if let Some((s, _, _)) = m.source {
-        v.value(s);
+        young |= v.value(s);
     }
+    v.seen().methods.insert(key, young);
+    young
 }
 
 /// Iterative on purpose: a block that captures the activation that created it
@@ -480,31 +497,47 @@ fn walk_method<V: Visit>(v: &mut V, m: &Rc<Method>) {
 /// blow the Rust stack. Borrows rather than clones the chain -- `s` holds it
 /// all alive -- because this runs once per frame and refcount traffic on a
 /// 300k-deep stack is not free.
-fn walk_scope<V: Visit>(v: &mut V, s: &Rc<Scope>) {
-    if !v.seen().scopes.insert(Rc::as_ptr(s) as usize) {
-        return;
+fn walk_scope<V: Visit>(v: &mut V, s: &Rc<Scope>) -> bool {
+    let key = Rc::as_ptr(s) as usize;
+    if let Some(&young) = v.seen().scopes.get(&key) {
+        return young;
     }
+    let mut chain = vec![key];
     let mut todo: Vec<&Scope> = Vec::new();
     let mut cur: &Scope = s;
+    let mut young = false;
     loop {
-        v.value(cur.recv);
-        v.value(cur.holder);
+        v.seen().scopes.insert(cur as *const Scope as usize, false);
+        young |= v.value(cur.recv);
+        young |= v.value(cur.holder);
         for x in cur.slots.borrow().iter() {
-            v.value(*x);
+            young |= v.value(*x);
         }
-        walk_method(v, &cur.method);
+        young |= walk_method(v, &cur.method);
         for next in [&cur.lexical, &cur.home] {
             if let Some(n) = next {
-                if v.seen().scopes.insert(Rc::as_ptr(n) as usize) {
-                    todo.push(n);
+                let k = Rc::as_ptr(n) as usize;
+                match v.seen().scopes.get(&k) {
+                    Some(&y) => young |= y,
+                    None => {
+                        chain.push(k);
+                        todo.push(n);
+                    }
                 }
             }
         }
         match todo.pop() {
             Some(n) => cur = n,
-            None => return,
+            None => break,
         }
     }
+    // one answer for the whole chain: an outer scope reaching young makes the
+    // inner ones reach it too, and the reverse only costs a redundant scan.
+    // The object holding a scope is pinned by `holds_scope` regardless.
+    for k in chain {
+        v.seen().scopes.insert(k, young);
+    }
+    young
 }
 
 /// An old object holding this cannot be dropped from the remembered set: a
@@ -532,9 +565,6 @@ struct Scav {
     /// evacuated but not yet scanned
     queue: Vec<ObjRef>,
     promoted: usize,
-    /// set by `value` when the value it just handled lives in the young
-    /// generation, so the object being scanned can be (re)remembered
-    saw_young: bool,
     /// verify mode: report young referents an old object should already have
     /// been remembered for
     checking: bool,
@@ -547,11 +577,12 @@ impl Visit for Scav {
     }
 
     /// One handle-table lookup per reference, which on a deep stack happens
-    /// millions of times per collection.
-    fn value(&mut self, v: Value) {
+    /// millions of times per collection. Answers whether the object is young
+    /// once it has been dealt with -- a promoted one is not.
+    fn value(&mut self, v: Value) -> bool {
         let h = match v {
             Value::Obj(h) => h,
-            _ => return,
+            _ => return false,
         };
         let e = self.g.entry(h);
         match e.loc {
@@ -560,13 +591,11 @@ impl Visit for Scav {
                 if self.checking {
                     self.violations += 1;
                 }
-                if matches!(self.evacuate(h, e, idx as usize), Loc::Young { .. }) {
-                    self.saw_young = true;
-                }
+                matches!(self.evacuate(h, e, idx as usize), Loc::Young { .. })
             }
             // already copied into the to space this collection
-            Loc::Young { .. } => self.saw_young = true,
-            Loc::Old { .. } => {}
+            Loc::Young { .. } => true,
+            Loc::Old { .. } => false,
             // a live reference to a freed handle: only possible if a root was
             // missed, and in stress mode the id was never reused, so say so
             Loc::Free => panic!("use of collected object {}", h.0),
@@ -616,9 +645,7 @@ impl Scav {
             Some(o) => o,
             None => return,
         };
-        self.saw_young = false;
-        walk_obj(self, o);
-        let keep = self.saw_young || holds_scope(o);
+        let keep = walk_obj(self, o) || holds_scope(o);
         drop(r);
         if keep {
             // no-op unless the object is old, which is exactly right
@@ -638,6 +665,9 @@ impl Scav {
     fn verify_old(&mut self) {
         self.checking = true;
         for h in self.g.old_handles() {
+            // no memo across objects here: a shared method answered from the
+            // cache would hide the very thing this is looking for
+            self.seen = Seen::default();
             let before = self.violations;
             self.scan(h);
             if self.violations > before {
@@ -653,7 +683,14 @@ impl Scav {
         // the barrier may be broken, but the heap must still come out
         // consistent: whatever the check found has been evacuated, so finish
         // copying it
+        self.seen = Seen::default();
         self.drain();
+        if self.violations > 0 {
+            // a check nobody notices is not a check: this is a debugging mode,
+            // so make the run fail rather than print into the void
+            eprintln!("[gc] {} unremembered young reference(s); exiting", self.violations);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -667,7 +704,6 @@ fn scavenge(vm: &mut Vm, g: &'static Gc) -> usize {
         to_bump: 0,
         queue: vec![],
         promoted: 0,
-        saw_young: false,
         checking: false,
         violations: 0,
     };
@@ -724,12 +760,15 @@ impl Visit for Mark {
         &mut self.seen
     }
 
-    fn value(&mut self, v: Value) {
+    /// Marking computes a full closure and is idempotent, so it has no use for
+    /// the young/old answer the scavenger needs.
+    fn value(&mut self, v: Value) -> bool {
         if let Value::Obj(h) = v {
             if self.g.mark(h) {
                 self.queue.push(h);
             }
         }
+        false
     }
 }
 
@@ -957,4 +996,56 @@ mod tests {
         assert_eq!(vm.id_hash.get(&lh.id()), Some(&1), "a live object lost its identity hash");
         assert!(!vm.id_hash.contains_key(&dead.id()), "a dead object kept its identity hash");
     }
+
+fn method_with(lits: Vec<Value>) -> Rc<Method> {
+    Rc::new(Method {
+        sel: "t".into(),
+        nargs: 0,
+        arg_slots: vec![],
+        slot_names: vec![],
+        slot_flags: vec![],
+        slot_inits: vec![],
+        code: vec![],
+        lits,
+        lit_strs: vec![],
+        is_block: false,
+        file: "t".into(),
+        line: 0,
+        source: None,
+    })
+}
+
+#[test]
+fn every_holder_of_a_shared_method_stays_remembered() {
+    let mut vm = Vm::new();
+    // young literal, reachable only through the method
+    let y = Value::obj(vec![], Payload::None);
+    let yh = y.as_obj().unwrap();
+    let m = method_with(vec![y]);
+
+    // fill the young space so the next allocations are pretenured
+    let cap = gc().young[0].len();
+    while gc().young_used() < cap {
+        let _ = Value::obj(vec![], Payload::None);
+    }
+
+    let o1 = Value::obj(vec![], Payload::Method(m.clone()));
+    let o2 = Value::obj(vec![], Payload::Method(m.clone()));
+    assert!(matches!(loc_of(o1.as_obj().unwrap()), Loc::Old { .. }), "o1 was not pretenured");
+    assert!(matches!(loc_of(o2.as_obj().unwrap()), Loc::Old { .. }), "o2 was not pretenured");
+    root(&vm, "o1", o1);
+    root(&vm, "o2", o2);
+
+    collect(&mut vm, false);
+    assert_ne!(loc_of(yh), Loc::Free, "the literal died in the first scavenge");
+    // only o1 is left remembered; o2's scan was memoised away
+    let remembered: Vec<u32> = gc().remembered.borrow().iter().map(|h| h.0).collect();
+    eprintln!("remembered after scan: {:?} (o1={} o2={})",
+              remembered, o1.as_obj().unwrap().0, o2.as_obj().unwrap().0);
+
+    // o1 dies; o2 is now the only path to the method and its literal
+    vm.globals.as_obj().unwrap().borrow_mut().slots.retain(|s| &*s.name != "o1");
+    collect(&mut vm, true);
+    assert_ne!(loc_of(yh), Loc::Free, "a live literal of a shared method was collected");
+}
 }
