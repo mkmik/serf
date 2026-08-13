@@ -41,12 +41,16 @@ impl Frame {
     }
 
     /// This frame's activation and every one whose continuation it took over
-    /// have now genuinely returned.
-    fn retire(&self) {
+    /// have now genuinely returned. Consumes the frame, because that is also
+    /// where its two buffers and -- if no block captured it -- its activation
+    /// go back to their pools instead of to `free`.
+    fn retire(mut self) {
         self.scope.dead.set(true);
         for s in self.tail_of.iter() {
             s.dead.set(true);
         }
+        give_vals(std::mem::take(&mut self.stack));
+        give_scope(self.scope);
     }
 
     fn is_home(&self, target: &Rc<Scope>) -> bool {
@@ -94,20 +98,39 @@ pub fn new_scope(
     args: Vec<Value>,
     lexical: Option<Rc<Scope>>,
 ) -> Rc<Scope> {
-    let mut slots = m.slot_inits.clone();
-    for (i, a) in args.into_iter().enumerate() {
-        slots[m.arg_slots[i]] = a;
-    }
     let home = lexical.as_ref().map(Scope::home_of);
-    Rc::new(Scope {
-        method: m,
-        recv,
-        holder,
-        slots: RefCell::new(slots),
-        lexical,
-        home,
-        dead: Cell::new(false),
-    })
+    // A pooled activation is refilled where it lies; only a pool miss allocates.
+    let mut rc = match take_scope() {
+        Some(rc) => rc,
+        None => Rc::new(Scope {
+            method: m.clone(),
+            recv,
+            holder,
+            slots: RefCell::new(take_vals()),
+            lexical: None,
+            home: None,
+            dead: Cell::new(false),
+        }),
+    };
+    {
+        let s = Rc::get_mut(&mut rc).expect("a fresh or pooled activation is uniquely owned");
+        let slots = s.slots.get_mut();
+        slots.clear();
+        slots.extend_from_slice(&m.slot_inits);
+        for (i, a) in args.iter().enumerate() {
+            slots[m.arg_slots[i]] = *a;
+        }
+        s.method = m;
+        s.recv = recv;
+        s.holder = holder;
+        s.lexical = lexical;
+        s.home = home;
+        s.dead.set(false);
+    }
+    // the caller built this to pass the arguments in; it is the same shape as
+    // the buffer the next send will want
+    give_vals(args);
+    rc
 }
 
 /// The error the current process is suspending for, if any. The world's own
@@ -468,7 +491,9 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         return Err(err(frames, format!("stack underflow sending '{}'", sel)));
                     }
                     let n = f.stack.len();
-                    let args = f.stack.split_off(n - argc);
+                    let mut args = take_vals();
+                    args.extend_from_slice(&f.stack[n - argc..]);
+                    f.stack.truncate(n - argc);
                     let recv = if normal {
                         f.stack.pop().unwrap()
                     } else {

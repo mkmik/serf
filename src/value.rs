@@ -176,6 +176,85 @@ impl Scope {
     }
 }
 
+/// An activation's slot buffer goes back to the pool rather than to malloc.
+/// Dropping the from-space was more than half spent here: a block in the young
+/// generation holds its captured activation, so a scavenge that collects the
+/// block frees the activation too, and `free` on this thread ends in `madvise`.
+impl Drop for Scope {
+    fn drop(&mut self) {
+        give_vals(std::mem::take(self.slots.get_mut()));
+    }
+}
+
+thread_local! {
+    /// Recycled `Vec<Value>` buffers. An activation's slots and a send's
+    /// arguments have the same shape and the same lifetime -- born at a send,
+    /// dead a moment later -- so they come from here and go back, and in the
+    /// steady state a send allocates nothing at all.
+    /// ponytail: a plain stack, not a size-classed pool; every buffer in it is
+    /// a handful of `Value`s wide.
+    static VALS: RefCell<Vec<Vec<Value>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Cap on both how many buffers are kept and how big a kept one may be: a
+/// method with hundreds of slots is rare enough that recycling its buffer
+/// would cost more memory than it saves.
+const VALS_KEPT: usize = 256;
+const VALS_WIDEST: usize = 64;
+
+pub fn take_vals() -> Vec<Value> {
+    VALS.try_with(|p| p.borrow_mut().pop()).ok().flatten().unwrap_or_default()
+}
+
+thread_local! {
+    /// Activations nobody holds any more. An `Rc` cannot hand its allocation
+    /// back as it drops, so a frame that has finished with one offers it here
+    /// instead: uniquely owned, it can be refilled in place by the next send,
+    /// slot buffer and all. An activation some block captured has a second
+    /// reference and is declined, and freed the ordinary way.
+    static SCOPES: RefCell<Vec<Rc<Scope>>> = const { RefCell::new(Vec::new()) };
+}
+
+const SCOPES_KEPT: usize = 256;
+
+/// Offer a finished activation to the pool. Declines any that is still
+/// referenced -- that is what makes refilling it in place sound.
+pub fn give_scope(mut s: Rc<Scope>) {
+    let Some(m) = Rc::get_mut(&mut s) else { return };
+    // park it holding nothing: its lexical chain and the values in its slots
+    // must not stay reachable just because the buffer is worth keeping
+    m.lexical = None;
+    m.home = None;
+    m.slots.get_mut().clear();
+    // `try_with`, not `with`: at thread exit these two pools are destroyed in
+    // an order neither of them picks, and dropping a parked activation runs
+    // `Scope::drop`, which reaches for the other one. Losing a buffer on the
+    // way out costs nothing.
+    let _ = SCOPES.try_with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < SCOPES_KEPT {
+            p.push(s);
+        }
+    });
+}
+
+pub fn take_scope() -> Option<Rc<Scope>> {
+    SCOPES.try_with(|p| p.borrow_mut().pop()).ok().flatten()
+}
+
+pub fn give_vals(mut v: Vec<Value>) {
+    if v.capacity() == 0 || v.capacity() > VALS_WIDEST {
+        return;
+    }
+    v.clear(); // `Value` is `Copy`, so this is just a length store
+    let _ = VALS.try_with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < VALS_KEPT {
+            p.push(v);
+        }
+    });
+}
+
 impl Value {
     pub fn obj(slots: Vec<Slot>, payload: Payload) -> Value {
         Value::Obj(crate::gc::alloc(slots, payload))

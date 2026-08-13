@@ -33,6 +33,17 @@ if [ -f core.snap ]; then
     200 timesRepeat: [ q: ('a' , 'b') ]. \
     m _MirrorAnnotation] value: 0" 2>&1 | tail -1)
   [ "$got" = "'ann-young'" ] || { echo "annotation barrier: got [$got]"; exit 1; }
+
+  # A block holds the activation it closed over, and both the frame that
+  # returned and the scavenge that collects the block offer that activation to
+  # the pool to be refilled in place. A block still holding one must keep it:
+  # close over a local, collect many times, then read it back through the
+  # block. Reusing it under the block would answer something other than 42.
+  got=$(SERF_GC_STRESS=1 $R --load core.snap --run "[|:x. b. q. n <- 7| \
+    b: [|:z| z + n]. \
+    200 timesRepeat: [ q: ('a' , 'b') ]. \
+    b value: 35] value: 0" 2>&1 | tail -1)
+  [ "$got" = "42" ] || { echo "captured activation: got [$got] want [42]"; exit 1; }
 fi
 echo "gc checks ok"
 

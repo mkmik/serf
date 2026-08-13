@@ -758,9 +758,18 @@ fn scavenge(vm: &mut Vm, g: &'static Gc) -> usize {
     let cap = g.young[0].len();
     let bump = (g.bump.get() as usize).min(cap);
     for i in 0..bump {
-        let dead = g.young[from as usize][i].borrow_mut().take();
+        let mut dead = g.young[from as usize][i].borrow_mut().take();
         if dead.is_some() {
             g.free_id(g.owner[from as usize][i].get());
+        }
+        // A block holds the activation it closed over, so this loop is where
+        // most activations actually die -- a frame that returned while a block
+        // of its was still live could not reclaim it. Offer it now; the pool
+        // declines it if anything else still names it.
+        if let Some(Payload::Block(_, s)) = dead.as_mut().map(|o| &mut o.payload) {
+            if let Some(s) = s.take() {
+                crate::value::give_scope(s);
+            }
         }
         drop(dead);
     }
