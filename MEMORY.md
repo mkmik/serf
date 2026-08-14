@@ -464,8 +464,9 @@ round-trip green, and is provable by a number.
 |---|---|---|
 | 0 | `serf_mem_*` metrics, `SERF_MEM_TRACE=1` allocation counter, Miri in `run-tests.sh` | **done** — 1,835,488 mallocs for the suite, now a metric rather than a probe |
 | 1 | `heap.rs`: the arena, `Oop` as a tagged pointer, `map_addr` tagging, the deref assertion | **done** — 10 tests green under `cargo miri test heap::` |
-| 2 | Objects in the arena: mark word, map pointer, byte and vector payloads; maps interned per shape; Cheney with forwarding; mark-sweep old gen | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
-| 2b | Key the inline caches and `lookup_cache` on the map | **done, ahead of the rest** — see below |
+| 2a | The collector over the arena, standalone: Cheney with forwarding, tenuring, remembered set, mark-sweep old space | **done** — 19 tests green under Miri, no VM integration |
+| 2b | The switch-over: `Value` becomes `Oop`, objects move into the arena, `gc.rs` retires | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
+| 2c | Key the inline caches and `lookup_cache` on the map | **done, ahead of the rest** — see below |
 | 3 | Roots: `each_root` rewrites, the shadow stack, the `prims.rs` audit | `SERF_GC_STRESS` green across the suite and a morphic boot |
 | 4 | Methods in the heap | image-load mallocs −170k; `walk_method`, `Seen.methods` gone |
 | 5 | Activations in the heap | `test.self` mallocs 1.86M → <1k; both pools and `walk_scope` gone |
@@ -513,7 +514,49 @@ The remaining 27 Miri errors are `memory leaked` — the heap is deliberately
 leaked, as `gc.rs`'s spaces already are, so `run-tests.sh` runs Miri with
 `-Zmiri-ignore-leaks` and skips with a note when Miri is not installed.
 
-### Phase 2b, landed early
+### Phase 2a: the collector, before anything depends on it
+
+Phase 2 is two jobs wearing one number, and they have very different risk. The
+*algorithms* — Cheney with forwarding, tenuring, a remembered set, mark and
+sweep — can be written and checked against nothing but their own tests. The
+*switch-over* — `Value` becoming `Oop`, `Obj` dissolving into arena words,
+every call site in `prims.rs` and `image_obj.rs` following — is mechanical but
+touches the whole VM at once. Doing the algorithms first means the big
+mechanical change lands on a collector that is already known to work.
+
+So `heap.rs` now has the collector, and nothing in the VM calls it yet:
+
+* Cheney evacuation, using the mark word as the forwarding pointer. Roots are
+  handed over as slots the collector **rewrites** — with direct pointers a root
+  is not merely read, and that is the interface the switch-over has to satisfy.
+* Tenuring at `PROMOTE_AGE`, into an old space with exact-fit free lists.
+* An exact per-object remembered set, cleaned as it is scanned.
+* Mark and sweep for the old space, marking through young objects because an
+  old one is often only reachable that way.
+* `alloc_or_tenure`, so allocation is infallible: an object too big for a
+  semispace, or one arriving when the space is full, is born old and recorded.
+
+Nineteen tests, green under Miri: survivors kept and garbage forgotten, roots
+rewritten, references between survivors following their target, a cycle copied
+exactly once, tenuring, a young object saved only by the write barrier, an old
+object falling back out of the remembered set, only a major reclaiming the old
+space, a swept run reused by the next promotion, and an old object reachable
+only through a young one surviving a major.
+
+An object's layout is `oops` leading `Oop` words then raw words, held in word 1
+until maps become heap objects and supply it. That is general enough for
+everything, because an immediate is a legal `Oop` — an activation's program
+counter is `Oop::int(pc)` and sits happily in the scanned region.
+
+One real bug came out of a test whose premise was wrong. `a_full_to_space_...`
+could not fail as written — equal semispaces cannot overflow, since everything
+that survives came out of a space the same size — but writing it exposed that
+`evacuate` asked the to-space for room *before* checking the age, and `alloc`
+bumps. Every tenured object was reserving a copy's worth of to-space and
+walking away from it. The replacement tests the reachable thing (pretenuring)
+and asserts the leak is gone.
+
+### Phase 2c, landed early
 
 2b turned out not to need the arena at all, so it went first. Objects still own
 their slot vectors; what is interned is the shape — slot names and kinds plus

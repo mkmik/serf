@@ -1,5 +1,5 @@
-//! The object arena: variable-size objects in one bump-allocated region,
-//! addressed by direct tagged pointers.
+//! The object arena and its collector: variable-size objects in one
+//! bump-allocated region, addressed by direct tagged pointers.
 //!
 //! This is the floor the memory subsystem is being rebuilt on; see MEMORY.md.
 //! Nothing in the VM stands on it yet -- `gc.rs` still keeps objects in
@@ -38,6 +38,7 @@
 
 use std::alloc::{alloc_zeroed, Layout};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 // ------------------------------------------------------------------- the word
 
@@ -76,7 +77,7 @@ impl Oop {
         Oop(std::ptr::without_provenance_mut((((v as u64) << 1) | 1) as usize))
     }
 
-    /// The null word: not an object and not an integer. What an untouched arena
+    /// The null word: not an object and not an integer. What an untouched heap
     /// word reads as, so a walk over one cannot mistake it for either.
     pub fn null() -> Oop {
         Oop(std::ptr::without_provenance_mut(0))
@@ -136,14 +137,22 @@ impl std::fmt::Debug for Oop {
 /// Every object starts with two words.
 ///
 /// ```text
-/// word 0  mark:  forwarded:1 │ age:8 │ kind:8 │ hash:23 │ size in words:24
-/// word 1  map:   the shape, once maps are heap objects; null until then
+/// word 0  mark:  forwarded:1 │ marked:1 │ dirty:1 │ age:8 │ kind:8 │ hash:22 │ size:23
+/// word 1  oops:  how many leading payload words hold `Oop`s; the rest are raw
 /// ```
 ///
-/// This is the C++ VM's header widened: its mark word is
-/// `tag:2 │ hash:22 │ age:7 │ marked:1` (`objects/markOop.hh:15`) and its
-/// second word is the map pointer. `size` lives here rather than in the map so
-/// that a sweep can walk a space with one load per object instead of two.
+/// This is the C++ VM's mark word widened -- `tag:2 │ hash:22 │ age:7 │
+/// marked:1` (`objects/markOop.hh:15`) -- plus the two bits a collector wants
+/// on hand: `dirty` for the remembered set and `forwarded` for an evacuation.
+/// `size` lives here rather than in the map so that a sweep can walk a space
+/// with one load per object instead of two.
+///
+/// Word 1 is the map pointer in the finished design: a map knows its objects'
+/// layout, which is the one thing this word is used for. Until maps are heap
+/// objects it holds the count directly. "Leading `Oop`s then raw words" is
+/// general enough for everything, because an immediate is a legal `Oop` -- an
+/// activation's program counter is `Oop::int(pc)` and lives happily in the
+/// scanned region.
 ///
 /// When the object has been evacuated the mark word is replaced wholesale by
 /// `FORWARDED | new address` -- the trick is `mark_memOop` in
@@ -151,14 +160,16 @@ impl std::fmt::Debug for Oop {
 /// gone with the copy.
 pub const HEADER_WORDS: usize = 2;
 
-const FORWARDED: u64 = 1 << 63;
-const SIZE_BITS: u32 = 24;
+const SIZE_BITS: u32 = 23;
 const SIZE_MASK: u64 = (1 << SIZE_BITS) - 1;
 const HASH_SHIFT: u32 = SIZE_BITS;
-const HASH_BITS: u32 = 23;
+const HASH_BITS: u32 = 22;
 const HASH_MASK: u64 = (1 << HASH_BITS) - 1;
 const KIND_SHIFT: u32 = HASH_SHIFT + HASH_BITS;
 const AGE_SHIFT: u32 = KIND_SHIFT + 8;
+const DIRTY: u64 = 1 << 61;
+const MARKED: u64 = 1 << 62;
+const FORWARDED: u64 = 1 << 63;
 
 /// The largest object the header can describe, in words.
 pub const MAX_OBJECT_WORDS: usize = SIZE_MASK as usize;
@@ -196,18 +207,17 @@ fn mark_of(size: usize, kind: Kind) -> u64 {
 
 // -------------------------------------------------------------------- the heap
 
-/// The one allocation. Spaces are carved out of it and objects are carved out
-/// of those, so every pointer in the heap shares this pointer's provenance.
+/// The one allocation. Spaces are carved out of it and objects out of those, so
+/// every pointer in the heap shares this pointer's provenance.
 ///
 /// Leaked and never freed, exactly as `gc.rs`'s spaces are, which is what lets
 /// an `Oop` be `Copy` with no lifetime attached to anything.
 struct Region {
     base: *mut u64,
     words: usize,
-    /// words handed out to spaces so far
     carved: Cell<usize>,
-    /// the spaces themselves, as word ranges, so a deref can ask whether an
-    /// address still means something
+    /// the spaces, as word ranges, so a deref can ask whether an address still
+    /// means something
     spaces: RefCell<Vec<(usize, usize)>>,
 }
 
@@ -232,7 +242,7 @@ fn region() -> &'static Region {
         None => {
             // ponytail: fixed at startup, no growth. The switch-over sizes it
             // for a real world; nothing stands on it yet.
-            let words = env_words("SERF_HEAP_WORDS", 1 << 16);
+            let words = env_words("SERF_HEAP_WORDS", 1 << 18);
             assert!(words > 0, "the heap needs room for something");
             let p = unsafe { alloc_zeroed(Layout::from_size_align(words * 8, 8).unwrap()) };
             assert!(!p.is_null(), "out of memory for a {words}-word heap");
@@ -249,8 +259,8 @@ fn region() -> &'static Region {
     })
 }
 
-/// The heap word at index `w`. In bounds by construction, and derived from the
-/// one base pointer, so it carries the whole heap's provenance.
+/// The heap word at index `w`, derived from the one base pointer so that it
+/// carries the whole heap's provenance.
 fn at(w: usize) -> *mut u64 {
     let r = region();
     debug_assert!(w < r.words, "word {w} is past the end of the heap");
@@ -269,9 +279,8 @@ fn heap_holds(a: usize) -> bool {
     a >= r.base.addr() && a < r.base.addr() + r.words * 8
 }
 
-/// Does this address lie in a space that still exists? Stronger than
-/// `heap_holds`, and the check that catches a pointer into a from-space some
-/// collection has already abandoned.
+/// Does this address lie in a space that still exists? The check that catches a
+/// pointer into a space some collection has already abandoned.
 fn in_a_live_space(a: usize) -> bool {
     let r = region();
     if !heap_holds(a) {
@@ -281,24 +290,31 @@ fn in_a_live_space(a: usize) -> bool {
     r.spaces.borrow().iter().any(|(s, n)| w >= *s && w < s + n)
 }
 
-/// How much of the heap has been handed out to spaces.
-pub fn heap_carved() -> usize {
-    region().carved.get()
-}
-
 pub fn heap_words() -> usize {
     region().words
+}
+
+pub fn heap_carved() -> usize {
+    region().carved.get()
 }
 
 // ------------------------------------------------------------------- a space
 
 /// A region objects are bump-allocated into and, eventually, copied out of: a
-/// young semispace, the old space. A view on the heap, not an allocation of its
-/// own -- see the module note on why that matters.
+/// young semispace, or the old space. A view on the heap, not an allocation of
+/// its own -- see the module note on why that matters.
 pub struct Space {
     start: usize,
     words: usize,
     bump: Cell<usize>,
+}
+
+fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize) {
+    debug_assert!(oops <= size - HEADER_WORDS, "more oop words than payload");
+    unsafe {
+        p.write(mark_of(size, kind));
+        p.add(1).write(oops as u64);
+    }
 }
 
 impl Space {
@@ -322,6 +338,10 @@ impl Space {
         self.bump.get()
     }
 
+    pub fn free(&self) -> usize {
+        self.words - self.bump.get()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.bump.get() == 0
     }
@@ -335,8 +355,8 @@ impl Space {
     /// Room for one object, header included. `None` when the space is full --
     /// which in a collector means "tenure it instead", not "find more memory",
     /// so it is an answer rather than an error.
-    pub fn alloc(&self, kind: Kind, payload_words: usize) -> Option<Oop> {
-        let size = HEADER_WORDS + payload_words;
+    pub fn alloc(&self, kind: Kind, oops: usize, raw: usize) -> Option<Oop> {
+        let size = HEADER_WORDS + oops + raw;
         if size > MAX_OBJECT_WORDS {
             return None;
         }
@@ -346,16 +366,18 @@ impl Space {
         }
         self.bump.set(a + size);
         let p = at(self.start + a);
-        unsafe { p.write(mark_of(size, kind)) };
+        init_object(p, size, kind, oops);
         Some(Oop::obj(p))
     }
 
     pub fn contains(&self, o: Oop) -> bool {
         match o.ptr() {
             Some(p) => {
-                let base = region().base.addr();
-                let w = (p.addr() - base) / 8;
-                heap_holds(p.addr()) && w >= self.start && w < self.start + self.words
+                if !heap_holds(p.addr()) {
+                    return false;
+                }
+                let w = (p.addr() - region().base.addr()) / 8;
+                w >= self.start && w < self.start + self.words
             }
             None => false,
         }
@@ -376,6 +398,12 @@ impl Space {
             a += n;
             Some(o)
         })
+    }
+
+    /// The object starting at word `a` of this space, for a Cheney scan that
+    /// has to walk objects appearing behind it as it goes.
+    fn object_at(&self, a: usize) -> Oop {
+        Oop::obj(at(self.start + a))
     }
 }
 
@@ -407,6 +435,12 @@ pub fn payload_words(o: Oop) -> usize {
     size_words(o) - HEADER_WORDS
 }
 
+/// How many leading payload words hold `Oop`s. The rest are raw: bytes, a
+/// bytecode run, the bits of a float.
+pub fn oop_words(o: Oop) -> usize {
+    unsafe { words_of(o).add(1).read() as usize }
+}
+
 pub fn kind(o: Oop) -> Kind {
     Kind::from((mark(o) >> KIND_SHIFT) as u8)
 }
@@ -429,32 +463,43 @@ pub fn set_age(o: Oop, a: u8) {
     set_mark(o, m | ((a as u64) << AGE_SHIFT));
 }
 
-/// The map word. Null until maps become heap objects.
-pub fn map(o: Oop) -> Oop {
-    Oop(from_addr(unsafe { word_at(o, MAP_WORD).read() } as usize))
+fn marked(o: Oop) -> bool {
+    mark(o) & MARKED != 0
 }
 
-pub fn set_map(o: Oop, m: Oop) {
-    unsafe { word_at(o, MAP_WORD).write(m.addr() as u64) }
+/// Set the mark bit; true the first time, i.e. when the contents still have to
+/// be walked.
+fn set_marked(o: Oop) -> bool {
+    let m = mark(o);
+    if m & MARKED != 0 {
+        return false;
+    }
+    set_mark(o, m | MARKED);
+    true
 }
 
-/// `word_at`'s index for the map word, which sits in the header rather than in
-/// the payload.
-const MAP_WORD: usize = usize::MAX;
+fn clear_marked(o: Oop) {
+    let m = mark(o);
+    set_mark(o, m & !MARKED);
+}
+
+fn dirty(o: Oop) -> bool {
+    mark(o) & DIRTY != 0
+}
+
+fn set_dirty(o: Oop, d: bool) {
+    let m = mark(o);
+    set_mark(o, if d { m | DIRTY } else { m & !DIRTY });
+}
 
 fn word_at(o: Oop, i: usize) -> *mut u64 {
     let p = words_of(o);
-    let off = if i == MAP_WORD {
-        1
-    } else {
-        debug_assert!(
-            i < payload_words(o),
-            "field {i} past the end of a {}-word object",
-            size_words(o)
-        );
-        HEADER_WORDS + i
-    };
-    unsafe { p.add(off) }
+    debug_assert!(
+        i < payload_words(o),
+        "field {i} past the end of a {}-word object",
+        size_words(o)
+    );
+    unsafe { p.add(HEADER_WORDS + i) }
 }
 
 pub fn field(o: Oop, i: usize) -> Oop {
@@ -465,8 +510,7 @@ pub fn set_field(o: Oop, i: usize, v: Oop) {
     unsafe { word_at(o, i).write(v.addr() as u64) }
 }
 
-/// Raw payload word, for the parts of an object that are not references --
-/// packed bytes, a bytecode run, a float.
+/// Raw payload word, for the parts of an object that are not references.
 pub fn raw(o: Oop, i: usize) -> u64 {
     unsafe { word_at(o, i).read() }
 }
@@ -475,8 +519,7 @@ pub fn set_raw(o: Oop, i: usize, v: u64) {
     unsafe { word_at(o, i).write(v) }
 }
 
-/// Copy an object's payload verbatim. What an evacuation is made of.
-pub fn copy_payload(from: Oop, to: Oop) {
+fn copy_payload(from: Oop, to: Oop) {
     debug_assert_eq!(payload_words(from), payload_words(to), "copying between different sizes");
     for i in 0..payload_words(from) {
         set_raw(to, i, raw(from, i));
@@ -498,14 +541,356 @@ pub fn forwarded(o: Oop) -> Option<Oop> {
     Some(Oop(from_addr((m & !FORWARDED) as usize)))
 }
 
-pub fn set_forwarded(o: Oop, to: Oop) {
+fn set_forwarded(o: Oop, to: Oop) {
     debug_assert!(to.is_obj(), "forwarded to something that is not an object");
     set_mark(o, FORWARDED | to.addr() as u64);
+}
+
+// ------------------------------------------------------------------ the roots
+
+/// Everything the collector must treat as live, handed over as slots it may
+/// rewrite. With direct pointers a root is not merely read: an object moves,
+/// and every reference to it -- including the VM's own -- has to be updated in
+/// place. Miss one and it points into an abandoned space.
+pub trait Roots {
+    fn each(&mut self, f: &mut dyn FnMut(&mut Oop));
+}
+
+/// Survive this many scavenges and you are tenured, as in `gc.rs`.
+const PROMOTE_AGE: u8 = 2;
+
+// -------------------------------------------------------------- the collector
+
+/// Generation scavenging over the arena: two young semispaces copied between by
+/// Cheney's algorithm, and an old space swept into free lists.
+pub struct Heap {
+    young: [Space; 2],
+    from: Cell<u8>,
+    old: Space,
+    /// exact-fit free runs in the old space, by size in words. ponytail: exact
+    /// fit, no splitting and no coalescing -- promotion re-promotes the same
+    /// sizes over and over, so it fits well; `old_free_words` is what would say
+    /// otherwise.
+    old_free: RefCell<HashMap<usize, Vec<usize>>>,
+    old_live: Cell<usize>,
+    /// old objects written since the last scavenge, so it need not scan them all
+    remembered: RefCell<Vec<Oop>>,
+    pub minors: Cell<u64>,
+    pub majors: Cell<u64>,
+}
+
+impl Heap {
+    pub fn new(young_words: usize, old_words: usize) -> Heap {
+        Heap {
+            young: [Space::new(young_words), Space::new(young_words)],
+            from: Cell::new(0),
+            old: Space::new(old_words),
+            old_free: RefCell::new(HashMap::new()),
+            old_live: Cell::new(0),
+            remembered: RefCell::new(vec![]),
+            minors: Cell::new(0),
+            majors: Cell::new(0),
+        }
+    }
+
+    fn from_space(&self) -> &Space {
+        &self.young[self.from.get() as usize]
+    }
+
+    fn to_space(&self) -> &Space {
+        &self.young[1 - self.from.get() as usize]
+    }
+
+    pub fn young_used(&self) -> usize {
+        self.from_space().used()
+    }
+
+    pub fn young_capacity(&self) -> usize {
+        self.young[0].capacity()
+    }
+
+    pub fn old_used(&self) -> usize {
+        self.old.used()
+    }
+
+    pub fn old_live(&self) -> usize {
+        self.old_live.get()
+    }
+
+    pub fn old_free_words(&self) -> usize {
+        self.old_free.borrow().iter().map(|(n, v)| n * v.len()).sum()
+    }
+
+    pub fn remembered_len(&self) -> usize {
+        self.remembered.borrow().len()
+    }
+
+    /// Allocate in the young generation. `None` means the space is full and the
+    /// caller should collect -- allocation never collects on its own, because
+    /// the caller's Rust locals are not roots.
+    pub fn alloc(&self, kind: Kind, oops: usize, raw: usize) -> Option<Oop> {
+        self.from_space().alloc(kind, oops, raw)
+    }
+
+    /// Allocate, putting into the old generation anything the young space
+    /// cannot take -- an object bigger than a semispace, or one arriving when
+    /// the space is full and no collection is possible yet. The caller gets an
+    /// object either way, which is what lets allocation be infallible.
+    pub fn alloc_or_tenure(&self, kind: Kind, oops: usize, raw: usize) -> Oop {
+        match self.alloc(kind, oops, raw) {
+            Some(o) => o,
+            None => {
+                // born old with its fields already set and no barrier fired for
+                // it: whatever it comes to hold, the next scavenge has to know
+                let o = self.alloc_old(kind, oops, raw);
+                self.record(o);
+                o
+            }
+        }
+    }
+
+    /// Allocate straight into the old generation: what a promotion does, and
+    /// what pretenuring does.
+    fn alloc_old(&self, kind: Kind, oops: usize, raw: usize) -> Oop {
+        let size = HEADER_WORDS + oops + raw;
+        self.old_live.set(self.old_live.get() + 1);
+        if let Some(a) = self.old_free.borrow_mut().get_mut(&size).and_then(|v| v.pop()) {
+            let p = from_addr(a);
+            init_object(p, size, kind, oops);
+            return Oop::obj(p);
+        }
+        self.old.alloc(kind, oops, raw).expect("old generation exhausted")
+    }
+
+    pub fn is_young(&self, o: Oop) -> bool {
+        self.young[0].contains(o) || self.young[1].contains(o)
+    }
+
+    /// Write barrier. An old object that may now hold a young reference has to
+    /// be scanned by the next scavenge, which does not otherwise look at the
+    /// old generation. Conservative -- it fires for writes that store no
+    /// reference at all -- which is the trade the C++ VM's unconditional card
+    /// store makes, and serf's is exact per object rather than per 128-byte
+    /// card (`memory/rSet.hh:11`).
+    pub fn record(&self, o: Oop) {
+        if self.is_young(o) || dirty(o) {
+            return;
+        }
+        set_dirty(o, true);
+        self.remembered.borrow_mut().push(o);
+    }
+
+    /// A field write that goes through the barrier. The switch-over routes
+    /// every mutation of an object word here.
+    pub fn store(&self, o: Oop, i: usize, v: Oop) {
+        set_field(o, i, v);
+        if v.is_obj() {
+            self.record(o);
+        }
+    }
+
+    // ---------------------------------------------------------------- scavenge
+
+    /// Move one object out of the from-space, answering where it went. Idempotent:
+    /// the second reference to an object finds the forward the first one left.
+    fn evacuate(&self, o: Oop, promoted: &mut Vec<Oop>) -> Oop {
+        if let Some(f) = forwarded(o) {
+            return f;
+        }
+        if !self.from_space().contains(o) {
+            return o; // already old, or already copied into the to-space
+        }
+        let (k, oops, pay) = (kind(o), oop_words(o), payload_words(o));
+        let raw = pay - oops;
+        let a = age(o).saturating_add(1);
+        // Ask the to-space only when the object is actually staying young: the
+        // bump happens inside `alloc`, so testing the age afterwards would
+        // reserve to-space words for every promoted object and then walk away
+        // from them.
+        //
+        // ponytail: the `None` arm is a safety valve rather than a live path.
+        // Equal semispaces cannot overflow -- everything that survives came out
+        // of a space the same size -- but promotion is what makes a scavenge
+        // unable to fail, and that is worth keeping true by construction rather
+        // than by argument (universe.cpp:87 keeps a whole generation in reserve
+        // for the same reason).
+        let dst = if a >= PROMOTE_AGE {
+            self.alloc_old(k, oops, raw)
+        } else {
+            match self.to_space().alloc(k, oops, raw) {
+                Some(d) => d,
+                None => self.alloc_old(k, oops, raw),
+            }
+        };
+        let tenured = !self.is_young(dst);
+        copy_payload(o, dst);
+        set_hash(dst, hash(o));
+        set_age(dst, a);
+        set_forwarded(o, dst);
+        if tenured {
+            // a promoted object has not been scanned yet, and the Cheney loop
+            // only walks the to-space, so it needs its own queue
+            promoted.push(dst);
+        }
+        dst
+    }
+
+    /// Walk one object's `Oop` fields, evacuating what they name and rewriting
+    /// them. Answers whether it still points at anything young, which is what
+    /// decides membership of the remembered set -- the self-cleaning card of
+    /// `rSet.cpp:131`, decided per object rather than per card.
+    fn scan(&self, o: Oop, promoted: &mut Vec<Oop>) -> bool {
+        let mut young = false;
+        for i in 0..oop_words(o) {
+            let v = field(o, i);
+            if !v.is_obj() {
+                continue;
+            }
+            let n = self.evacuate(v, promoted);
+            if n != v {
+                set_field(o, i, n);
+            }
+            young |= self.is_young(n);
+        }
+        young
+    }
+
+    /// A minor collection: copy the young survivors into the to-space or the
+    /// old generation, then abandon everything left behind.
+    pub fn scavenge(&self, roots: &mut dyn Roots) {
+        let mut promoted: Vec<Oop> = vec![];
+
+        // the remembered set is rebuilt as objects are scanned, so clearing the
+        // dirty bits here keeps bit and membership in step
+        let rs = std::mem::take(&mut *self.remembered.borrow_mut());
+        for o in rs.iter() {
+            set_dirty(*o, false);
+        }
+
+        roots.each(&mut |slot| {
+            if slot.is_obj() {
+                *slot = self.evacuate(*slot, &mut promoted);
+            }
+        });
+        for o in rs {
+            if self.scan(o, &mut promoted) {
+                self.record(o);
+            }
+        }
+
+        // Cheney: the to-space is the queue. Objects appear behind `scan` as
+        // they are evacuated, so this loop finishes when it catches the bump.
+        let mut cursor = 0usize;
+        loop {
+            let to = self.to_space();
+            if cursor < to.used() {
+                let o = to.object_at(cursor);
+                cursor += size_words(o);
+                self.scan(o, &mut promoted);
+                continue;
+            }
+            match promoted.pop() {
+                Some(o) => {
+                    if self.scan(o, &mut promoted) {
+                        self.record(o);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        // whatever is still in the from-space was never reached, and forgetting
+        // it is the free: one store, no destructors
+        self.from_space().reset();
+        self.from.set(1 - self.from.get());
+        self.minors.set(self.minors.get() + 1);
+    }
+
+    // ------------------------------------------------------------ mark & sweep
+
+    fn mark_from(&self, o: Oop, work: &mut Vec<Oop>) {
+        if o.is_obj() && set_marked(o) {
+            work.push(o);
+        }
+    }
+
+    /// Mark the whole reachable graph, young and old: an old object is often
+    /// only reachable through a young one.
+    fn mark_all(&self, roots: &mut dyn Roots) {
+        let mut work: Vec<Oop> = vec![];
+        roots.each(&mut |slot| {
+            if slot.is_obj() && set_marked(*slot) {
+                work.push(*slot);
+            }
+        });
+        while let Some(o) = work.pop() {
+            for i in 0..oop_words(o) {
+                let v = field(o, i);
+                self.mark_from(v, &mut work);
+            }
+        }
+    }
+
+    /// Drop every unmarked old object onto the free list and clear the marks on
+    /// the rest. Runs before the scavenge, so a dead old object cannot drag its
+    /// young referents through one more copy.
+    fn sweep_old(&self) {
+        let mut free = self.old_free.borrow_mut();
+        // rebuilt from scratch: a run that was free stays free, and this is
+        // where it is rediscovered
+        free.clear();
+        let mut live = 0usize;
+        for o in self.old.walk() {
+            if marked(o) {
+                clear_marked(o);
+                live += 1;
+            } else {
+                if dirty(o) {
+                    set_dirty(o, false);
+                }
+                free.entry(size_words(o)).or_default().push(o.addr());
+            }
+        }
+        self.old_live.set(live);
+        drop(free);
+        // a swept object may have been on the remembered set
+        self.remembered.borrow_mut().retain(|o| dirty(*o));
+    }
+
+    /// Collect. `major` sweeps the old generation as well.
+    pub fn collect(&self, roots: &mut dyn Roots, major: bool) {
+        if major {
+            self.mark_all(roots);
+            self.sweep_old();
+            self.majors.set(self.majors.get() + 1);
+        }
+        self.scavenge(roots);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Roots as a plain list of slots, which is all the collector asks for.
+    struct Vars(Vec<Oop>);
+
+    impl Roots for Vars {
+        fn each(&mut self, f: &mut dyn FnMut(&mut Oop)) {
+            for o in self.0.iter_mut() {
+                f(o);
+            }
+        }
+    }
+
+    fn heap() -> Heap {
+        Heap::new(512, 2048)
+    }
+
+    /// A `Slots` object of `n` fields, all of them `Oop`s.
+    fn obj(h: &Heap, n: usize) -> Oop {
+        h.alloc(Kind::Slots, n, 0).expect("young space full")
+    }
 
     #[test]
     fn a_smallint_is_not_a_pointer_and_survives_the_round_trip() {
@@ -522,40 +907,44 @@ mod tests {
 
     #[test]
     fn an_object_pointer_is_aligned_and_untagged() {
-        let s = Space::new(64);
-        let o = s.alloc(Kind::Slots, 3).unwrap();
+        let h = heap();
+        let o = h.alloc(Kind::Slots, 2, 1).unwrap();
         assert!(o.is_obj());
         assert!(!o.is_int(), "an object pointer must not read as an integer");
         assert_eq!(o.addr() & 7, 0, "object pointers carry no tag bits");
         assert_eq!(size_words(o), HEADER_WORDS + 3);
         assert_eq!(payload_words(o), 3);
+        assert_eq!(oop_words(o), 2);
         assert_eq!(kind(o), Kind::Slots);
-        assert!(s.contains(o));
     }
 
     #[test]
     fn header_fields_do_not_tread_on_each_other() {
-        let s = Space::new(64);
-        let o = s.alloc(Kind::Method, 5).unwrap();
-        set_hash(o, 0x7f_ffff);
+        let h = heap();
+        let o = h.alloc(Kind::Method, 5, 2).unwrap();
+        set_hash(o, HASH_MASK as u32);
         set_age(o, 200);
-        assert_eq!(hash(o), 0x7f_ffff);
+        set_dirty(o, true);
+        assert!(set_marked(o));
+        assert_eq!(hash(o), HASH_MASK as u32);
         assert_eq!(age(o), 200);
-        assert_eq!(size_words(o), HEADER_WORDS + 5, "size was trampled");
+        assert!(dirty(o) && marked(o));
+        assert_eq!(size_words(o), HEADER_WORDS + 7, "size was trampled");
         assert_eq!(kind(o), Kind::Method, "kind was trampled");
+        assert_eq!(oop_words(o), 5);
         set_hash(o, 1);
         assert_eq!(age(o), 200, "writing the hash moved the age");
-        assert_eq!(kind(o), Kind::Method);
+        assert!(dirty(o) && marked(o), "writing the hash moved a flag");
+        clear_marked(o);
+        assert!(dirty(o) && !marked(o));
     }
 
     #[test]
     fn fields_hold_both_kinds_of_word() {
-        let s = Space::new(64);
-        let o = s.alloc(Kind::Slots, 4).unwrap();
-        let other = s.alloc(Kind::Bytes, 1).unwrap();
-        for i in 0..4 {
-            assert!(field(o, i).is_null(), "a fresh heap word is not null");
-        }
+        let h = heap();
+        let o = h.alloc(Kind::Slots, 2, 2).unwrap();
+        let other = obj(&h, 1);
+        assert!(field(o, 0).is_null(), "a fresh heap word is not null");
         set_field(o, 0, Oop::int(-42));
         set_field(o, 1, other);
         set_raw(o, 2, 0xdead_beef_dead_beef);
@@ -563,9 +952,6 @@ mod tests {
         assert_eq!(field(o, 1), other);
         assert!(field(o, 1).is_obj(), "a stored pointer came back as something else");
         assert_eq!(raw(o, 2), 0xdead_beef_dead_beef);
-        set_map(o, other);
-        assert_eq!(map(o), other);
-        assert_eq!(field(o, 0).as_int(), Some(-42), "the map word overlapped a field");
     }
 
     /// A pointer read back out of the heap must still be usable as a pointer.
@@ -573,9 +959,9 @@ mod tests {
     /// keeps, and it is why `Oop` is a pointer rather than an integer.
     #[test]
     fn a_pointer_stored_and_reloaded_is_still_dereferenceable() {
-        let s = Space::new(64);
-        let holder = s.alloc(Kind::Slots, 1).unwrap();
-        let target = s.alloc(Kind::Slots, 2).unwrap();
+        let h = heap();
+        let holder = obj(&h, 1);
+        let target = obj(&h, 2);
         set_field(target, 0, Oop::int(99));
         set_field(holder, 0, target);
         let back = field(holder, 0);
@@ -588,7 +974,7 @@ mod tests {
     fn the_space_walks_itself() {
         let s = Space::new(256);
         let sizes = [0usize, 1, 4, 2, 9];
-        let made: Vec<Oop> = sizes.iter().map(|n| s.alloc(Kind::Slots, *n).unwrap()).collect();
+        let made: Vec<Oop> = sizes.iter().map(|n| s.alloc(Kind::Slots, *n, 0).unwrap()).collect();
         let seen: Vec<Oop> = s.walk().collect();
         assert_eq!(seen, made, "the walk did not find the objects in order");
         assert_eq!(s.used(), sizes.iter().map(|n| n + HEADER_WORDS).sum::<usize>());
@@ -597,75 +983,259 @@ mod tests {
     #[test]
     fn a_full_space_answers_none_rather_than_growing() {
         let s = Space::new(8);
-        assert!(s.alloc(Kind::Slots, 2).is_some()); // 4 words
-        assert!(s.alloc(Kind::Slots, 2).is_some()); // 8 words, exactly full
-        assert!(s.alloc(Kind::Slots, 0).is_none(), "an overfull space allocated");
+        assert!(s.alloc(Kind::Slots, 2, 0).is_some()); // 4 words
+        assert!(s.alloc(Kind::Slots, 2, 0).is_some()); // 8 words, exactly full
+        assert!(s.alloc(Kind::Slots, 0, 0).is_none(), "an overfull space allocated");
         assert_eq!(s.used(), 8);
     }
 
+    // ----------------------------------------------------------- collection
+
     #[test]
-    fn reset_frees_the_whole_space_at_once() {
-        let s = Space::new(64);
-        s.alloc(Kind::Slots, 4).unwrap();
-        assert!(!s.is_empty());
-        s.reset();
-        assert!(s.is_empty());
-        assert_eq!(s.walk().count(), 0);
-        // and the space really is reusable
-        let o = s.alloc(Kind::Bytes, 1).unwrap();
-        assert_eq!(kind(o), Kind::Bytes);
+    fn a_scavenge_keeps_the_reachable_and_forgets_the_rest() {
+        let h = heap();
+        let keep = obj(&h, 1);
+        set_field(keep, 0, Oop::int(7));
+        let _lost = obj(&h, 4);
+        let before = h.young_used();
+
+        let mut roots = Vars(vec![keep]);
+        h.scavenge(&mut roots);
+
+        let keep = roots.0[0];
+        assert!(h.young_used() < before, "nothing was reclaimed");
+        assert_eq!(h.young_used(), HEADER_WORDS + 1, "more than the survivor came across");
+        assert_eq!(field(keep, 0).as_int(), Some(7), "the survivor lost its contents");
+        assert_eq!(age(keep), 1);
     }
 
-    /// Evacuation, in miniature: copy an object to another space, forward the
-    /// corpse, and reach the copy through the forward. Rebuilding a pointer to
-    /// one space out of a pointer into another is the operation that has to be
-    /// provenance-correct -- it is what made the whole heap one allocation --
-    /// so this is the test Miri is here for.
     #[test]
-    fn an_object_forwards_to_its_copy_in_another_space() {
-        let from = Space::new(64);
-        let to = Space::new(64);
-        let o = from.alloc(Kind::Slots, 3).unwrap();
-        set_hash(o, 12345);
-        set_field(o, 0, Oop::int(11));
-        set_field(o, 2, Oop::int(33));
-        assert!(forwarded(o).is_none(), "a fresh object is already forwarded");
-
-        let copy = to.alloc(kind(o), payload_words(o)).unwrap();
-        copy_payload(o, copy);
-        set_hash(copy, hash(o));
-        set_forwarded(o, copy);
-
-        let f = forwarded(o).expect("the corpse does not point at the copy");
-        assert_eq!(f, copy);
-        assert!(to.contains(f) && !from.contains(f), "the copy is in the wrong space");
-        assert_eq!(field(f, 0).as_int(), Some(11));
-        assert_eq!(field(f, 2).as_int(), Some(33));
-        assert_eq!(hash(f), 12345);
-        assert_eq!(kind(f), Kind::Slots);
+    fn a_root_is_rewritten_to_where_its_object_went() {
+        let h = heap();
+        let o = obj(&h, 1);
+        set_field(o, 0, Oop::int(1));
+        let mut roots = Vars(vec![o]);
+        h.scavenge(&mut roots);
+        assert_ne!(roots.0[0], o, "the root was not moved");
+        assert_eq!(forwarded(o), Some(roots.0[0]), "the corpse does not point at the copy");
+        assert_eq!(field(roots.0[0], 0).as_int(), Some(1));
     }
 
-    /// A reference held in another object survives its target being evacuated,
-    /// which is the whole reason the mark word doubles as a forwarding pointer.
     #[test]
-    fn a_reference_follows_its_target_through_an_evacuation() {
-        let from = Space::new(64);
-        let to = Space::new(64);
-        let holder = from.alloc(Kind::Slots, 1).unwrap();
-        let target = from.alloc(Kind::Slots, 1).unwrap();
-        set_field(target, 0, Oop::int(5));
-        set_field(holder, 0, target);
+    fn a_reference_between_survivors_follows_its_target() {
+        let h = heap();
+        let a = obj(&h, 1);
+        let b = obj(&h, 1);
+        set_field(a, 0, b);
+        set_field(b, 0, Oop::int(5));
+        let mut roots = Vars(vec![a]);
+        h.scavenge(&mut roots);
 
-        let copy = to.alloc(kind(target), payload_words(target)).unwrap();
-        copy_payload(target, copy);
-        set_forwarded(target, copy);
+        let a = roots.0[0];
+        let b2 = field(a, 0);
+        assert_ne!(b2, b, "the referent did not move");
+        assert!(b2.is_obj(), "the reference is no longer an object");
+        assert_eq!(field(b2, 0).as_int(), Some(5), "the reference points at the wrong thing");
+    }
 
-        // what a Cheney scan does: read the field, notice the forward, rewrite
-        let old = field(holder, 0);
-        if let Some(f) = forwarded(old) {
-            set_field(holder, 0, f);
+    /// A cycle must terminate and must not be copied twice.
+    #[test]
+    fn a_cycle_survives_exactly_once() {
+        let h = heap();
+        let a = obj(&h, 1);
+        let b = obj(&h, 1);
+        set_field(a, 0, b);
+        set_field(b, 0, a);
+        let mut roots = Vars(vec![a]);
+        h.scavenge(&mut roots);
+
+        let a = roots.0[0];
+        let b2 = field(a, 0);
+        assert_eq!(field(b2, 0), a, "the cycle did not close back on the copy");
+        assert_eq!(h.young_used(), 2 * (HEADER_WORDS + 1), "an object was copied twice");
+    }
+
+    #[test]
+    fn a_survivor_is_tenured_once_it_is_old_enough() {
+        let h = heap();
+        let o = obj(&h, 1);
+        set_field(o, 0, Oop::int(3));
+        let mut roots = Vars(vec![o]);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
         }
-        assert_eq!(field(holder, 0), copy, "the reference did not follow");
-        assert_eq!(field(field(holder, 0), 0).as_int(), Some(5));
+        let o = roots.0[0];
+        assert!(!h.is_young(o), "a survivor was never tenured");
+        assert_eq!(h.old_live(), 1);
+        assert_eq!(field(o, 0).as_int(), Some(3), "tenuring lost the contents");
+        // and it stops moving
+        let before = roots.0[0];
+        h.scavenge(&mut roots);
+        assert_eq!(roots.0[0], before, "an old object was moved by a scavenge");
+    }
+
+    /// The scavenge does not scan the old generation, so only the write barrier
+    /// can save a young object that only an old one still names.
+    #[test]
+    fn the_remembered_set_saves_a_young_object_an_old_one_holds() {
+        let h = heap();
+        let holder = obj(&h, 1);
+        let mut roots = Vars(vec![holder]);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        let holder = roots.0[0];
+        assert!(!h.is_young(holder), "the holder was not tenured");
+
+        let young = obj(&h, 1);
+        set_field(young, 0, Oop::int(42));
+        h.store(holder, 0, young);
+        assert_eq!(h.remembered_len(), 1, "the barrier did not fire");
+
+        h.scavenge(&mut roots);
+        let survivor = field(roots.0[0], 0);
+        assert!(survivor.is_obj(), "the young referent was lost");
+        assert_eq!(field(survivor, 0).as_int(), Some(42));
+        assert!(h.is_young(survivor));
+        // still pointing at something young, so still remembered
+        assert_eq!(h.remembered_len(), 1);
+    }
+
+    #[test]
+    fn an_old_object_leaves_the_remembered_set_once_it_points_at_nothing_young() {
+        let h = heap();
+        let holder = obj(&h, 1);
+        let mut roots = Vars(vec![holder]);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        let holder = roots.0[0];
+        h.store(holder, 0, Oop::int(1)); // an integer is not a reference
+        assert_eq!(h.remembered_len(), 0, "an integer store was remembered");
+
+        let young = obj(&h, 0);
+        h.store(holder, 0, young);
+        assert_eq!(h.remembered_len(), 1);
+        // let the referent be tenured too, and the holder should fall out
+        for _ in 0..PROMOTE_AGE + 1 {
+            h.scavenge(&mut roots);
+        }
+        assert_eq!(h.remembered_len(), 0, "the remembered set never empties");
+    }
+
+    #[test]
+    fn only_a_major_reclaims_the_old_generation() {
+        let h = heap();
+        let doomed = obj(&h, 1);
+        let mut roots = Vars(vec![doomed]);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        assert_eq!(h.old_live(), 1);
+        let used = h.old_used();
+
+        roots.0.clear(); // nothing reaches it now
+        h.scavenge(&mut roots);
+        assert_eq!(h.old_live(), 1, "a minor collection swept the old generation");
+
+        h.collect(&mut roots, true);
+        assert_eq!(h.old_live(), 0, "a major collection did not sweep it");
+        assert_eq!(h.old_free_words(), used, "the swept run did not reach the free list");
+    }
+
+    #[test]
+    fn a_swept_run_is_handed_back_to_the_next_promotion() {
+        let h = heap();
+        let doomed = obj(&h, 3);
+        let mut roots = Vars(vec![doomed]);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        let used = h.old_used();
+        roots.0.clear();
+        h.collect(&mut roots, true);
+        assert!(h.old_free_words() > 0);
+
+        // an object of the same shape should land in the hole, not past it
+        let next = obj(&h, 3);
+        roots.0.push(next);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        assert_eq!(h.old_used(), used, "the old space grew instead of reusing the run");
+        assert_eq!(h.old_free_words(), 0, "the free run was not taken");
+    }
+
+    #[test]
+    fn a_major_keeps_what_is_reachable_only_through_a_young_object() {
+        let h = heap();
+        let old = obj(&h, 1);
+        let mut roots = Vars(vec![old]);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        let old = roots.0[0];
+        assert!(!h.is_young(old));
+        set_field(old, 0, Oop::int(77));
+
+        // a fresh young object is the only thing naming it, and it is the root
+        let young = obj(&h, 1);
+        h.store(young, 0, old);
+        roots.0[0] = young;
+
+        h.collect(&mut roots, true);
+        let reached = field(roots.0[0], 0);
+        assert_eq!(h.old_live(), 1, "the old object was swept out from under a live reference");
+        assert_eq!(field(reached, 0).as_int(), Some(77));
+    }
+
+    /// Allocation is infallible: what the young space cannot take is born old.
+    /// Both reasons it cannot -- too big for a semispace at all, and a space
+    /// that has filled up before a collection could run.
+    #[test]
+    fn what_the_young_space_cannot_take_is_born_old() {
+        let h = Heap::new(64, 2048);
+        let big = h.alloc_or_tenure(Kind::Bytes, 0, 200);
+        assert!(!h.is_young(big), "an object bigger than a semispace stayed young");
+        assert_eq!(payload_words(big), 200, "the pretenured object is the wrong size");
+
+        let mut roots = Vars(vec![big]);
+        while h.alloc(Kind::Slots, 1, 0).is_some() {}
+        let crammed = h.alloc_or_tenure(Kind::Slots, 1, 0);
+        assert!(!h.is_young(crammed), "an allocation into a full space was not tenured");
+        set_field(crammed, 0, Oop::int(9));
+        roots.0.push(crammed);
+
+        // clear the filler out again -- none of it is reachable
+        h.scavenge(&mut roots);
+        assert_eq!(h.young_used(), 0, "the unreachable filler survived");
+
+        // a pretenured object is remembered, so whatever it holds survives
+        let young = obj(&h, 1);
+        set_field(young, 0, Oop::int(4));
+        h.store(crammed, 0, young);
+        h.scavenge(&mut roots);
+        let held = field(roots.0[1], 0);
+        assert!(held.is_obj(), "a pretenured object's young referent was lost");
+        assert_eq!(field(held, 0).as_int(), Some(4));
+    }
+
+    /// Promotion must not reserve to-space it then walks away from -- the bump
+    /// happens inside `alloc`, so asking the to-space before checking the age
+    /// leaks a whole object's worth of words per tenured object.
+    #[test]
+    fn tenuring_costs_the_to_space_nothing() {
+        let h = heap();
+        let mut roots = Vars(vec![]);
+        for _ in 0..8 {
+            let o = obj(&h, 1);
+            set_field(o, 0, Oop::int(1));
+            roots.0.push(o);
+        }
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        assert_eq!(h.old_live(), 8, "not everything was tenured");
+        assert_eq!(h.young_used(), 0, "tenuring left words behind in the young space");
     }
 }
