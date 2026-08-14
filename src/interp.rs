@@ -745,12 +745,18 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     };
                     let mut carried = vec![];
                     if tail {
-                        let old = frames.pop().unwrap();
+                        let mut old = frames.pop().unwrap();
+                        give_vals(std::mem::take(&mut old.stack));
                         carried = old.tail_of;
                         if Rc::strong_count(&old.scope) > 1 {
                             carried.push(old.scope);
                         } else {
                             old.scope.dead.set(true);
+                            // Self's loops are recursive with the recursive call
+                            // in tail position, so this -- not `retire` -- is
+                            // where most activations end. Offer it here too, or
+                            // every iteration of a `whileTrue:` allocates one.
+                            give_scope(old.scope);
                         }
                         // Blocks die with a collection, not with the send they
                         // were passed to, so the list holds on to activations

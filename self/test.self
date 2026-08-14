@@ -159,4 +159,17 @@ grew _AddSlots: (| b = 2 |). grew _AddSlots: (| c = 3 |).
 grew _AddSlots: (| d = 4 |). grew _AddSlots: (| e = 5 |).
 t check: 'grew past'  Is: grew a + grew e      Should: 6.
 
+"--- a tail call is where most activations end, and it hands them to the pool
+     to be refilled in place. One a block still holds must not go: `whileTrue:`
+     is recursive in tail position, so the `^` below returns non-locally out of
+     a block, through frames that were tail-called away, to a home activation
+     that has to still be itself when it gets there."
+globals _AddSlots: ( | tc = (| parent* = traits object.
+    find: n = ( | i <- 0 |
+        [ i < 1000 ] whileTrue: [ (i = n) ifTrue: [ ^'found' ]. i: i + 1 ].
+        'missing' ) |) | ).
+t check: 'nlr thru tail' Is: (tc find: 500)    Should: 'found'.
+t check: 'tail no nlr'   Is: (tc find: 5000)   Should: 'missing'.
+t check: 'nlr at once'   Is: (tc find: 0)      Should: 'found'.
+
 t n print. ' tests passed' printLine.
