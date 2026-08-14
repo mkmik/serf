@@ -115,6 +115,46 @@ Two things worth knowing about the interpreter:
   anything else still held the scope, which only worked because `Rc` freed a
   discarded block immediately.)
 
+## Maps, and what a send caches on
+
+A send caches what lookup found, and the question is what to key that on. The
+receiver's identity is the wrong answer: a loop over a thousand clones of one
+prototype presents a thousand receivers and misses every time. The C++ VM keys
+on the receiver's *map* — `MethodLookupKey` "adds the receiver map to that
+info, and is specific to a given receiver map" (`lookup/key.hh:49`) — and serf
+now does the same.
+
+serf's map is the shape a lookup depends on: every slot's name and kind, plus
+the value of every **parent** slot, since a search recurses into those. A data
+slot's value is not in it, because it cannot change what a lookup finds. Shapes
+are interned, so two objects of one shape name the same `MapRef`. On a real
+world that is `core.snap`'s 69,954 objects across 6,062 shapes, and morphic's
+138,202 across 12,828 — about one shape per eleven objects.
+
+Each send site keeps one entry and probes it twice: the same receiver as last
+time answers without touching the object at all, and a *different* receiver of
+the same shape answers after one deref to read its map. The first is what a
+monomorphic site wants; the second is the one receiver keying could never make.
+A loop cloning a prototype and sending to the clone goes from 800,186 misses to
+221, and 0.36s to 0.30s; an integer loop, which the identity probe already
+handled, is unchanged.
+
+```sh
+SERF_MAP_VERIFY=1 ./target/release/serf …   # check every memoised map against
+                                            # a freshly computed shape, so a
+                                            # mutation that changed a shape
+                                            # without saying so fails on the spot
+```
+
+```
+serf_maps_total                     distinct shapes interned
+serf_send_site_hits_total           inline cache probes that hit
+serf_send_site_map_hits_total       ...of those, the ones that hit on the shape
+                                    of a receiver the site had never seen --
+                                    exactly what receiver keying would have missed
+serf_send_site_misses_total
+```
+
 ## Garbage collection
 
 Generation Scavenging, as in `memory/`: a young generation of two semispaces
@@ -359,9 +399,9 @@ stack.
 
 ## Deliberately not here
 
-* **No JIT and no maps.** Every object owns its slot vector and lookup is a
-  linear scan. ~1.5M sends/s; a 3M-iteration loop takes ~4s. Add maps and
-  inline caches when that number matters.
+* **No JIT, and maps only as a key.** Every object still owns its slot vector;
+  what is interned is its *shape*, which is what the send caches key on. A real
+  map would share the descriptors too — see [MEMORY.md](MEMORY.md).
 * **No compaction and no finalization.** The old generation is swept into a
   free list, never compacted, and nothing runs when an object dies.
 * **No processes, no `IfFail:` protocol, no debugger.** Errors abort to the

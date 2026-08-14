@@ -172,4 +172,37 @@ t check: 'nlr thru tail' Is: (tc find: 500)    Should: 'found'.
 t check: 'tail no nlr'   Is: (tc find: 5000)   Should: 'missing'.
 t check: 'nlr at once'   Is: (tc find: 0)      Should: 'found'.
 
+"--- maps: the shape a send caches on, and what has to invalidate it.
+ `askWho:` has a single send site for `who`, so every check below reuses one
+ inline cache entry. Two objects with the same slot names but different parents
+ must not share it -- which is why a parent slot's value is part of the shape."
+globals _AddSlots: ( | mA = (| parent* = traits object. who = 'A'. |).
+                       mB = (| parent* = traits object. who = 'B'. |).
+                       askWho: x = ( x who ). | ).
+globals _AddSlots: ( | mk1 <- (| parent* <- mA. |).
+                       mk2 <- (| parent* <- mB. |). | ).
+t check: 'one site, parent A'  Is: (askWho: mk1)  Should: 'A'.
+t check: 'one site, parent B'  Is: (askWho: mk2)  Should: 'B'.
+t check: 'one site, back to A' Is: (askWho: mk1)  Should: 'A'.
+
+"a clone shares its prototype's shape, so one cache entry answers for both"
+globals _AddSlots: ( | mk3 <- mk1 _Clone. | ).
+t check: 'clone shares shape'  Is: (askWho: mk3)  Should: 'A'.
+
+"rewiring a parent changes what that site has to find"
+mk3 parent: mB.
+t check: 'parent rewired'      Is: (askWho: mk3)  Should: 'B'.
+t check: 'sibling unaffected'  Is: (askWho: mk1)  Should: 'A'.
+
+"adding a slot shadows the parent's, and removing it falls back again"
+mk3 _AddSlots: (| who = 'own'. |).
+t check: 'added slot shadows'  Is: (askWho: mk3)  Should: 'own'.
+"the sibling still has the old shape: if mk3 kept the memoised map it no longer
+ matches, the site would answer for mk3 here and find a slot mk1 does not have"
+t check: 'sibling after add'   Is: (askWho: mk1)  Should: 'A'.
+mk3 _RemoveSlot: 'who'.
+t check: 'removed slot falls back' Is: (askWho: mk3) Should: 'B'.
+t check: 'sibling after remove' Is: (askWho: mk1)  Should: 'A'.
+
+
 t n print. ' tests passed' printLine.

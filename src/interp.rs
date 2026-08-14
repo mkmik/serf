@@ -601,15 +601,23 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     let holder = frames.last().unwrap().scope.holder.clone();
                     let found = if let Some(s) = site.take() {
                         let m = &frames.last().unwrap().scope.method;
-                        let key = vm.lookup_key(&cur_recv);
-                        match m.site_hit(s, key) {
-                            Some(h) => Ok(h),
+                        let start = vm.lookup_key(&cur_recv);
+                        // the same receiver again answers without reading it;
+                        // only a new one pays a deref to find out its shape
+                        match m.site_hit_recv(s, start) {
+                            Some(h) => Ok(h.at(start)),
                             None => {
-                                let r = vm.lookup(&cur_recv, &cur_sel);
-                                if let Ok(h) = r {
-                                    m.site_fill(s, key, h);
+                                let key = start.borrow().map();
+                                match m.site_hit_map(s, key) {
+                                    Some(h) => Ok(h.at(start)),
+                                    None => {
+                                        let r = vm.lookup_from(&cur_recv, &cur_sel, start, key);
+                                        if let Ok(h) = r {
+                                            m.site_fill(s, start, key, MapHit::of(start, h));
+                                        }
+                                        r
+                                    }
                                 }
-                                r
                             }
                         }
                     } else if cur_resend {

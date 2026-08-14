@@ -12,6 +12,15 @@ export SERF_METRICS=off
 
 $R self/test.self
 
+# again checking every memoised map against a freshly computed shape. A send
+# caches on the receiver's shape, so a mutation that changes one without
+# calling `forget_map` would dispatch to another object's method -- and the
+# Self-level checks cannot see it, because a shape change also bumps
+# LOOKUP_GEN and flushes every site before the stale key is consulted
+SERF_MAP_VERIFY=1 $R self/test.self >/dev/null
+[ -f core.snap ] && SERF_MAP_VERIFY=1 $R --load core.snap \
+  -e "(1 to: 200) do: [|:i| (i printString , 'x') hash ]" >/dev/null 2>&1
+
 # again with a young generation small enough to scavenge hundreds of times,
 # checking the write barrier against a full scan of the old generation as it
 # goes: a missed root shows up as a wrong answer or a panic, a missed barrier

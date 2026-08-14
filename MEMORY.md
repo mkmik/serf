@@ -465,7 +465,7 @@ round-trip green, and is provable by a number.
 | 0 | `serf_mem_*` metrics, `SERF_MEM_TRACE=1` allocation counter, Miri in `run-tests.sh` | the numbers above stop being ad-hoc; the harness exists before the unsafe does |
 | 1 | `heap.rs`: the arena, `Oop` as a tagged pointer, `map_addr` tagging, the deref assertion | Miri green on a heap-only unit test |
 | 2 | Objects in the arena: mark word, map pointer, byte and vector payloads; maps interned per shape; Cheney with forwarding; mark-sweep old gen | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
-| 2b | Key the inline caches and `lookup_cache` on the map | send-site hit rate on a clone-heavy loop, ~0% → ~100% |
+| 2b | Key the inline caches and `lookup_cache` on the map | **done, ahead of the rest** — see below |
 | 3 | Roots: `each_root` rewrites, the shadow stack, the `prims.rs` audit | `SERF_GC_STRESS` green across the suite and a morphic boot |
 | 4 | Methods in the heap | image-load mallocs −170k; `walk_method`, `Seen.methods` gone |
 | 5 | Activations in the heap | `test.self` mallocs 1.86M → <1k; both pools and `walk_scope` gone |
@@ -475,9 +475,40 @@ Phase 3 is the one that can silently corrupt, which is why phase 0 builds the
 tools first and phase 3 is its own step rather than a rider on phase 2. Phase 5
 is where the payoff is, which argues for not stopping after 2.
 
-Phase 2b is separable and is the one that pays back immediately: once objects
-carry a map pointer, changing the cache key is a small diff with a large and
-independently measurable effect.
+### Phase 2b, landed early
+
+2b turned out not to need the arena at all, so it went first. Objects still own
+their slot vectors; what is interned is the shape — slot names and kinds plus
+the value of every parent slot — memoised on the object and forgotten by the
+three places that can change it (`put`, a parent `assign`, `_RemoveSlot:`).
+
+A send site keeps one entry and probes it twice: same receiver as last time,
+answered without touching the object; else one deref to read the map, and a
+receiver of a shape the site has seen answers from there. The two-level probe
+is not decoration — keying on the map *alone* costs a deref per send and made a
+monomorphic integer loop 10% slower (0.94s → 1.03s), which the identity probe
+gives back (0.95s).
+
+| | misses | time |
+|---|---|---|
+| clone-and-send loop, keyed on the receiver | 800,186 | 0.36s |
+| the same, keyed on receiver then shape | **221** | **0.30s** |
+
+`serf_send_site_map_hits_total` counts the probes that hit on a receiver the
+site had never seen: 799,965 on that benchmark, which is the old miss count
+almost exactly. Real worlds intern about one shape per eleven objects —
+`core.snap` 69,954 objects to 6,062 shapes, morphic 138,202 to 12,828.
+
+The invariant needs its own check. The Self-level tests cover the semantics
+(dispatch after adding a slot, removing one, rewiring a parent) but *cannot*
+catch a missing `forget_map`, because a shape change also bumps `LOOKUP_GEN`
+and flushes every site before the stale key is consulted. `SERF_MAP_VERIFY=1`
+recomputes each memoised shape and panics where a stale one is used; it runs
+over the suite and over `core.snap` in `run-tests.sh`.
+
+Still owed at phase 2: the descriptors themselves move into the map, an object
+shrinks to a mark word plus a map pointer plus its assignable values, and the
+annotations, the kind byte and `Vm::obj_kind` go with them.
 
 ## Risks
 

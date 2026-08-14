@@ -36,6 +36,10 @@ struct Metrics {
     gens: [Gen; 2],
     allocated: AtomicU64,
     slots_spilled: AtomicU64,
+    maps: AtomicU64,
+    site_hits: AtomicU64,
+    site_map_hits: AtomicU64,
+    site_misses: AtomicU64,
     promoted: AtomicU64,
     freed: AtomicU64,
     young: AtomicU64,
@@ -61,6 +65,10 @@ static M: Metrics = Metrics {
     ],
     allocated: AtomicU64::new(0),
     slots_spilled: AtomicU64::new(0),
+    maps: AtomicU64::new(0),
+    site_hits: AtomicU64::new(0),
+    site_map_hits: AtomicU64::new(0),
+    site_misses: AtomicU64::new(0),
     promoted: AtomicU64::new(0),
     freed: AtomicU64::new(0),
     young: AtomicU64::new(0),
@@ -95,6 +103,26 @@ pub static TOTALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// is the right one for a real world.
 pub fn slots_spilled() {
     M.slots_spilled.fetch_add(1, Relaxed);
+}
+
+/// A shape nothing had seen before. A world that mints these in a loop is
+/// reshaping objects rather than cloning them, and gains nothing from the
+/// map-keyed caches.
+pub fn map_minted() {
+    M.maps.fetch_add(1, Relaxed);
+}
+
+/// One send-site inline cache probe. The hit rate is what says whether keying
+/// on the map rather than on the receiver was worth it.
+pub fn site(hit: bool, by_map: bool) {
+    if hit {
+        M.site_hits.fetch_add(1, Relaxed);
+        if by_map {
+            M.site_map_hits.fetch_add(1, Relaxed);
+        }
+    } else {
+        M.site_misses.fetch_add(1, Relaxed);
+    }
 }
 
 pub fn record(c: Collection) {
@@ -167,6 +195,10 @@ pub fn encode() -> String {
     for (name, help, kind, v) in [
         ("serf_gc_objects_allocated_total", "Objects allocated.", "counter", M.allocated.load(Relaxed)),
         ("serf_gc_slots_spilled_total", "Objects whose slots outgrew the cell and took a vector.", "counter", M.slots_spilled.load(Relaxed)),
+        ("serf_maps_total", "Distinct object shapes interned.", "counter", M.maps.load(Relaxed)),
+        ("serf_send_site_hits_total", "Send-site inline cache probes that hit.", "counter", M.site_hits.load(Relaxed)),
+        ("serf_send_site_map_hits_total", "Hits on a receiver the site had not seen, of a shape it had -- the ones keying on the receiver alone would have missed.", "counter", M.site_map_hits.load(Relaxed)),
+        ("serf_send_site_misses_total", "Send-site inline cache probes that missed.", "counter", M.site_misses.load(Relaxed)),
         ("serf_gc_objects_freed_total", "Objects reclaimed.", "counter", M.freed.load(Relaxed)),
         ("serf_gc_objects_promoted_total", "Objects tenured into the old generation.", "counter", M.promoted.load(Relaxed)),
         ("serf_gc_young_objects", "Objects in the young generation, as of the last collection.", "gauge", M.young.load(Relaxed)),

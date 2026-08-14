@@ -1,9 +1,14 @@
 //! Object model: prototypes, slots, multiple-parent lookup.
 //!
 //! Follows vm/src/any/objects: everything is an object with named slots;
-//! inheritance is delegation through slots marked as parents. Unlike the C++
-//! VM there are no maps -- every object carries its own slot vector.
-//! ponytail: no maps.
+//! inheritance is delegation through slots marked as parents. Every object
+//! carries its own slot vector, but its *shape* -- slot names and kinds, and
+//! the parent values a search recurses into -- is interned as a `MapRef`, the
+//! way the C++ VM interns a map. That is what the method caches key on, since
+//! a thousand clones of one prototype share one shape and no two of them share
+//! an identity.
+//! ponytail: the map is only the key; the slots themselves are still per
+//! object, which is what a real map would share.
 //!
 //! An object lives in the heap in `gc.rs`; a `Value` names one by handle, so a
 //! `Value` is `Copy` and identity is the handle.
@@ -37,7 +42,7 @@ pub enum Value {
     Obj(ObjRef),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SlotKind {
     Data,
     Parent,
@@ -134,6 +139,134 @@ pub struct Slot {
 pub struct Obj {
     pub slots: Slots,
     pub payload: Payload,
+    /// This object's map, memoised. `NO_MAP` until something asks for it, and
+    /// back to `NO_MAP` whenever the shape changes. Not in the shape itself:
+    /// two objects share a map, so the map cannot hold anything per-object.
+    map: Cell<u32>,
+}
+
+const NO_MAP: u32 = u32::MAX;
+
+impl Obj {
+    pub fn new(slots: Slots, payload: Payload) -> Obj {
+        Obj { slots, payload, map: Cell::new(NO_MAP) }
+    }
+
+    /// The shape this object's lookups depend on. Interned, so every object
+    /// like it answers the same `MapRef` -- which is what makes it a usable
+    /// cache key where the object's own identity is not.
+    pub fn map(&self) -> MapRef {
+        let m = self.map.get();
+        if m != NO_MAP {
+            if MAP_VERIFY.with(|v| *v) {
+                verify_map(self);
+            }
+            return MapRef(m);
+        }
+        let r = intern_shape(self);
+        self.map.set(r.0);
+        r
+    }
+
+    /// The shape changed, so the memoised map is wrong. Call from anywhere that
+    /// adds, removes or reorders a slot, or writes a parent slot's value.
+    pub fn forget_map(&self) {
+        self.map.set(NO_MAP);
+    }
+}
+
+// ------------------------------------------------------------------- maps
+
+/// A map: the shape a lookup depends on, interned so that every object of that
+/// shape names the same one. The C++ VM keeps slot descriptors in a map and
+/// keys its lookups on it -- `MethodLookupKey` "adds the receiver map to that
+/// info, and is specific to a given receiver map" (lookup/key.hh:49). serf
+/// keeps the descriptors in the object for now and interns only the key, which
+/// is the part a cache needs: 76% of core.snap's objects share 81 shapes, so a
+/// cache keyed on the map hits where one keyed on the receiver cannot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MapRef(u32);
+
+/// A parent slot's value, as something hashable. Only parents are in the shape:
+/// a search recurses into them, so two objects whose parents differ must not
+/// share a cache entry. A data slot's value cannot change what a lookup finds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum VKey {
+    Obj(u32),
+    Int(i64),
+    Float(u64),
+}
+
+fn vkey(v: Value) -> VKey {
+    match v {
+        Value::Obj(o) => VKey::Obj(o.0),
+        Value::Int(i) => VKey::Int(i),
+        Value::Float(f) => VKey::Float(f.to_bits()),
+    }
+}
+
+/// Slot names and kinds in order, plus the value of every parent slot.
+#[derive(PartialEq, Eq, Hash)]
+struct Shape(Vec<(Sym, SlotKind, Option<VKey>)>);
+
+fn shape_of(o: &Obj) -> Shape {
+    Shape(
+        o.slots
+            .iter()
+            .map(|s| {
+                let v = if s.kind == SlotKind::Parent { Some(vkey(s.value)) } else { None };
+                (s.name, s.kind, v)
+            })
+            .collect(),
+    )
+}
+
+thread_local! {
+    /// Interned shapes. An `Rc` so the table and its index share one copy.
+    /// Entries are never removed: a shape nothing has any more is a few dozen
+    /// bytes, and dropping one would need to know that no object still names
+    /// it. `serf_maps_total` says whether a world is minting them in a loop.
+    /// ponytail: monotonic table, no eviction.
+    static MAPS: RefCell<(Vec<Rc<Shape>>, HashMap<Rc<Shape>, MapRef>)> =
+        RefCell::new((vec![], HashMap::new()));
+}
+
+fn intern_shape(o: &Obj) -> MapRef {
+    let s = shape_of(o);
+    MAPS.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(&m) = t.1.get(&s) {
+            return m;
+        }
+        let s = Rc::new(s);
+        let m = MapRef(t.0.len() as u32);
+        t.0.push(s.clone());
+        t.1.insert(s, m);
+        crate::metrics::map_minted();
+        m
+    })
+}
+
+thread_local! {
+    /// `SERF_MAP_VERIFY=1`: check every memoised map against a freshly computed
+    /// shape. The invalidation points are `put`, a parent `assign` and
+    /// `_RemoveSlot`, and this is what says nobody has added a fourth.
+    static MAP_VERIFY: bool = std::env::var_os("SERF_MAP_VERIFY").is_some();
+}
+
+/// Recompute the shape and check it against the memoised map, so a mutation
+/// that forgot to call `forget_map` fails where the stale map is used rather
+/// than by dispatching to the wrong method somewhere else entirely.
+fn verify_map(o: &Obj) {
+    let cached = o.map.get();
+    if cached == NO_MAP {
+        return;
+    }
+    let fresh = MAPS.with(|t| t.borrow().1.get(&shape_of(o)).copied());
+    if fresh != Some(MapRef(cached)) {
+        panic!("stale map: object memoised map {} but its shape interns to {:?} -- \
+                a slot was changed without forget_map()", cached, fresh);
+    }
 }
 
 /// How many slots live in the cell itself. A young space is a fixed array of
@@ -318,8 +451,13 @@ pub struct Site {
     /// arity of the selector in this literal, a pure function of it -- so
     /// unlike `hit` it never goes stale. `u32::MAX` until first computed.
     nargs: u32,
-    /// receiver key, what it found, and the `LOOKUP_GEN` that was true at
-    hit: Option<(u64, ObjRef, Hit)>,
+    /// The `LOOKUP_GEN` that was true at, the last receiver seen here, its map,
+    /// and what lookup found. Two ways in: the same receiver again hits without
+    /// touching the object at all, and a *different* receiver of the same shape
+    /// hits after one deref to read its map. The first is what a monomorphic
+    /// site wants and is the cheaper of the two; the second is what a loop over
+    /// a clone family wants, and receiver keying alone could never give it.
+    hit: Option<(u64, ObjRef, MapRef, MapHit)>,
 }
 
 impl Default for Site {
@@ -346,16 +484,37 @@ impl Method {
         s[i].nargs as usize
     }
 
-    /// What site `i` last found for receiver key `k`, if that is still good.
-    pub fn site_hit(&self, i: usize, k: ObjRef) -> Option<Hit> {
+    /// The same receiver as last time? Then the answer stands, and reading the
+    /// object to find its map was not necessary. Tried first because it is the
+    /// common case and the only one that touches nothing.
+    pub fn site_hit_recv(&self, i: usize, r: ObjRef) -> Option<MapHit> {
         match self.sites()[i].hit {
-            Some((g, r, h)) if r == k && g == lookup_gen() => Some(h),
+            Some((g, s, _, h)) if s == r && g == lookup_gen() => {
+                crate::metrics::site(true, false);
+                Some(h)
+            }
             _ => None,
         }
     }
 
-    pub fn site_fill(&self, i: usize, k: ObjRef, h: Hit) {
-        self.sites()[i].hit = Some((lookup_gen(), k, h));
+    /// A different receiver, but of the same shape. This is the probe receiver
+    /// keying could not make: a loop over a thousand clones of one prototype
+    /// arrives here a thousand times and hits every time.
+    pub fn site_hit_map(&self, i: usize, k: MapRef) -> Option<MapHit> {
+        match self.sites()[i].hit {
+            Some((g, _, m, h)) if m == k && g == lookup_gen() => {
+                crate::metrics::site(true, true);
+                Some(h)
+            }
+            _ => {
+                crate::metrics::site(false, false);
+                None
+            }
+        }
+    }
+
+    pub fn site_fill(&self, i: usize, r: ObjRef, k: MapRef, h: MapHit) {
+        self.sites()[i].hit = Some((lookup_gen(), r, k, h));
     }
 }
 
@@ -514,16 +673,20 @@ impl Obj {
     /// Add or replace by name.
     pub fn put(&mut self, s: Slot) {
         lookup_gen_bump();
+        self.forget_map();
         match self.find_sym(s.name) {
             Some(i) => self.slots[i] = s,
             None => self.slots.push(s),
         }
     }
     /// Write a slot's value. A parent write rewires the object graph and so
-    /// invalidates memoised lookups; a data write cannot change one.
+    /// invalidates memoised lookups and this object's map; a data write cannot
+    /// change what a lookup finds, so it leaves both alone -- which is the
+    /// point of keeping data values out of the shape.
     pub fn assign(&mut self, i: usize, v: Value) {
         if self.slots[i].kind == SlotKind::Parent {
             lookup_gen_bump();
+            self.forget_map();
         }
         self.slots[i].value = v;
     }
@@ -554,6 +717,34 @@ pub struct Hit {
     pub idx: usize,
 }
 
+/// The same answer, relative to the object the search started from: a slot in
+/// that object itself, or a slot in one particular ancestor. The distinction is
+/// what makes a hit cacheable across a whole clone family -- a `Hit`'s `holder`
+/// is the receiver when the slot is the receiver's own, and every object
+/// sharing a map has a different one. An ancestor is shared, because a parent
+/// slot's value is part of the shape.
+#[derive(Clone, Copy)]
+pub enum MapHit {
+    OnSelf(usize),
+    In(ObjRef, usize),
+}
+
+impl MapHit {
+    pub fn of(start: ObjRef, h: Hit) -> MapHit {
+        if h.holder == start {
+            MapHit::OnSelf(h.idx)
+        } else {
+            MapHit::In(h.holder, h.idx)
+        }
+    }
+    pub fn at(self, start: ObjRef) -> Hit {
+        match self {
+            MapHit::OnSelf(idx) => Hit { holder: start, idx },
+            MapHit::In(holder, idx) => Hit { holder, idx },
+        }
+    }
+}
+
 /// Memoised `lookup` results, selector -> start object -> outcome. Entries are
 /// valid only for the `LOOKUP_GEN` they were filled at; the whole cache is
 /// dropped when the generation moves, which also covers recycled handle ids.
@@ -563,7 +754,7 @@ pub struct Hit {
 pub struct LookupCache {
     gen: u64,
     len: usize,
-    map: HashMap<Rc<str>, HashMap<ObjRef, Result<Hit, LookupErr>>>,
+    map: HashMap<Rc<str>, HashMap<MapRef, Result<MapHit, LookupErr>>>,
 }
 
 pub struct Vm {
@@ -882,8 +1073,29 @@ impl Vm {
         }
     }
 
+    /// The object a search starts from, and the map a memoised result is keyed
+    /// on. Every object of that shape shares the entry, which is the whole
+    /// point: the receiver's own identity would give each clone its own.
+    pub fn map_key(&self, recv: &Value) -> (ObjRef, MapRef) {
+        let start = self.lookup_key(recv);
+        let m = start.borrow().map();
+        (start, m)
+    }
+
     pub fn lookup(&self, recv: &Value, sel: &str) -> Result<Hit, LookupErr> {
-        let key = self.lookup_key(recv);
+        let (start, key) = self.map_key(recv);
+        self.lookup_from(recv, sel, start, key)
+    }
+
+    /// `lookup` for a caller that already has the key -- the send bytecode,
+    /// which needs it for its inline cache anyway.
+    pub fn lookup_from(
+        &self,
+        recv: &Value,
+        sel: &str,
+        start: ObjRef,
+        key: MapRef,
+    ) -> Result<Hit, LookupErr> {
         let gen = lookup_gen();
         {
             let mut c = self.lookup_cache.borrow_mut();
@@ -892,7 +1104,7 @@ impl Vm {
                 c.len = 0;
                 c.gen = gen;
             } else if let Some(r) = c.map.get(sel).and_then(|m| m.get(&key)) {
-                return *r;
+                return r.map(|h| h.at(start));
             }
         }
         let mut hits: Vec<Hit> = vec![];
@@ -903,6 +1115,8 @@ impl Vm {
             1 => Ok(hits[0]),
             _ => Err(LookupErr::Ambiguous),
         };
+        let stored = r.map(|h| MapHit::of(start, h));
+        let r = stored.map(|h| h.at(start));
         let mut c = self.lookup_cache.borrow_mut();
         // ponytail: crude size cap; an LRU if a world ever legitimately holds
         // this many live (receiver, selector) pairs
@@ -912,10 +1126,10 @@ impl Vm {
         }
         match c.map.get_mut(sel) {
             Some(m) => {
-                m.insert(key, r);
+                m.insert(key, stored);
             }
             None => {
-                c.map.entry(sel.into()).or_default().insert(key, r);
+                c.map.entry(sel.into()).or_default().insert(key, stored);
             }
         }
         c.len += 1;

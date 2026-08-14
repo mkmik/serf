@@ -1120,7 +1120,13 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let o = as_obj(recv, name)?;
             let before = o.borrow().slots.len();
             crate::value::lookup_gen_bump();
-            o.borrow_mut().slots.retain(|s| sym_str(s.name) != n && sym_str(s.name) != with_colon);
+            {
+                // removing a slot changes the shape, and this is the one place
+                // that touches an object's slots without going through `put`
+                let mut b = o.borrow_mut();
+                b.forget_map();
+                b.slots.retain(|s| sym_str(s.name) != n && sym_str(s.name) != with_colon);
+            }
             if o.borrow().slots.len() == before {
                 return Err("slotNameError".into());
             }

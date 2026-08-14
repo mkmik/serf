@@ -329,6 +329,7 @@ fn world_stats(vm: &Vm) -> String {
     let (mut ints, mut floats, mut annos) = (0i64, 0usize, 0usize);
     let mut bykind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut seen: HashSet<usize> = HashSet::new();
+    let mut shapes: HashSet<value::MapRef> = HashSet::new();
     let mut work: Vec<value::Value> = root;
     while let Some(v) = work.pop() {
         match &v {
@@ -342,6 +343,7 @@ fn world_stats(vm: &Vm) -> String {
         let key = image_obj::value_key(&v);
         if vm.anno_obj.contains_key(&key) { annos += 1; }
         let o = v.as_obj().unwrap().borrow();
+        shapes.insert(o.map());
         for sl in &o.slots {
             slots += 1;
             match sl.kind {
@@ -385,9 +387,11 @@ fn world_stats(vm: &Vm) -> String {
          byte objects {} ({} bytes)  vectors {} ({} elements)\n\
          methods {} ({} bytecodes, {} literals)  blocks {}  floats {}  int-checksum {}\n\
          parents by payload {:?}\n\
+         maps {} (one per {:.1} objects)\n\
          heap {} objects (young {} old {})",
         objs, slots, parents, assigns, annos, strs, strbytes, vecs, vecelems,
         meths, code, lits, blocks, floats, ints, bykind,
+        shapes.len(), objs as f64 / shapes.len().max(1) as f64,
         gc::gc().count(), gc::gc().young_used(), gc::gc().old_used()
     )
 }
