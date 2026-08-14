@@ -482,6 +482,27 @@ What is left is not collector design. It is porting the VM onto a collector
 that already works, which is the shape the last four commits were arranged to
 produce.
 
+### Is the port worth it? Yes, four times over
+
+Before spending the flip's effort, the collector was measured against the one
+it replaces. `cargo test --release -- --ignored --nocapture heap::bench`, with
+a young space of 1M words and one object in a hundred surviving:
+
+```
+4,615,321 objects, 40 scavenges, 9ns/object allocated, 397us mean pause
+```
+
+The cell heap, on a real run with `SERF_GC_STATS=1`, scavenges 49,644 young
+objects with 493 survivors in **879us**. The arena carries roughly 115,000
+objects per semispace and scavenges them in **397us** -- about twice the
+objects in half the time, so four times the throughput per object -- and it
+allocates 4.6M objects with **no `malloc` at all**, where the cell heap takes
+one per object with slots or a payload.
+
+Nine nanoseconds an object includes zeroing the payload and filling three
+slots. The bump is the cheap part; what the cell heap was paying for was
+`malloc`, and then `free` again on every dead object in the from-space.
+
 ### Phase 2c: the flip, spelled out
 
 The remaining work is mechanical, so here is the mechanism rather than an

@@ -1244,7 +1244,7 @@ mod tests {
     use super::*;
 
     /// Roots as a plain list of slots, which is all the collector asks for.
-    struct Vars(Vec<Oop>);
+    pub struct Vars(pub Vec<Oop>);
 
     impl Roots for Vars {
         fn each(&mut self, f: &mut dyn FnMut(&mut Oop)) {
@@ -2060,5 +2060,62 @@ mod tests {
         }
         assert_eq!(h.old_live(), 8, "not everything was tenured");
         assert_eq!(h.young_used(), 0, "tenuring left words behind in the young space");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use super::tests::Vars;
+
+    /// Not a check -- a number. `cargo test --release -- --ignored --nocapture
+    /// heap::bench`. The cell heap it replaces scavenges ~50k young objects in
+    /// about 880us (`SERF_GC_STATS=1`); this says what the arena does with the
+    /// same shape of work, and so whether porting the VM onto it is worth it.
+    #[test]
+    #[ignore]
+    fn scavenge_throughput() {
+        let h = Heap::new(1 << 20, 1 << 20);
+        let mut roots = Vars(vec![]);
+        let t0 = std::time::Instant::now();
+        let mut allocated = 0u64;
+        let mut scavenges = 0u64;
+        let mut pause = std::time::Duration::ZERO;
+        for _ in 0..40 {
+            loop {
+                match h.alloc(Shape::new(Kind::Slots, 3)) {
+                    Some(o) => {
+                        for i in 0..3 {
+                            set_slot_desc(o, i, i as u32, 0);
+                            set_slot_value(o, i, Oop::int(i as i64));
+                        }
+                        allocated += 1;
+                        // keep about one in a hundred, as a real world does
+                        if allocated % 100 == 0 {
+                            roots.0.push(o);
+                        }
+                    }
+                    None => break,
+                }
+            }
+            let live = roots.0.len();
+            let t = std::time::Instant::now();
+            h.scavenge(&mut roots);
+            pause += t.elapsed();
+            scavenges += 1;
+            let _ = live;
+            roots.0.truncate(roots.0.len() / 2);
+        }
+        let total = t0.elapsed();
+        eprintln!(
+            "[bench] {} objects, {} scavenges, {:.1}ms total, {:.0}ns/object alloc, \
+             {:.0}us mean pause, {} tenured",
+            allocated,
+            scavenges,
+            total.as_secs_f64() * 1e3,
+            (total - pause).as_nanos() as f64 / allocated as f64,
+            pause.as_micros() as f64 / scavenges as f64,
+            h.old_live(),
+        );
     }
 }
