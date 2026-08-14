@@ -137,6 +137,12 @@ is reachable from the `Vm`. The interpreter lends its activation stack to the
 compilation — which keep half-built graphs in Rust locals — suspend collection
 outright.
 
+What the collector does *not* manage is what an object contains: slot vectors
+past the fourth, byte payloads, methods and activations are still Rust
+allocations, at 1.9M `malloc`s per test run. [MEMORY.md](MEMORY.md) designs the
+replacement — direct tagged pointers, one arena, every Self-universe entity in
+it, activations included.
+
 ```sh
 SERF_GC=off      ./target/release/serf …   # never collect
 SERF_GC_STRESS=1 ./target/release/serf …   # collect after every allocation and
