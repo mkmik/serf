@@ -91,6 +91,7 @@ struct Metrics {
     allocated: AtomicU64,
     slots_spilled: AtomicU64,
     maps: AtomicU64,
+    switched: AtomicU64,
     site_hits: AtomicU64,
     site_map_hits: AtomicU64,
     site_misses: AtomicU64,
@@ -120,6 +121,7 @@ static M: Metrics = Metrics {
     allocated: AtomicU64::new(0),
     slots_spilled: AtomicU64::new(0),
     maps: AtomicU64::new(0),
+    switched: AtomicU64::new(0),
     site_hits: AtomicU64::new(0),
     site_map_hits: AtomicU64::new(0),
     site_misses: AtomicU64::new(0),
@@ -164,6 +166,13 @@ pub fn slots_spilled() {
 /// map-keyed caches.
 pub fn map_minted() {
     M.maps.fetch_add(1, Relaxed);
+}
+
+/// One `switch_pointers`: a walk of both generations to make the world stop
+/// naming an object that a wider one replaced. Cheap because it happens while
+/// a world is being programmed, not while it runs -- this is what says so.
+pub fn switched() {
+    M.switched.fetch_add(1, Relaxed);
 }
 
 /// One send-site inline cache probe. The hit rate is what says whether keying
@@ -253,6 +262,7 @@ pub fn encode() -> String {
         ("serf_gc_objects_allocated_total", "Objects allocated.", "counter", M.allocated.load(Relaxed)),
         ("serf_gc_slots_spilled_total", "Objects whose slots outgrew the cell and took a vector.", "counter", M.slots_spilled.load(Relaxed)),
         ("serf_maps_total", "Distinct object shapes interned.", "counter", M.maps.load(Relaxed)),
+        ("serf_switch_pointers_total", "Heap walks to replace every reference to one object with another, as _AddSlots: needs.", "counter", M.switched.load(Relaxed)),
         ("serf_send_site_hits_total", "Send-site inline cache probes that hit.", "counter", M.site_hits.load(Relaxed)),
         ("serf_send_site_map_hits_total", "Hits on a receiver the site had not seen, of a shape it had -- the ones keying on the receiver alone would have missed.", "counter", M.site_map_hits.load(Relaxed)),
         ("serf_send_site_misses_total", "Send-site inline cache probes that missed.", "counter", M.site_misses.load(Relaxed)),

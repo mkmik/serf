@@ -434,6 +434,7 @@ impl Space {
     pub fn alloc(&self, s: Shape) -> Option<Oop> {
         let (oops, raw) = s.words();
         let o = self.alloc_words(s.kind, oops, s.slots, oops + raw, s.annotated)?;
+        zero_payload(o);
         if s.kind == Kind::Bytes {
             set_raw(o, len_word(o), s.len as u64);
         }
@@ -791,6 +792,23 @@ pub fn bytes_of(o: Oop) -> Vec<u8> {
     (0..ilen(o)).map(|i| byte_at(o, i)).collect()
 }
 
+/// A fresh object reads as nulls and zeroes.
+///
+/// Not a nicety. A space is reused by resetting a bump pointer, not by being
+/// cleared, so the words of a new object are whatever the last occupant left
+/// there -- and a stale word that happens to look like a pointer is one the
+/// collector will follow into a space that no longer holds what it did. The
+/// cell heap could not have this bug, because a cell held an `Option<Obj>`
+/// and an absent one was absent. Here it costs a store per word, paid on
+/// allocation rather than discovered later.
+///
+/// Evacuation and cloning skip it: they overwrite every word anyway.
+fn zero_payload(o: Oop) {
+    for i in 0..payload_words(o) {
+        set_raw(o, i, 0);
+    }
+}
+
 fn copy_payload(from: Oop, to: Oop) {
     debug_assert_eq!(payload_words(from), payload_words(to), "copying between different sizes");
     for i in 0..payload_words(from) {
@@ -923,6 +941,7 @@ impl Heap {
                 // born old with its fields already set and no barrier fired for
                 // it: whatever it comes to hold, the next scavenge has to know
                 let o = self.alloc_old(s.kind, oops, s.slots, oops + raw, s.annotated);
+                zero_payload(o);
                 self.record(o);
                 if s.kind == Kind::Bytes {
                     set_raw(o, len_word(o), s.len as u64);
@@ -1173,6 +1192,40 @@ impl Heap {
         }
         // a swept object may have been on the remembered set
         self.remembered.borrow_mut().retain(|o| dirty(*o));
+    }
+
+    /// Replace every reference to `from` with `to`, everywhere.
+    ///
+    /// This is `universe::switch_pointers` (`memory/universe.cpp:315`), and it
+    /// is the bill that comes with direct pointers. An object is a fixed run of
+    /// words, so `_AddSlots:` cannot grow one in place: it builds a wider object
+    /// and has to make the world stop naming the old one. With a handle table
+    /// this was a single store; here it is a walk of both generations and every
+    /// root.
+    ///
+    /// Affordable because of *when* it happens -- programming a world, not
+    /// running one. `serf_switch_pointers_total` is what would say otherwise.
+    pub fn switch_pointers(&self, roots: &mut dyn Roots, from: Oop, to: Oop) {
+        debug_assert!(from.is_obj() && to.is_obj(), "switching something that is not an object");
+        roots.each(&mut |slot| {
+            if *slot == from {
+                *slot = to;
+            }
+        });
+        for space in [self.from_space(), &self.old] {
+            for o in space.walk() {
+                if o == from {
+                    continue; // the corpse may keep naming itself
+                }
+                for i in 0..oop_words(o) {
+                    if field(o, i) == from {
+                        set_field(o, i, to);
+                        self.record(o);
+                    }
+                }
+            }
+        }
+        crate::metrics::switched();
     }
 
     /// Collect. `major` sweeps the old generation as well.
@@ -1798,6 +1851,196 @@ mod tests {
         u.vars.clear();
         h.collect(&mut u, true);
         assert_eq!(u.buried, vec![1], "the swept old object was not reported");
+    }
+
+    /// `_AddSlots:` cannot widen an object in place, so it builds a wider one
+    /// and makes the world stop naming the old. Every reference has to move:
+    /// roots, other young objects, and old ones -- which then have to be
+    /// remembered, because the new object may be young.
+    #[test]
+    fn switching_pointers_finds_every_reference() {
+        let h = heap();
+        let holder = obj(&h, 1);
+        let mut roots = Vars(vec![holder]);
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut roots);
+        }
+        let old_holder = roots.0[0];
+        assert!(!h.is_young(old_holder), "the holder was not tenured");
+
+        let narrow = obj(&h, 1);
+        set_slot_desc(narrow, 0, 1, DATA);
+        set_slot_value(narrow, 0, Oop::int(5));
+        h.store(old_holder, 0, narrow);
+        let young_holder = obj(&h, 2);
+        set_slot_desc(young_holder, 0, 1, DATA);
+        set_slot_value(young_holder, 0, narrow);
+        set_slot_desc(young_holder, 1, 2, DATA);
+        set_slot_value(young_holder, 1, Oop::int(1));
+        roots.0.push(young_holder);
+        roots.0.push(narrow);
+
+        // the wider object `_AddSlots:` would have built
+        let wide = h.alloc(Shape::new(Kind::Slots, 2)).unwrap();
+        set_slot_desc(wide, 0, 1, DATA);
+        set_slot_value(wide, 0, Oop::int(5));
+        set_slot_desc(wide, 1, 9, DATA);
+        set_slot_value(wide, 1, Oop::int(6));
+
+        h.switch_pointers(&mut roots, narrow, wide);
+
+        assert_eq!(roots.0[2], wide, "a root still names the narrow object");
+        assert_eq!(slot_value(young_holder, 0), wide, "a young holder was missed");
+        assert_eq!(slot_value(old_holder, 0), wide, "an old holder was missed");
+        assert_eq!(slot_value(young_holder, 1).as_int(), Some(1), "a bystander was switched");
+
+        // and the switched-to object survives, because everything now names it
+        h.scavenge(&mut roots);
+        assert_eq!(slot_value(roots.0[1], 0), roots.0[2]);
+        assert_eq!(slot_value(roots.0[2], 1).as_int(), Some(6));
+        assert_eq!(slot_value(roots.0[0], 0), roots.0[2], "the old holder lost the new object");
+    }
+
+    // ------------------------------------------------------------- under load
+
+    /// A fingerprint of everything reachable from the roots that does *not*
+    /// depend on where anything is: kinds, shapes, descriptors, immediates and
+    /// bytes, in a fixed traversal order. A collection moves objects and must
+    /// change nothing else, so this number may not move either.
+    fn fingerprint(roots: &[Oop]) -> u64 {
+        let mut seen: Vec<usize> = vec![];
+        let mut work: Vec<Oop> = roots.iter().rev().copied().collect();
+        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+        let mix = |acc: &mut u64, v: u64| {
+            *acc = (*acc ^ v).wrapping_mul(0x100_0000_01b3);
+        };
+        while let Some(o) = work.pop() {
+            if let Some(i) = o.as_int() {
+                mix(&mut acc, i as u64 ^ 0x1111);
+                continue;
+            }
+            if !o.is_obj() {
+                mix(&mut acc, 0x2222);
+                continue;
+            }
+            if seen.contains(&o.addr()) {
+                mix(&mut acc, 0x3333);
+                continue;
+            }
+            seen.push(o.addr());
+            mix(&mut acc, kind(o) as u64);
+            mix(&mut acc, slots(o) as u64);
+            mix(&mut acc, ilen(o) as u64);
+            for i in 0..slots(o) {
+                mix(&mut acc, slot_name(o, i) as u64);
+                mix(&mut acc, slot_kind(o, i) as u64);
+            }
+            for i in 0..ilen(o) {
+                if kind(o) == Kind::Bytes {
+                    mix(&mut acc, byte_at(o, i) as u64);
+                }
+            }
+            // children last, so the shape is fingerprinted before the graph
+            for i in (0..oop_words(o)).rev() {
+                work.push(field(o, i));
+            }
+        }
+        acc
+    }
+
+    /// A graph of a few thousand objects of assorted shapes, collected
+    /// repeatedly -- minors, majors, and a `switch_pointers` in the middle --
+    /// with the fingerprint checked after every step. Deterministic: the same
+    /// sequence every run, so a failure is reproducible.
+    #[test]
+    fn a_graph_survives_being_collected_over_and_over() {
+        // Miri interprets every load and store, so the full graph would take
+        // the best part of an hour there. A smaller one walks the same paths.
+        let (rounds, batch) = if cfg!(miri) { (6usize, 12usize) } else { (40, 60) };
+        let h = Heap::new(1 << 13, 1 << 14);
+        let mut rng: u64 = 0x5eed;
+        let mut next = move || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) as usize
+        };
+
+        let mut live: Vec<Oop> = vec![];
+        for round in 0..rounds {
+            // build a batch, wiring each new object to ones already there
+            for _ in 0..batch {
+                let pick = next() % 10;
+                let o = if pick < 6 {
+                    let n = next() % 5;
+                    let o = h.alloc_or_tenure(Shape::new(Kind::Slots, n));
+                    for i in 0..n {
+                        set_slot_desc(o, i, (next() % 32) as u32, (next() % 2) as u8);
+                        let v = if !live.is_empty() && next() % 2 == 0 {
+                            live[next() % live.len()]
+                        } else {
+                            Oop::int((next() % 1000) as i64)
+                        };
+                        // through the barrier: `o` may already be old
+                        h.store(o, i, v);
+                    }
+                    o
+                } else if pick < 8 {
+                    let n = next() % 40;
+                    let o = h.alloc_or_tenure(Shape::indexable(Kind::Bytes, 1, n));
+                    set_slot_desc(o, 0, 1, PARENT);
+                    for i in 0..n {
+                        set_byte_at(o, i, (next() % 251) as u8);
+                    }
+                    o
+                } else {
+                    let n = next() % 6;
+                    let o = h.alloc_or_tenure(Shape::indexable(Kind::ObjVector, 1, n));
+                    set_slot_desc(o, 0, 1, PARENT);
+                    for i in 0..n {
+                        let v = if !live.is_empty() {
+                            live[next() % live.len()]
+                        } else {
+                            Oop::int(i as i64)
+                        };
+                        set_element(o, i, v);
+                        if v.is_obj() {
+                            h.record(o);
+                        }
+                    }
+                    o
+                };
+                live.push(o);
+            }
+
+            // drop about half of the roots, so there is always garbage
+            let keep = live.len() / 2;
+            while live.len() > keep {
+                live.swap_remove(next() % live.len());
+            }
+
+            let before = fingerprint(&live);
+            let mut roots = Vars(std::mem::take(&mut live));
+            if round % 7 == 6 {
+                // widen one object the way `_AddSlots:` would
+                if let Some(&victim) = roots.0.iter().find(|o| kind(**o) == Kind::Slots) {
+                    let n = slots(victim);
+                    let wide = h.alloc_or_tenure(Shape::new(Kind::Slots, n));
+                    for i in 0..n {
+                        set_slot_desc(wide, i, slot_name(victim, i), slot_kind(victim, i));
+                        h.store(wide, i, slot_value(victim, i));
+                    }
+                    h.switch_pointers(&mut roots, victim, wide);
+                }
+            }
+            h.collect(&mut roots, round % 5 == 4);
+            live = roots.0;
+            assert_eq!(
+                fingerprint(&live),
+                before,
+                "round {round}: the graph changed across a collection"
+            );
+        }
+        assert!(!live.is_empty(), "everything died");
+        assert!(h.old_live() > 0, "nothing was ever tenured");
     }
 
     /// Promotion must not reserve to-space it then walks away from -- the bump
