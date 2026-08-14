@@ -113,52 +113,92 @@ One object is a contiguous run of words, self-describing so that any arena can
 be walked linearly.
 
 ```
-word 0   mark:  forwarded:1 │ identity hash:23 │ age:8 │ kind:8 │ flags:8 │ tag:8
-word 1   size in words:32 │ nslots:32
-word 2   slot 0 descriptor:  name (Sym):32 │ kind:8 │ flags:8 │ pad:16
-word 3   slot 0 value        Oop
-  ⋮      … nslots × 2 words …
-         [FLAG_ANNO]     object annotation Oop, then nslots slot-annotation Oops
+word 0   mark:  forwarded:1 │ identity hash:23 │ age:8 │ flags:8 │ tag:8 │ pad:8
+word 1   map pointer  ──▶ shape: slot descriptors, constant slot values, kind,
+                          annotations, size — shared by every object like this
+word 2   assignable slot 0 value      Oop
+  ⋮      … one word per assignable slot …
          [kind indexable] length in elements, then the bytes or the Oops
 ```
 
-This is the C++ VM's header, widened. Self's mark word is
-`tag:2 │ hash:22 │ age:7 │ marked:1` (`objects/markOop.hh:15`) and its second
-word is the map pointer; serf has no maps, so the second word carries the size
-and slot count that a map would otherwise hold.
+This is the C++ VM's layout: mark word plus map pointer. Self's mark word is
+`tag:2 │ hash:22 │ age:7 │ marked:1` (`objects/markOop.hh:15`); serf's is
+widened to 64 bits and gains the scavenge's `forwarded` flag.
 
 * `hash` is the identity hash Self keeps in the mark word, and its being here
   is what deletes `Vm::id_hash`. An address cannot serve, because the object
   moves.
-* `kind` replaces `Payload`: `Slots`, `Bytes`, `ObjVector`, `Method`, `Block`,
-  `Mirror`, `Proxy`, `Float`, `Activation`, `Process`. It deletes
-  `Vm::obj_kind`.
-* `forwarded` is the scavenge's flag; see below.
-* Annotations are a trailing region present only when `FLAG_ANNO` is set —
-  serf's own world has none and should not pay for them; a loaded world has
-  218,474 and needs them somewhere that is not a Rust hash map. It deletes
-  `Vm::anno_obj`, `Vm::anno_slot`, `Vm::anno_young`, `note_anno`, and the
-  annotation write barrier.
+* Everything else that was going to need a home in the object — slot names and
+  kinds, the `kind` byte that replaces `Payload`, the annotations — is in the
+  map. That deletes `Vm::obj_kind`, `Vm::anno_obj`, `Vm::anno_slot`,
+  `Vm::anno_young`, `note_anno` and the annotation write barrier, and it leaves
+  an object holding only the words that actually differ between clones.
 
-**No maps.** The C++ VM shares slot descriptors between clones through a map
-and pays for it with map canonicalisation, map transitions on every
-`_AddSlots:`, and dependency lists — the largest single subsystem in
-`objects/`. The win over per-object descriptors on `core.snap` is 265,153 slots
-× 8 bytes ≈ 2 MB. Not worth it yet. Add maps if a world ever clones one shape
-hundreds of thousands of times; `serf_mem_slot_words` will say so.
+### Maps
+
+An earlier draft of this design skipped maps, on the grounds that sharing slot
+descriptors between clones saves 265,153 × 8 ≈ 2 MB on `core.snap` and costs
+map canonicalisation, map transitions on `_AddSlots:` and dependency lists —
+the largest subsystem in `objects/`. That costed the wrong axis. **A map is
+the right key for a method cache, and object identity is the wrong one.**
+
+Self keys its lookups on the receiver's map, not the receiver:
+`MethodLookupKey` "adds the receiver map to that info, and is specific to a
+given receiver map" (`lookup/key.hh:49`). serf keys on the receiver object —
+`m.site_hit(s, vm.lookup_key(&cur_recv))` in `interp.rs:604`, where
+`lookup_key` answers the receiver's own `ObjRef`. So a loop over a thousand
+clones of one prototype misses a monomorphic inline cache a thousand times,
+and fills the `lookup_cache` with a thousand entries that say the same thing.
+Only immediates cache well today, because all integers share their traits
+object as a key.
+
+Interning a map per distinct shape is something serf's image writer already
+does (`image_obj.rs:892`), so the compression ratio is measurable rather than
+hypothetical:
+
+| | objects | maps | maps with one object | objects sharing a map |
+|---|---|---|---|---|
+| `core.snap` | 111,844 | 26,584 | 26,503 | 85,341 across **81 maps** |
+| `morphic.snap` | 219,746 | 53,495 | 53,312 | 166,434 across **183 maps** |
+
+The singleton maps are the methods and blocks — 15,595 and 8,583 in
+`core.snap` — which each hold their own code and are never a polymorphic
+receiver. The other **76% of objects collapse onto 81 shapes**. That is the
+cache key ratio: about **1,000:1**, against the 4:1 the raw map count suggests
+and the 1:1 serf gets now. Largest families in `core.snap`: 19,888 / 17,354 /
+11,355 / 5,925 / 4,662.
+
+For the map to be a *sound* lookup key it must hold constant slot **values**,
+not just names and kinds — two objects of the same shape whose constant parent
+slots point at different parents must not share a cache entry. That is Self's
+design (a slot descriptor is name, type, data, annotation) and it is what the
+table above already measures, since the interned body includes those words. An
+assignable parent slot is the remaining hole, and Self plugs it with an
+explicit `assignableDependencyList` (`lookup/simpleLookup.hh:48`).
+
+The cost is `_Define` and `_AddSlots:`, which become map transitions plus a
+`switch_pointers` scan of the heap. **Direct pointers already require that
+scan**, so accepting them has largely pre-paid the biggest bill maps come with.
+The two decisions reinforce each other, which is why maps belong in phase 2
+rather than in a phase that never happens.
+
+*ponytail: canonicalise maps in a hash table keyed on the body, as
+`image_obj.rs` already does. Dependency lists are Self's mechanism for
+invalidating caches precisely; serf's `LOOKUP_GEN` whole-cache flush is the
+lazy version and stays until a mutation-heavy workload thrashes it.*
 
 ### Sizing check
 
 `core.snap`'s reachable world, laid out this way:
 
 ```
-69,954 objects × (2 + 2×3.8) words        5.4 MB
-694,669 bytes of string data              0.7 MB
-76,093 vector elements                    0.6 MB
-161,177 bytecodes + 54,846 literals       0.6 MB
-annotations, on the objects that have any ~1.7 MB
-                                        ────────
-                                          ~9 MB, in one arena, zero malloc blocks
+69,954 objects × (2 + ~1.3 assignable) words   1.8 MB
+26,584 maps, carrying the shared descriptors   4.3 MB
+694,669 bytes of string data                   0.7 MB
+76,093 vector elements                         0.6 MB
+161,177 bytecodes + 54,846 literals            0.6 MB
+                                             ────────
+                                               ~8 MB, in one arena, no malloc blocks
 ```
 
 against today's 18.9 MB of mostly-empty young space plus ~427k allocator
@@ -254,10 +294,24 @@ Non-moving on purpose: a *compacting* old generation with direct pointers needs
 a pass over every reference in the heap to repoint it, and the C++ VM's answer
 is a transient side table — "the object table is used for pointer forwarding
 during a full GC" (`memory/oTable.hh:11`). That is the right thing to build
-*second*, when a fragmentation metric says so, not first.
+*second*, when a metric says so, not first.
+
+Three things are given up, not one, and fragmentation is only the first:
+
+* **External fragmentation.** Free runs that no promoted object fits. Bounded
+  by size classes, and bounded further by the fact that promotion is the only
+  source of old-generation allocation — so the sizes arriving are the sizes
+  that were already surviving.
+* **Locality.** A compacting collector lays a promoted subgraph out
+  contiguously; a free list scatters it in whatever order holes appear. For a
+  Self world this is the one that is easy to under-rate, because traversing an
+  object graph is what the VM spends its time on.
+* **RSS never comes back down.** Without compaction there is nothing to release
+  to the OS after a world shrinks.
 
 *ponytail: size-classed free lists, no compaction. `serf_mem_old_fragmentation`
-decides whether to build the mark-compact pass and its forwarding table.*
+and a promoted-subgraph locality benchmark decide whether to build the
+mark-compact pass and its forwarding table.*
 
 ### Remembered set
 
@@ -298,8 +352,11 @@ What remains:
   needs an audit. `SERF_GC_STRESS` collecting after every allocation is what
   makes that auditable rather than hopeful.
 * **Caches keyed by object address must be fixed up, not just flushed.** The
-  lookup cache and the inline caches hold receiver and holder pointers; they
-  live in known VM-owned tables, so the collector walks and rewrites them.
+  lookup cache and the inline caches hold map and holder pointers, and a map is
+  an ordinary heap object that moves like any other; they live in known
+  VM-owned tables, so the collector walks and rewrites them. Maps tenure almost
+  immediately and then stop moving, so in the steady state this pass finds
+  nothing to do.
 
 ## Doing this in Rust
 
@@ -407,7 +464,8 @@ round-trip green, and is provable by a number.
 |---|---|---|
 | 0 | `serf_mem_*` metrics, `SERF_MEM_TRACE=1` allocation counter, Miri in `run-tests.sh` | the numbers above stop being ad-hoc; the harness exists before the unsafe does |
 | 1 | `heap.rs`: the arena, `Oop` as a tagged pointer, `map_addr` tagging, the deref assertion | Miri green on a heap-only unit test |
-| 2 | Objects in the arena: header, slots, byte and vector payloads; Cheney with forwarding; mark-sweep old gen | `core.snap` resident ~19 MB → ~9 MB; `Slots`, `Payload`, the handle table gone |
+| 2 | Objects in the arena: mark word, map pointer, byte and vector payloads; maps interned per shape; Cheney with forwarding; mark-sweep old gen | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
+| 2b | Key the inline caches and `lookup_cache` on the map | send-site hit rate on a clone-heavy loop, ~0% → ~100% |
 | 3 | Roots: `each_root` rewrites, the shadow stack, the `prims.rs` audit | `SERF_GC_STRESS` green across the suite and a morphic boot |
 | 4 | Methods in the heap | image-load mallocs −170k; `walk_method`, `Seen.methods` gone |
 | 5 | Activations in the heap | `test.self` mallocs 1.86M → <1k; both pools and `walk_scope` gone |
@@ -417,7 +475,9 @@ Phase 3 is the one that can silently corrupt, which is why phase 0 builds the
 tools first and phase 3 is its own step rather than a rider on phase 2. Phase 5
 is where the payoff is, which argues for not stopping after 2.
 
-Maps are phase 7 and probably never.
+Phase 2b is separable and is the one that pays back immediately: once objects
+carry a map pointer, changing the cache key is a small diff with a large and
+independently measurable effect.
 
 ## Risks
 
@@ -429,19 +489,28 @@ Maps are phase 7 and probably never.
 * **The optimizer**, discussed above. Strict provenance is the answer;
   `as usize` round trips are the thing to ban in review.
 * **Float boxing** in numeric loops.
-* **Old-generation fragmentation**, since the old generation no longer moves.
-  Metric first, mark-compact second.
+* **Old-generation fragmentation and promotion locality**, since the old
+  generation no longer moves. Metric first, mark-compact second.
+* **Map churn.** `_AddSlots:` on a unique shape mints a map that nothing else
+  will ever share, so a program that reshapes objects in a loop allocates a map
+  per iteration and gains nothing from the cache. `core.snap` already shows
+  26,503 single-object maps; that is fine for methods, which are born once, and
+  would not be fine for a hot loop. `serf_mem_maps_minted` is the metric.
 * **Scavenge frequency** rises once activations are allocated rather than
   pooled. Scavenge *cost* is proportional to survivors and activations die
   immediately, so this should be a win — but the young space must be sized in
   bytes rather than in objects, and `SERF_GC_YOUNG` changes units.
 
-## Decisions to confirm
+## Decisions
 
-1. **Boxed floats** (63-bit smallints, zero-tag pointers) versus NaN-boxing.
-   Recommendation: box them; 155 floats in `core.snap` and 3,467 in
-   `morphic.snap` say the integer range and the unmasked deref are worth more.
-2. **No maps**, per-object slot descriptors. Recommendation: no maps, and
-   measure before revisiting.
-3. **Non-moving old generation** to start. Recommendation: yes; build the
-   forwarding table and the compaction pass when a metric asks for it.
+1. **Boxed floats**, 63-bit smallints, zero-tag pointers. Settled: 155 floats
+   in `core.snap` and 3,467 in `morphic.snap` say the integer range and the
+   unmasked deref are worth more than inline `f64`.
+2. **Maps**, holding slot descriptors, constant slot values, kind and
+   annotations. Settled, and this reverses the first draft: the case is not the
+   ~2 MB of shared descriptors but the cache key, where 76% of a world's
+   objects collapse onto 81 shapes. Self keys `MethodLookupKey` on the receiver
+   map for exactly this reason.
+3. **Non-moving old generation** to start. Settled: size-classed free lists,
+   accepting fragmentation, scattered promotion locality and an RSS floor;
+   build the forwarding table and the compaction pass when a metric asks.
