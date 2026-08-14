@@ -8,10 +8,64 @@
 //! thread-local: the serving thread has no business touching it, and reads
 //! these atomics instead.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
+
+/// Every trip to the system allocator, counted.
+///
+/// The point of the memory subsystem work is that a running interpreter should
+/// not make any: Self objects, their slots, their bytes and their activations
+/// all belong in the VM's own arenas, and `malloc` should be reached for only
+/// to grow one. That is a claim about a number, so the number is a metric --
+/// two relaxed atomics on a path that already costs hundreds of cycles.
+///
+/// It counts the whole process, including the metrics thread and Rust's own
+/// startup, which is a few dozen allocations and not worth excluding.
+struct Counted;
+
+static MALLOCS: AtomicU64 = AtomicU64::new(0);
+static FREES: AtomicU64 = AtomicU64::new(0);
+static MALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for Counted {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        MALLOCS.fetch_add(1, Relaxed);
+        MALLOC_BYTES.fetch_add(l.size() as u64, Relaxed);
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        FREES.fetch_add(1, Relaxed);
+        unsafe { System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+        MALLOCS.fetch_add(1, Relaxed);
+        MALLOC_BYTES.fetch_add(n.saturating_sub(l.size()) as u64, Relaxed);
+        unsafe { System.realloc(p, l, n) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counted = Counted;
+
+/// `SERF_MEM_TRACE=1`: a line at exit, for benchmarks that do not stay up long
+/// enough to be scraped.
+pub fn trace_mem(tag: &str) {
+    if std::env::var_os("SERF_MEM_TRACE").is_none() {
+        return;
+    }
+    let (m, f, b) = (MALLOCS.load(Relaxed), FREES.load(Relaxed), MALLOC_BYTES.load(Relaxed));
+    eprintln!(
+        "[mem] {}: mallocs {} frees {} live {} bytes {}",
+        tag,
+        m,
+        f,
+        m.saturating_sub(f),
+        b
+    );
+}
 
 /// Upper bounds in seconds. A scavenge of a small young generation is tens of
 /// microseconds; a major collection of a loaded world is tens of milliseconds.
@@ -193,6 +247,9 @@ pub fn encode() -> String {
         ));
     }
     for (name, help, kind, v) in [
+        ("serf_mem_mallocs_total", "Trips to the system allocator. The memory subsystem's goal is that a running interpreter makes none.", "counter", MALLOCS.load(Relaxed)),
+        ("serf_mem_frees_total", "Blocks returned to the system allocator.", "counter", FREES.load(Relaxed)),
+        ("serf_mem_malloc_bytes_total", "Bytes asked of the system allocator.", "counter", MALLOC_BYTES.load(Relaxed)),
         ("serf_gc_objects_allocated_total", "Objects allocated.", "counter", M.allocated.load(Relaxed)),
         ("serf_gc_slots_spilled_total", "Objects whose slots outgrew the cell and took a vector.", "counter", M.slots_spilled.load(Relaxed)),
         ("serf_maps_total", "Distinct object shapes interned.", "counter", M.maps.load(Relaxed)),

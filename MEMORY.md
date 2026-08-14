@@ -462,8 +462,8 @@ round-trip green, and is provable by a number.
 
 | | | proves it |
 |---|---|---|
-| 0 | `serf_mem_*` metrics, `SERF_MEM_TRACE=1` allocation counter, Miri in `run-tests.sh` | the numbers above stop being ad-hoc; the harness exists before the unsafe does |
-| 1 | `heap.rs`: the arena, `Oop` as a tagged pointer, `map_addr` tagging, the deref assertion | Miri green on a heap-only unit test |
+| 0 | `serf_mem_*` metrics, `SERF_MEM_TRACE=1` allocation counter, Miri in `run-tests.sh` | **done** — 1,835,488 mallocs for the suite, now a metric rather than a probe |
+| 1 | `heap.rs`: the arena, `Oop` as a tagged pointer, `map_addr` tagging, the deref assertion | **done** — 10 tests green under `cargo miri test heap::` |
 | 2 | Objects in the arena: mark word, map pointer, byte and vector payloads; maps interned per shape; Cheney with forwarding; mark-sweep old gen | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
 | 2b | Key the inline caches and `lookup_cache` on the map | **done, ahead of the rest** — see below |
 | 3 | Roots: `each_root` rewrites, the shadow stack, the `prims.rs` audit | `SERF_GC_STRESS` green across the suite and a morphic boot |
@@ -474,6 +474,44 @@ round-trip green, and is provable by a number.
 Phase 3 is the one that can silently corrupt, which is why phase 0 builds the
 tools first and phase 3 is its own step rather than a rider on phase 2. Phase 5
 is where the payoff is, which argues for not stopping after 2.
+
+### Phases 0 and 1, and what Miri changed
+
+Phase 0 is the malloc counter made permanent: a counting `GlobalAlloc` behind
+two relaxed atomics, `serf_mem_mallocs_total` / `_frees_total` /
+`_malloc_bytes_total` in the exposition, and `SERF_MEM_TRACE=1` for a line at
+exit. The suite is **1,835,488 mallocs**, which is the number the rest of this
+document is trying to drive to zero, and it is no longer an ad-hoc probe.
+
+Phase 1 is `src/heap.rs`: the tagged `Oop`, the object header, spaces,
+bump allocation, the self-describing linear walk, and forwarding. Nothing in
+the VM stands on it yet.
+
+**One design decision came out of Miri rather than out of the plan.** The first
+draft gave each space its own `alloc_zeroed`, which reads as the tidy thing to
+do. Miri rejected `forwarded()` immediately:
+
+```
+error: Undefined Behavior: memory access failed: attempting to access 8 bytes,
+but got alloc91680+0x1940 which is at or beyond the end of the allocation of
+size 512 bytes
+```
+
+A scavenge rebuilds the reference to the copy out of a pointer to the corpse,
+so `with_addr` was handing a to-space address the *from-space's* provenance.
+That is not a bug to patch; it says the whole heap must be **one allocation**,
+with every object pointer derived from its base. Which it now is — spaces are
+views on it, and the "is this reference young?" range compare that a direct
+model was supposed to give back comes free with it.
+
+Worth noting what this cost to find: nothing. The tests passed in release and
+in debug. Only Miri saw it, and it saw it the first time it ran, which is the
+argument for phase 0 having built the harness before phase 1 wrote any
+`unsafe`.
+
+The remaining 27 Miri errors are `memory leaked` — the heap is deliberately
+leaked, as `gc.rs`'s spaces already are, so `run-tests.sh` runs Miri with
+`-Zmiri-ignore-leaks` and skips with a note when Miri is not installed.
 
 ### Phase 2b, landed early
 

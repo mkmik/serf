@@ -1,6 +1,7 @@
 mod compile;
 mod ffi;
 mod gc;
+mod heap;
 mod glue_table;
 mod struct_table;
 mod image;
@@ -541,6 +542,7 @@ fn main() {
         }
         i += 1;
     }
+    metrics::trace_mem("exit");
     if interactive {
         repl(&mut vm);
     }

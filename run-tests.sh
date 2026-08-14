@@ -4,6 +4,23 @@ set -e
 cd "$(dirname "$0")"
 cargo build --release 2>&1 | grep -E '^(error|warning: unused)' && exit 1
 cargo test --release --quiet
+# again in debug, so the `debug_assert`s the arena leans on actually run -- the
+# release build compiles out the check that a pointer lands in a live space
+cargo test --quiet heap:: >/dev/null
+
+# and under Miri, which is what says the `unsafe` in heap.rs is sound rather
+# than merely untested: strict provenance, no integer round trips, and a
+# pointer to one space rebuilt from a pointer into another caught the first
+# time it was tried. The heap is deliberately leaked, as gc.rs's spaces are,
+# so the leak check is off.
+MIRI=$(rustup which --toolchain nightly cargo-miri 2>/dev/null || true)
+if [ -n "$MIRI" ]; then
+  PATH="$(dirname "$MIRI"):$PATH" MIRIFLAGS=-Zmiri-ignore-leaks \
+    cargo miri test --quiet heap:: >/dev/null 2>&1 \
+    && echo "miri ok" || { echo "miri FAILED"; exit 1; }
+else
+  echo "miri not installed, skipping: rustup toolchain install nightly --component miri"
+fi
 R=./target/release/serf
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -74,7 +91,19 @@ if command -v curl >/dev/null; then
   n=0
   while [ $n -lt 50 ] && ! grep -q 127.0.0.1 "$T/m" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
   port=$(sed -n 's|.*127\.0\.0\.1:\([0-9]*\).*|\1|p' "$T/m")
-  curl -s "http://127.0.0.1:$port/metrics" > "$T/scrape" || true
+  # poll rather than scrape once. The port is printed before the VM has even
+  # bootstrapped, so a single shot right then races how long it takes to fill a
+  # young generation -- a race this test won until startup grew slightly, and
+  # then lost every time.
+  n=0
+  while [ $n -lt 100 ]; do
+    curl -s "http://127.0.0.1:$port/metrics" > "$T/scrape" || true
+    if grep -q '^serf_gc_pause_seconds_count{generation="young"} [1-9]' "$T/scrape"; then
+      break
+    fi
+    sleep 0.1
+    n=$((n + 1))
+  done
   wait $pid
   grep -q '^serf_gc_pause_seconds_count{generation="young"} [1-9]' "$T/scrape" || {
     echo "metrics: nothing scraped from port [$port]"; cat "$T/scrape"; exit 1; }

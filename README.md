@@ -2,8 +2,13 @@
 
 A from-scratch Self implementation: scanner, parser, bytecode compiler, and a
 bytecode interpreter, plus a small world written in Self. No JIT, no
-dependencies. Built and tested on macOS arm64; it is plain safe Rust, so any
+dependencies. Built and tested on macOS arm64; it is portable Rust, so any
 target `rustc` supports should work.
+
+All of it is safe Rust except `src/heap.rs`, which is where the object heap is
+being rebuilt on direct tagged pointers — a moving collector cannot be written
+in safe Rust, and confining that to one module is the point. It is checked
+under Miri; see [MEMORY.md](MEMORY.md).
 
 ```sh
 cargo build --release
@@ -87,6 +92,7 @@ never pops a window. `SERF_X11=real ./run-tests.sh` uses `$DISPLAY` instead
 | `src/value.rs` | objects, slots, and the multiple-parent lookup |
 | `src/prims.rs` | primitives (`_IntAdd:`, `_Clone`, `_AddSlots:`, …) |
 | `src/gc.rs` | the object heap: a generational collector, after `memory/` |
+| `src/heap.rs` | the arena the heap is being rebuilt on: tagged pointers, one allocation |
 | `src/metrics.rs` | Prometheus metrics for it, over a one-page HTTP server |
 | `src/image.rs` | snapshot file format, after `memory/universe.cpp` and `space.cpp` |
 | `src/image_obj.rs` | snapshot words <-> serf objects: maps, slot descriptors, layout |
@@ -140,6 +146,7 @@ A loop cloning a prototype and sending to the clone goes from 800,186 misses to
 handled, is unchanged.
 
 ```sh
+SERF_MEM_TRACE=1 ./target/release/serf …    # mallocs, frees and bytes at exit
 SERF_MAP_VERIFY=1 ./target/release/serf …   # check every memoised map against
                                             # a freshly computed shape, so a
                                             # mutation that changed a shape
