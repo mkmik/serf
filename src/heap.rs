@@ -138,7 +138,8 @@ impl std::fmt::Debug for Oop {
 ///
 /// ```text
 /// word 0  mark:  forwarded:1 │ marked:1 │ dirty:1 │ age:8 │ kind:8 │ hash:22 │ size:23
-/// word 1  form:  slots:32 │ oops:32
+/// word 1  form:  slots:31 │ annotated:1 │ oops:32
+/// word 2  shape: the memoised map, `gen:32 │ map:32`
 /// ```
 ///
 /// `oops` is how many leading payload words hold `Oop`s; the rest are raw.
@@ -147,10 +148,17 @@ impl std::fmt::Debug for Oop {
 ///
 /// ```text
 /// payload[0 .. slots)              slot values            Oop
-/// payload[slots .. oops)           indexable elements     Oop   (an objVector)
+/// payload[slots .. + annos)        annotations            Oop   (if annotated)
+/// payload[.. oops)                 indexable elements     Oop   (an objVector)
 /// payload[oops .. oops + slots)    slot descriptors       raw: name:32 │ kind:8
 /// payload[oops + slots .. )        indexable bytes        raw   (a string)
 /// ```
+///
+/// The annotation region is one `Oop` for the object's own annotation and one
+/// per slot, present only when the object has any. serf's own world has none
+/// and should not pay for them; a loaded world has 218,474 and needs them
+/// somewhere the collector can see, which a Rust-side table keyed on an address
+/// that moves is not.
 ///
 /// Descriptors sit in the raw region because they are not references -- an
 /// interned name is a number. When maps arrive they take the descriptors with
@@ -174,7 +182,7 @@ impl std::fmt::Debug for Oop {
 /// `FORWARDED | new address` -- the trick is `mark_memOop` in
 /// `objects/memOop.hh:50`, and it works because the fields it overwrites have
 /// gone with the copy.
-pub const HEADER_WORDS: usize = 2;
+pub const HEADER_WORDS: usize = 3;
 
 const SIZE_BITS: u32 = 23;
 const SIZE_MASK: u64 = (1 << SIZE_BITS) - 1;
@@ -325,12 +333,16 @@ pub struct Space {
     bump: Cell<usize>,
 }
 
-fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize, slots: usize) {
+const ANNOTATED: u64 = 1 << 31;
+
+fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize, slots: usize, anno: bool) {
     debug_assert!(oops <= size - HEADER_WORDS, "more oop words than payload");
-    debug_assert!(slots <= oops, "more named slots than oop words");
+    debug_assert!(slots < ANNOTATED as usize, "more named slots than the form word holds");
     unsafe {
         p.write(mark_of(size, kind));
-        p.add(1).write(((slots as u64) << 32) | oops as u64);
+        let f = ((slots as u64) << 32) | oops as u64 | if anno { ANNOTATED << 32 } else { 0 };
+        p.add(1).write(f);
+        p.add(2).write(0); // no memoised shape yet
     }
 }
 
@@ -341,25 +353,42 @@ pub struct Shape {
     pub kind: Kind,
     pub slots: usize,
     pub len: usize,
+    pub annotated: bool,
 }
 
 impl Shape {
     pub fn new(kind: Kind, slots: usize) -> Shape {
-        Shape { kind, slots, len: 0 }
+        Shape { kind, slots, len: 0, annotated: false }
     }
 
     pub fn indexable(kind: Kind, slots: usize, len: usize) -> Shape {
-        Shape { kind, slots, len }
+        Shape { kind, slots, len, annotated: false }
+    }
+
+    /// Room for an object annotation and one per slot. A loaded world wants
+    /// this; serf's own does not, and does not pay for it.
+    pub fn annotated(mut self) -> Shape {
+        self.annotated = true;
+        self
+    }
+
+    fn anno_words(&self) -> usize {
+        if self.annotated {
+            1 + self.slots
+        } else {
+            0
+        }
     }
 
     /// (`Oop` words, raw words). A byte object keeps its exact length in a word
     /// of its own, because `size` only counts whole words and a 46-byte string
     /// has to come back 46 bytes long.
     fn words(&self) -> (usize, usize) {
+        let head = self.slots + self.anno_words();
         match self.kind {
-            Kind::ObjVector => (self.slots + self.len, self.slots),
-            Kind::Bytes => (self.slots, self.slots + 1 + self.len.div_ceil(8)),
-            _ => (self.slots, self.slots),
+            Kind::ObjVector => (head + self.len, self.slots),
+            Kind::Bytes => (head, self.slots + 1 + self.len.div_ceil(8)),
+            _ => (head, self.slots),
         }
     }
 }
@@ -404,7 +433,7 @@ impl Space {
     /// so it is an answer rather than an error.
     pub fn alloc(&self, s: Shape) -> Option<Oop> {
         let (oops, raw) = s.words();
-        let o = self.alloc_words(s.kind, oops, s.slots, oops + raw)?;
+        let o = self.alloc_words(s.kind, oops, s.slots, oops + raw, s.annotated)?;
         if s.kind == Kind::Bytes {
             set_raw(o, len_word(o), s.len as u64);
         }
@@ -413,7 +442,14 @@ impl Space {
 
     /// The layout spelled out rather than derived, for a copy: an evacuation
     /// has an object in front of it and needs the same shape, not a fresh one.
-    fn alloc_words(&self, kind: Kind, oops: usize, slots: usize, payload: usize) -> Option<Oop> {
+    fn alloc_words(
+        &self,
+        kind: Kind,
+        oops: usize,
+        slots: usize,
+        payload: usize,
+        anno: bool,
+    ) -> Option<Oop> {
         let size = HEADER_WORDS + payload;
         if size > MAX_OBJECT_WORDS {
             return None;
@@ -424,7 +460,7 @@ impl Space {
         }
         self.bump.set(a + size);
         let p = at(self.start + a);
-        init_object(p, size, kind, oops, slots);
+        init_object(p, size, kind, oops, slots, anno);
         Some(Oop::obj(p))
     }
 
@@ -451,7 +487,7 @@ impl Space {
                 return None;
             }
             let o = Oop::obj(at(self.start + a));
-            let n = size_words(o);
+            let n = walk_size(o);
             debug_assert!(n >= HEADER_WORDS, "object with no header at word {a}");
             a += n;
             Some(o)
@@ -486,7 +522,18 @@ fn set_mark(o: Oop, m: u64) {
 }
 
 pub fn size_words(o: Oop) -> usize {
+    debug_assert!(mark(o) & FORWARDED == 0, "the mark word is a forwarding address");
     (mark(o) & SIZE_MASK) as usize
+}
+
+/// How far to the next object, for a walk over a space that has been evacuated.
+/// An evacuated object's mark word *is* the forwarding address, so its size is
+/// no longer in it -- but the copy is the same size, and the copy still has one.
+fn walk_size(o: Oop) -> usize {
+    match forwarded(o) {
+        Some(f) => size_words(f),
+        None => size_words(o),
+    }
 }
 
 pub fn payload_words(o: Oop) -> usize {
@@ -506,7 +553,65 @@ pub fn oop_words(o: Oop) -> usize {
 /// How many named slots the object has. Its values are the first `slots` words
 /// of the payload and its descriptors are the first `slots` raw words.
 pub fn slots(o: Oop) -> usize {
-    (form(o) >> 32) as usize
+    ((form(o) >> 32) & (ANNOTATED - 1)) as usize
+}
+
+pub fn is_annotated(o: Oop) -> bool {
+    form(o) & (ANNOTATED << 32) != 0
+}
+
+fn anno_words(o: Oop) -> usize {
+    if is_annotated(o) {
+        1 + slots(o)
+    } else {
+        0
+    }
+}
+
+/// The object's own annotation, and one per slot. Self keeps these in the map;
+/// serf keeps them here, which is what lets the collector see them instead of
+/// needing a write barrier of its own for a Rust-side table.
+pub fn obj_anno(o: Oop) -> Oop {
+    if is_annotated(o) {
+        field(o, slots(o))
+    } else {
+        Oop::null()
+    }
+}
+
+pub fn set_obj_anno(o: Oop, v: Oop) {
+    debug_assert!(is_annotated(o), "the object has no room for an annotation");
+    set_field(o, slots(o), v)
+}
+
+pub fn slot_anno(o: Oop, i: usize) -> Oop {
+    if is_annotated(o) {
+        field(o, slots(o) + 1 + i)
+    } else {
+        Oop::null()
+    }
+}
+
+pub fn set_slot_anno(o: Oop, i: usize, v: Oop) {
+    debug_assert!(is_annotated(o), "the object has no room for annotations");
+    debug_assert!(i < slots(o), "slot {i} has no annotation");
+    set_field(o, slots(o) + 1 + i, v)
+}
+
+/// The memoised shape: the `LOOKUP_GEN` it was computed at, and the map it came
+/// to. Zero means "not computed", and a generation that has moved on means the
+/// same. This word is the map pointer in the finished design.
+pub fn shape_memo(o: Oop, gen: u32) -> Option<u32> {
+    let w = unsafe { words_of(o).add(2).read() };
+    if w != 0 && (w >> 32) as u32 == gen {
+        Some(w as u32)
+    } else {
+        None
+    }
+}
+
+pub fn set_shape_memo(o: Oop, gen: u32, map: u32) {
+    unsafe { words_of(o).add(2).write(((gen as u64) << 32) | map as u64) }
 }
 
 pub fn kind(o: Oop) -> Kind {
@@ -636,20 +741,24 @@ fn len_word(o: Oop) -> usize {
 
 pub fn ilen(o: Oop) -> usize {
     match kind(o) {
-        Kind::ObjVector => oop_words(o) - slots(o),
+        Kind::ObjVector => oop_words(o) - elements_at(o),
         Kind::Bytes => raw(o, len_word(o)) as usize,
         _ => 0,
     }
 }
 
+fn elements_at(o: Oop) -> usize {
+    slots(o) + anno_words(o)
+}
+
 pub fn element(o: Oop, i: usize) -> Oop {
     debug_assert!(kind(o) == Kind::ObjVector && i < ilen(o), "element {i} out of range");
-    field(o, slots(o) + i)
+    field(o, elements_at(o) + i)
 }
 
 pub fn set_element(o: Oop, i: usize, v: Oop) {
     debug_assert!(kind(o) == Kind::ObjVector && i < ilen(o), "element {i} out of range");
-    set_field(o, slots(o) + i, v)
+    set_field(o, elements_at(o) + i, v)
 }
 
 /// Bytes are packed into the raw words after the length. Reading one is a word
@@ -717,6 +826,13 @@ fn set_forwarded(o: Oop, to: Oop) {
 /// place. Miss one and it points into an abandoned space.
 pub trait Roots {
     fn each(&mut self, f: &mut dyn FnMut(&mut Oop));
+
+    /// An object the collection is about to forget. The heap itself needs no
+    /// such hook -- abandoning a space is one store -- but anything holding
+    /// Rust memory on an object's behalf does, and during the switch-over a
+    /// method still does. Called once per dead object, before its space is
+    /// reused, and it must not allocate.
+    fn dying(&mut self, _o: Oop) {}
 }
 
 /// Survive this many scavenges and you are tenured, as in `gc.rs`.
@@ -806,7 +922,7 @@ impl Heap {
                 let (oops, raw) = s.words();
                 // born old with its fields already set and no barrier fired for
                 // it: whatever it comes to hold, the next scavenge has to know
-                let o = self.alloc_old(s.kind, oops, s.slots, oops + raw);
+                let o = self.alloc_old(s.kind, oops, s.slots, oops + raw, s.annotated);
                 self.record(o);
                 if s.kind == Kind::Bytes {
                     set_raw(o, len_word(o), s.len as u64);
@@ -818,26 +934,33 @@ impl Heap {
 
     /// Allocate straight into the old generation: what a promotion does, and
     /// what pretenuring does.
-    fn alloc_old(&self, kind: Kind, oops: usize, slots: usize, payload: usize) -> Oop {
+    fn alloc_old(
+        &self,
+        kind: Kind,
+        oops: usize,
+        slots: usize,
+        payload: usize,
+        anno: bool,
+    ) -> Oop {
         let size = HEADER_WORDS + payload;
         self.old_live.set(self.old_live.get() + 1);
         if let Some(a) = self.old_free.borrow_mut().get_mut(&size).and_then(|v| v.pop()) {
             let p = from_addr(a);
-            init_object(p, size, kind, oops, slots);
+            init_object(p, size, kind, oops, slots, anno);
             return Oop::obj(p);
         }
         self.old
-            .alloc_words(kind, oops, slots, payload)
+            .alloc_words(kind, oops, slots, payload, anno)
             .expect("old generation exhausted")
     }
 
     /// A clone: the same shape, the same contents, its own identity. `_Clone`.
     pub fn clone_object(&self, o: Oop) -> Oop {
-        let (oops, pay, ns) = (oop_words(o), payload_words(o), slots(o));
-        let c = match self.from_space().alloc_words(kind(o), oops, ns, pay) {
+        let (oops, pay, ns, an) = (oop_words(o), payload_words(o), slots(o), is_annotated(o));
+        let c = match self.from_space().alloc_words(kind(o), oops, ns, pay, an) {
             Some(c) => c,
             None => {
-                let c = self.alloc_old(kind(o), oops, ns, pay);
+                let c = self.alloc_old(kind(o), oops, ns, pay, an);
                 self.record(c);
                 c
             }
@@ -884,7 +1007,8 @@ impl Heap {
         if !self.from_space().contains(o) {
             return o; // already old, or already copied into the to-space
         }
-        let (k, oops, pay, ns) = (kind(o), oop_words(o), payload_words(o), slots(o));
+        let (k, oops, pay, ns, an) =
+            (kind(o), oop_words(o), payload_words(o), slots(o), is_annotated(o));
         let a = age(o).saturating_add(1);
         // Ask the to-space only when the object is actually staying young: the
         // bump happens inside `alloc`, so testing the age afterwards would
@@ -898,11 +1022,11 @@ impl Heap {
         // than by argument (universe.cpp:87 keeps a whole generation in reserve
         // for the same reason).
         let dst = if a >= PROMOTE_AGE {
-            self.alloc_old(k, oops, ns, pay)
+            self.alloc_old(k, oops, ns, pay, an)
         } else {
-            match self.to_space().alloc_words(k, oops, ns, pay) {
+            match self.to_space().alloc_words(k, oops, ns, pay, an) {
                 Some(d) => d,
-                None => self.alloc_old(k, oops, ns, pay),
+                None => self.alloc_old(k, oops, ns, pay, an),
             }
         };
         let tenured = !self.is_young(dst);
@@ -982,8 +1106,14 @@ impl Heap {
             }
         }
 
-        // whatever is still in the from-space was never reached, and forgetting
-        // it is the free: one store, no destructors
+        // whatever is still in the from-space was never reached. Forgetting it
+        // is the free -- one store -- but the walk first, because a dead object
+        // may be the last thing holding some Rust memory on its own account.
+        for o in self.from_space().walk() {
+            if forwarded(o).is_none() {
+                roots.dying(o);
+            }
+        }
         self.from_space().reset();
         self.from.set(1 - self.from.get());
         self.minors.set(self.minors.get() + 1);
@@ -1017,12 +1147,13 @@ impl Heap {
     /// Drop every unmarked old object onto the free list and clear the marks on
     /// the rest. Runs before the scavenge, so a dead old object cannot drag its
     /// young referents through one more copy.
-    fn sweep_old(&self) {
+    fn sweep_old(&self, roots: &mut dyn Roots) {
         let mut free = self.old_free.borrow_mut();
         // rebuilt from scratch: a run that was free stays free, and this is
         // where it is rediscovered
         free.clear();
         let mut live = 0usize;
+        let mut dead: Vec<Oop> = vec![];
         for o in self.old.walk() {
             if marked(o) {
                 clear_marked(o);
@@ -1031,11 +1162,15 @@ impl Heap {
                 if dirty(o) {
                     set_dirty(o, false);
                 }
+                dead.push(o);
                 free.entry(size_words(o)).or_default().push(o.addr());
             }
         }
         self.old_live.set(live);
         drop(free);
+        for o in dead {
+            roots.dying(o);
+        }
         // a swept object may have been on the remembered set
         self.remembered.borrow_mut().retain(|o| dirty(*o));
     }
@@ -1044,7 +1179,7 @@ impl Heap {
     pub fn collect(&self, roots: &mut dyn Roots, major: bool) {
         if major {
             self.mark_all(roots);
-            self.sweep_old();
+            self.sweep_old(roots);
             self.majors.set(self.majors.get() + 1);
         }
         self.scavenge(roots);
@@ -1168,11 +1303,12 @@ mod tests {
 
     #[test]
     fn a_full_space_answers_none_rather_than_growing() {
-        let s = Space::new(12);
-        assert!(s.alloc(Shape::new(Kind::Slots, 2)).is_some()); // 6 words
-        assert!(s.alloc(Shape::new(Kind::Slots, 2)).is_some()); // 12 words, exactly full
+        let each = HEADER_WORDS + 4; // two slot values and two descriptors
+        let s = Space::new(2 * each);
+        assert!(s.alloc(Shape::new(Kind::Slots, 2)).is_some());
+        assert!(s.alloc(Shape::new(Kind::Slots, 2)).is_some(), "exactly full is still room");
         assert!(s.alloc(Shape::new(Kind::Slots, 0)).is_none(), "an overfull space allocated");
-        assert_eq!(s.used(), 12);
+        assert_eq!(s.used(), 2 * each);
     }
 
     // ----------------------------------------------------------- collection
@@ -1550,6 +1686,118 @@ mod tests {
         let sc = h.clone_object(s);
         assert_eq!(bytes_of(sc), text, "a byte object's clone lost its bytes");
         assert_eq!(ilen(sc), text.len());
+    }
+
+    #[test]
+    fn annotations_live_in_the_object_and_are_traced() {
+        let h = heap();
+        let plain = h.alloc(Shape::new(Kind::Slots, 2)).unwrap();
+        assert!(!is_annotated(plain));
+        assert!(obj_anno(plain).is_null(), "an unannotated object invented one");
+        assert!(slot_anno(plain, 0).is_null());
+
+        let o = h.alloc(Shape::new(Kind::Slots, 2).annotated()).unwrap();
+        assert!(is_annotated(o));
+        set_slot_desc(o, 0, 21, DATA);
+        set_slot_value(o, 0, Oop::int(1));
+        set_slot_desc(o, 1, 22, DATA);
+        set_slot_value(o, 1, Oop::int(2));
+
+        let note = h.alloc(Shape::indexable(Kind::Bytes, 0, 4)).unwrap();
+        set_bytes(note, b"note");
+        set_obj_anno(o, note);
+        set_slot_anno(o, 1, Oop::int(7));
+
+        let mut roots = Vars(vec![o]);
+        h.scavenge(&mut roots);
+        let o = roots.0[0];
+        assert_eq!(slot_value(o, 0).as_int(), Some(1), "an annotation displaced a slot value");
+        assert_eq!(slot_name(o, 1), 22, "an annotation displaced a descriptor");
+        assert_eq!(slot_anno(o, 1).as_int(), Some(7));
+        let note2 = obj_anno(o);
+        assert!(note2.is_obj() && note2 != note, "the annotation was not traced");
+        assert_eq!(bytes_of(note2), b"note");
+    }
+
+    #[test]
+    fn an_annotated_vector_keeps_its_elements_and_its_notes_apart() {
+        let h = heap();
+        let v = h.alloc(Shape::indexable(Kind::ObjVector, 1, 2).annotated()).unwrap();
+        set_slot_desc(v, 0, 1, PARENT);
+        set_slot_value(v, 0, Oop::int(5));
+        set_obj_anno(v, Oop::int(6));
+        set_slot_anno(v, 0, Oop::int(7));
+        set_element(v, 0, Oop::int(8));
+        set_element(v, 1, Oop::int(9));
+        assert_eq!(ilen(v), 2, "the annotations were counted as elements");
+        assert_eq!(element(v, 0).as_int(), Some(8));
+        assert_eq!(element(v, 1).as_int(), Some(9));
+        assert_eq!(slot_value(v, 0).as_int(), Some(5));
+        assert_eq!(obj_anno(v).as_int(), Some(6));
+        assert_eq!(slot_anno(v, 0).as_int(), Some(7));
+    }
+
+    #[test]
+    fn the_memoised_shape_is_valid_only_for_its_generation() {
+        let h = heap();
+        let o = obj(&h, 1);
+        assert_eq!(shape_memo(o, 1), None, "a fresh object has a shape already");
+        set_shape_memo(o, 1, 42);
+        assert_eq!(shape_memo(o, 1), Some(42));
+        assert_eq!(shape_memo(o, 2), None, "the memo outlived its generation");
+        set_shape_memo(o, 2, 43);
+        assert_eq!(shape_memo(o, 2), Some(43));
+        // and it does not disturb anything else
+        set_slot_desc(o, 0, 5, DATA);
+        set_slot_value(o, 0, Oop::int(3));
+        assert_eq!(slot_value(o, 0).as_int(), Some(3));
+        assert_eq!(slot_name(o, 0), 5);
+        assert_eq!(size_words(o), HEADER_WORDS + 2);
+    }
+
+    /// Anything holding Rust memory on a dead object's behalf has to hear about
+    /// it, because abandoning a space is one store and runs no destructors.
+    struct Undertaker {
+        vars: Vec<Oop>,
+        buried: Vec<usize>,
+    }
+
+    impl Roots for Undertaker {
+        fn each(&mut self, f: &mut dyn FnMut(&mut Oop)) {
+            for o in self.vars.iter_mut() {
+                f(o);
+            }
+        }
+        fn dying(&mut self, o: Oop) {
+            self.buried.push(hash(o) as usize);
+        }
+    }
+
+    #[test]
+    fn the_collector_names_what_it_forgets() {
+        let h = heap();
+        let keep = obj(&h, 1);
+        set_hash(keep, 1);
+        let doomed = obj(&h, 1);
+        set_hash(doomed, 2);
+        let also = obj(&h, 1);
+        set_hash(also, 3);
+
+        let mut u = Undertaker { vars: vec![keep], buried: vec![] };
+        h.scavenge(&mut u);
+        u.buried.sort_unstable();
+        assert_eq!(u.buried, vec![2, 3], "the wrong objects were reported dead");
+        let _ = (doomed, also);
+
+        // and again for the old generation, where a sweep does the forgetting
+        let mut u = Undertaker { vars: vec![u.vars[0]], buried: vec![] };
+        for _ in 0..PROMOTE_AGE {
+            h.scavenge(&mut u);
+        }
+        assert!(u.buried.is_empty(), "a survivor was reported dead");
+        u.vars.clear();
+        h.collect(&mut u, true);
+        assert_eq!(u.buried, vec![1], "the swept old object was not reported");
     }
 
     /// Promotion must not reserve to-space it then walks away from -- the bump
