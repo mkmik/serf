@@ -7,8 +7,10 @@ target `rustc` supports should work.
 
 All of it is safe Rust except `src/heap.rs`, which is where the object heap is
 being rebuilt on direct tagged pointers — a moving collector cannot be written
-in safe Rust, and confining that to one module is the point. It is checked
-under Miri; see [MEMORY.md](MEMORY.md).
+in safe Rust, and confining that to one module is the point. That module is a
+complete generational collector, checked under Miri; the VM still runs on the
+older cell heap in `src/gc.rs` until it is ported onto it. See
+[MEMORY.md](MEMORY.md).
 
 ```sh
 cargo build --release
@@ -92,7 +94,7 @@ never pops a window. `SERF_X11=real ./run-tests.sh` uses `$DISPLAY` instead
 | `src/value.rs` | objects, slots, and the multiple-parent lookup |
 | `src/prims.rs` | primitives (`_IntAdd:`, `_Clone`, `_AddSlots:`, …) |
 | `src/gc.rs` | the object heap: a generational collector, after `memory/` |
-| `src/heap.rs` | the arena the heap is being rebuilt on: tagged pointers, one allocation |
+| `src/heap.rs` | the arena and collector the heap is being rebuilt on: tagged pointers, one allocation |
 | `src/metrics.rs` | Prometheus metrics for it, over a one-page HTTP server |
 | `src/image.rs` | snapshot file format, after `memory/universe.cpp` and `space.cpp` |
 | `src/image_obj.rs` | snapshot words <-> serf objects: maps, slot descriptors, layout |

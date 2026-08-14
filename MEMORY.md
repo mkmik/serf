@@ -465,17 +465,84 @@ round-trip green, and is provable by a number.
 | 0 | `serf_mem_*` metrics, `SERF_MEM_TRACE=1` allocation counter, Miri in `run-tests.sh` | **done** — 1,835,488 mallocs for the suite, now a metric rather than a probe |
 | 1 | `heap.rs`: the arena, `Oop` as a tagged pointer, `map_addr` tagging, the deref assertion | **done** — 10 tests green under `cargo miri test heap::` |
 | 2a | The collector over the arena, standalone: Cheney with forwarding, tenuring, remembered set, mark-sweep old space | **done** — 19 tests green under Miri, no VM integration |
-| 2b | The Self object model on the arena: slots, descriptors, byte and vector payloads, `_Clone` | **done** — 25 tests green under Miri |
-| 2c | The flip: `Value` becomes `Oop`, `gc.rs` retires, and methods and activations come too | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
+| 2b | The Self object model on the arena: slots, descriptors, annotations, byte and vector payloads, `_Clone`, `switch_pointers` | **done** — 31 tests green under Miri, including a 2,400-object graph collected forty times |
+| 2c | The flip: the VM moves onto it, and methods and activations come too | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, `gc.rs` gone |
 | 2d | Key the inline caches and `lookup_cache` on the map | **done, ahead of the rest** — see below |
 | 3 | Roots: `each_root` rewrites, the shadow stack, the `prims.rs` audit | `SERF_GC_STRESS` green across the suite and a morphic boot |
-| 4 | Methods in the heap | image-load mallocs −170k; `walk_method`, `Seen.methods` gone |
-| 5 | Activations in the heap | `test.self` mallocs 1.86M → <1k; both pools and `walk_scope` gone |
-| 6 | Annotations, identity hash and kind in the object | `sweep_weak` and four side tables gone |
+| 6 | Maps as heap objects, so a clone stops carrying its own descriptors | `core.snap` slot words −60% |
 
-Phase 3 is the one that can silently corrupt, which is why phase 0 builds the
-tools first and phase 3 is its own step rather than a rider on phase 2. Phase 5
-is where the payoff is, which argues for not stopping after 2.
+**The collector is finished.** Everything above the flip line is built, tested
+and Miri-clean: the arena, the tagged word, the object model, Cheney with
+forwarding, tenuring, the remembered set, mark and sweep, exact-fit free lists,
+`switch_pointers`, pretenuring, and the `dying` hook. Phases 4 and 5 stopped
+being separate work along the way -- an arena word cannot hold an `Rc`, so
+methods and activations move when the objects do, and that is what 2c means.
+
+What is left is not collector design. It is porting the VM onto a collector
+that already works, which is the shape the last four commits were arranged to
+produce.
+
+### Phase 2c: the flip, spelled out
+
+The remaining work is mechanical, so here is the mechanism rather than an
+argument for it.
+
+**The word.** `Value` stays a Rust enum -- `Int(i64) | Float(f64) | Obj(Oop)` --
+and gains `to_oop`/`from_oop`. Rust code keeps the shape it has, which is what
+makes 180 `Value::` sites compile unchanged; the *heap* stores eight-byte
+`Oop`s, and the conversion happens at the boundary. A `Float` boxes on the way
+in and unboxes on the way out. Optimising the boundary away is later work and
+is confined to whatever profile says so.
+
+**The object.** `pub type ObjRef = Oop`, so `Value::Obj(o)` keeps working.
+`o.borrow()` answers a `Copy` view rather than a `Ref`, and the two field
+accesses become calls:
+
+| today | after |
+|---|---|
+| `b.slots[i].value` | `b.slot_value(i)` |
+| `b.slots.len()` | `b.slot_count()` |
+| `b.slots.iter()` | `b.slots()` |
+| `match &b.payload` | `match b.kind()` plus `b.bytes()` / `b.element(i)` / `b.method()` |
+| `b.put(slot)` | `put_slot(vm, o, slot)` — may widen, hence `switch_pointers` |
+
+`put` and `_RemoveSlot:` are the two that change character: an object is a
+fixed run of words, so they build a new object and switch every pointer to it.
+That is why `switch_pointers` exists, and why it is worth a metric.
+
+**Methods.** A method is born once and never churns, so it stays an
+`Rc<Method>` behind an index in a VM-side table, and the object holds the index
+as an immediate. The `dying` hook releases the entry when the method object is
+collected, which is what keeps `interp::send`'s one-shot methods from
+accumulating. Moving `Method` itself into the heap is a later, separable job.
+
+**Activations.** These cannot use that bridge: `test.self` makes 226,222 of
+them, and a table that never releases one is a leak rather than a bridge. So a
+`Scope` becomes a `Kind::Activation` object -- method index, receiver, holder,
+lexical, home, `pc`, `sp`, then locals and stack, all in the `Oop` region,
+because `Oop::int(pc)` is a legal `Oop` and the collector simply skips it.
+`Frame` becomes an `Oop`. This is where the 1.79M mallocs go.
+
+**Roots.** `Vm::each_root` becomes `Roots::each`, handing out `&mut Oop`
+slots -- the collector *rewrites* them, which is the whole difference from a
+handle table. `canonical`, `flags`, `image_roots` and the frame stacks are all
+already enumerable; `procs` changes from a `HashMap` keyed on identity to a
+`Vec<(Oop, Vec<Frame>)>`, because an address is not a key.
+
+**Side tables.** `id_hash` and `obj_kind` become header fields.
+`anno_obj`/`anno_slot` become the object's annotation region. `sweep_weak`,
+`note_anno` and `anno_young` go with them.
+
+**Order.** `value.rs` and `gc.rs` first, then let the compiler drive
+`interp.rs`, `prims.rs`, `image_obj.rs`, `compile.rs`, `main.rs`. Green means
+`run-tests.sh`, and the `core.snap` round-trip is the test that will actually
+find the mistakes -- it exercises 69,954 objects, 265,153 slots, annotations,
+methods, blocks and floats, and compares every one of them after a save and a
+reload.
+
+Then phase 3 immediately: `SERF_GC_STRESS` collects after every allocation, and
+that is what turns a missed root in `prims.rs` from silent corruption into a
+panic at the site.
 
 ### Phases 0 and 1, and what Miri changed
 
