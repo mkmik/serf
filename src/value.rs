@@ -591,7 +591,10 @@ pub struct Vm {
     /// maps, so a loaded image parks them here keyed by object identity, and
     /// the image writer puts them back.
     pub anno_obj: std::collections::HashMap<usize, Value>,
-    pub anno_slot: std::collections::HashMap<(usize, String), Value>,
+    /// nested by object rather than keyed on (object, slot): a collection
+    /// walks this to drop dead entries, and morphic holds 456k annotations
+    /// against 138k objects, so the walk is the object count either way
+    pub anno_slot: std::collections::HashMap<usize, std::collections::HashMap<Sym, Value>>,
     /// Annotation values that may still be young. The two tables above are
     /// Rust side, so they cannot be in the collector's remembered set; this
     /// is their write barrier, and a scavenge takes it as the root set rather
@@ -786,7 +789,7 @@ impl Vm {
         // has to see them: an old object neither moves nor dies outside one,
         // so a scavenge takes the write barrier's list instead.
         if major {
-            for x in self.anno_obj.values().chain(self.anno_slot.values()) {
+            for x in self.anno_obj.values().chain(self.anno_slot.values().flatten().map(|(_, v)| v)) {
                 v(x);
             }
         } else {
@@ -816,7 +819,7 @@ impl Vm {
     /// to an unrelated object later on.
     pub fn sweep_weak(&mut self, dead: &dyn Fn(usize) -> bool) {
         self.anno_obj.retain(|k, _| !dead(*k));
-        self.anno_slot.retain(|(k, _), _| !dead(*k));
+        self.anno_slot.retain(|k, _| !dead(*k));
         self.id_hash.retain(|k, _| !dead(*k));
         self.obj_kind.retain(|k, _| !dead(*k));
         self.procs.retain(|k, _| !dead(*k));

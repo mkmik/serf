@@ -594,7 +594,8 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let dflt = vm.image_roots.as_ref().map(|g| g[17].clone());
             v(vm
                 .anno_slot
-                .get(&(key_of(&r), slot))
+                .get(&key_of(&r))
+                .and_then(|m| m.get(&sym(&slot)))
                 .cloned()
                 .or(dflt)
                 .unwrap_or_else(|| vm.nil_v()))
@@ -752,7 +753,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 value: if assignment { vm.nil_v() } else { contents },
             });
             if let Some(a) = args.get(4) {
-                vm.anno_slot.insert((key_of(&copy), n.clone()), a.clone());
+                vm.anno_slot.entry(key_of(&copy)).or_default().insert(sym(&n), a.clone());
                 vm.note_anno(a);
             }
             let mslots = as_obj(recv, name)?.borrow().slots.clone();

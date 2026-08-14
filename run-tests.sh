@@ -44,6 +44,16 @@ if [ -f core.snap ]; then
     200 timesRepeat: [ q: ('a' , 'b') ]. \
     b value: 35] value: 0" 2>&1 | tail -1)
   [ "$got" = "42" ] || { echo "captured activation: got [$got] want [42]"; exit 1; }
+
+  # slot annotations are nested under the object rather than keyed on
+  # (object, slot), and a collection walks that outer map to drop dead
+  # entries. Write one, collect hard enough to sweep many times, read it back.
+  got=$(SERF_GC_STRESS=1 $R --load core.snap --run "[|:x. m. q| \
+    m: (reflect: (| y = 1 |)). \
+    m: (m _MirrorCopyAt: 'z' Put: (reflect: 9) IsParent: false IsArgument: false Annotation: 'slot-note'). \
+    200 timesRepeat: [ q: ('a' , 'b') ]. \
+    m _MirrorAnnotationAt: 'z'] value: 0" 2>&1 | tail -1)
+  [ "$got" = "'slot-note'" ] || { echo "slot annotation: got [$got]"; exit 1; }
 fi
 echo "gc checks ok"
 

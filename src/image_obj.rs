@@ -289,7 +289,7 @@ pub struct Loader<'a> {
     nil: Value,
     block_traits: u32,
     pub anno_obj: HashMap<usize, Value>,
-    pub anno_slot: HashMap<(usize, String), Value>,
+    pub anno_slot: HashMap<usize, HashMap<Sym, Value>>,
     pub id_hash: HashMap<usize, i64>,
     pub obj_kind: HashMap<usize, u8>,
 }
@@ -429,7 +429,7 @@ impl<'a> Loader<'a> {
             let value = self.value(raw)?;
             if s.anno & TAG_MASK == MEM_TAG {
                 let a = self.value(s.anno)?;
-                self.anno_slot.insert((value_key(&shell), name.clone()), a);
+                self.anno_slot.entry(value_key(&shell)).or_default().insert(sym(&name), a);
             }
             slots.push(Slot { name: name.as_str().into(), kind, value });
             // Self stores only the data slot; `x:` is derived from it being an
@@ -774,7 +774,7 @@ impl<'a> Builder<'a> {
         for s in &slots {
             self.string(sym_str(s.name).as_bytes());
             self.visit(&s.value)?;
-            if let Some(a) = self.vm.anno_slot.get(&(value_key(v), s.name.to_string())).cloned() {
+            if let Some(a) = self.vm.anno_slot.get(&value_key(v)).and_then(|m| m.get(&s.name)).cloned() {
                 self.visit(&a)?;
             }
         }
@@ -1080,7 +1080,7 @@ impl<'a> Builder<'a> {
                 for s in &slots {
                     let ni = self.string(sym_str(s.name).as_bytes());
                     let nm = self.items[ni].addr | MEM_TAG;
-                    let sa = match self.vm.anno_slot.get(&(value_key(&v), s.name.to_string())).cloned() {
+                    let sa = match self.vm.anno_slot.get(&value_key(&v)).and_then(|m| m.get(&s.name)).cloned() {
                         Some(a) => self.tagged(&a)?,
                         None => nil,
                     };
