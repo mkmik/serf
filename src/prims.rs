@@ -124,8 +124,11 @@ fn order(who: &str, a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> 
     }
 }
 
-fn ovf(who: &'static str) -> impl Fn(Option<i64>) -> Result<i64, String> {
-    move |o| o.ok_or_else(|| format!("{}: integer overflow", who))
+/// An overflowing integer primitive answers 'overflowError' and nothing more:
+/// `traits smallInt`'s arithmetic reads that name with `==` and retries the
+/// whole operation on bigInts, which is how the world grows past maxSmallInt.
+fn ovf(o: Option<i64>) -> Result<i64, String> {
+    o.ok_or_else(|| "overflowError".to_string())
 }
 
 fn hash_of(v: &Value) -> i64 {
@@ -304,9 +307,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
     let v = |x: Value| Ok(P::Val(x));
     match name {
         // ------------------------------------------------------ arithmetic
-        "_IntAdd:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntAdd:")(a.checked_add(b)), |a, b| a + b)?),
-        "_IntSub:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntSub:")(a.checked_sub(b)), |a, b| a - b)?),
-        "_IntMul:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntMul:")(a.checked_mul(b)), |a, b| a * b)?),
+        "_IntAdd:" => v(arith(name, recv, &args[0], |a, b| ovf(a.checked_add(b)), |a, b| a + b)?),
+        "_IntSub:" => v(arith(name, recv, &args[0], |a, b| ovf(a.checked_sub(b)), |a, b| a - b)?),
+        "_IntMul:" => v(arith(name, recv, &args[0], |a, b| ovf(a.checked_mul(b)), |a, b| a * b)?),
         "_IntDiv:" => v(arith(
             name,
             recv,
@@ -315,7 +318,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 if b == 0 {
                     Err("divisionByZeroError".into())
                 } else {
-                    ovf("_IntDiv:")(a.checked_div(b))
+                    ovf(a.checked_div(b))
                 }
             },
             |a, b| a / b,
@@ -328,7 +331,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 if b == 0 {
                     Err("divisionByZeroError".into())
                 } else {
-                    ovf("_IntMod:")(a.checked_rem(b))
+                    ovf(a.checked_rem(b))
                 }
             },
             |a, b| a % b,
@@ -486,6 +489,61 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         })),
         "_ByteAt:" => call(vm, "_At:", recv, args),
         "_ByteAt:Put:" => call(vm, "_At:Put:", recv, args),
+        // A C integer inside a byte vector: `Size:` is its width in bits and
+        // `At:` a byte offset (`cIntSize:Signed:At:...`). bigInt keeps its
+        // digits this way, so every number past maxSmallInt is read and
+        // written through here.
+        // ponytail: little-endian, as every host serf builds on is; a
+        // big-endian port takes the last w bytes of the buffer instead.
+        "_CSignedIntSize:At:" | "_CUnsignedIntSize:At:"
+        | "_CSignedIntSize:At:Put:" | "_CUnsignedIntSize:At:Put:" => {
+            let signed = name.starts_with("_CSigned");
+            let bits = as_i(&args[0], name)?;
+            let w = match bits {
+                8 | 16 | 32 | 64 => bits as usize / 8,
+                _ => return Err("badTypeError".into()),
+            };
+            let i = as_i(&args[1], name)?;
+            let o = as_obj(recv, name)?;
+            let len = match &o.borrow().payload {
+                Payload::Bytes(b) => b.len(),
+                _ => return Err("badTypeError".into()),
+            };
+            if i < 0 || i as usize + w > len {
+                return Err("badIndexError".into());
+            }
+            let (i, mut buf) = (i as usize, [0u8; 8]);
+            match args.get(2) {
+                Some(a) => {
+                    let x = as_i(a, name)?;
+                    if !signed && x < 0 {
+                        return Err("badSignError".into());
+                    }
+                    let fits = bits == 64 || if signed { matches!(x >> (bits - 1), 0 | -1) } else { x >> bits == 0 };
+                    if !fits {
+                        return Err("badTypeError".into());
+                    }
+                    buf = (x as u64).to_le_bytes();
+                    match &mut o.borrow_mut().payload {
+                        Payload::Bytes(b) => b[i..i + w].copy_from_slice(&buf[..w]),
+                        _ => unreachable!(),
+                    }
+                    v(recv.clone())
+                }
+                None => {
+                    match &o.borrow().payload {
+                        Payload::Bytes(b) => buf[..w].copy_from_slice(&b[i..i + w]),
+                        _ => unreachable!(),
+                    }
+                    let x = i64::from_le_bytes(buf);
+                    if !signed && bits == 64 && x < 0 {
+                        // no room for it in a 64-bit smallInt
+                        return Err("overflowError".into());
+                    }
+                    v(Value::Int(if signed && bits < 64 { x << (64 - bits) >> (64 - bits) } else { x }))
+                }
+            }
+        }
         "_ByteVectorConcatenate:Prototype:" => {
             let a = recv.bytes().ok_or("_ByteVectorConcatenate: receiver is not a byte vector")?;
             let b = args[0].bytes().ok_or("_ByteVectorConcatenate: argument is not a byte vector")?;
