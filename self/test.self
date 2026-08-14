@@ -28,6 +28,16 @@ t check: 'eq mixed' Is: 3 = 'x'          Should: false.
 t check: 'shift'    Is: 1 << 10          Should: 1024.
 t check: 'float'    Is: 2.0 ** 10        Should: 1024.0.
 
+"A failing primitive answers a bare VM error name and the selector it was
+ sent: `traits smallInt` reads both, and retries on bigInts when it overflows"
+t check: 'overflow' Is: ((1 << 62) _IntMul: 4 IfFail: [|:e. :n| e])
+                    Should: 'overflowError'.
+t check: 'failname' Is: ((1 << 62) _IntMul: 4 IfFail: [|:e. :n| n])
+                    Should: '_IntMul:IfFail:'.
+t check: 'cint'     Is: (((byteVector copySize: 8) _CUnsignedIntSize: 32 At: 2
+                          Put: 70000) _CSignedIntSize: 8 At: 2)
+                    Should: 112.
+
 "--- booleans and blocks"
 t check: 'ifTrue'   Is: ((3 < 4) ifTrue: ['y'] False: ['n'])   Should: 'y'.
 t check: 'block0'   Is: [ 1 + 1 ] value                        Should: 2.

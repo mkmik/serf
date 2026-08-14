@@ -523,9 +523,10 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                         o.borrow().find("value:With:").is_some()
                                     });
                                     let err_s = vm.string(&m);
+                                    let prim = vm.string(&cur_sel);
                                     cur_args = if two {
                                         cur_sel = "value:With:".into();
-                                        vec![err_s, vm.string(&cur_sel)]
+                                        vec![err_s, prim]
                                     } else {
                                         cur_sel = "value:".into();
                                         vec![err_s]
