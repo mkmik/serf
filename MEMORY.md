@@ -465,8 +465,9 @@ round-trip green, and is provable by a number.
 | 0 | `serf_mem_*` metrics, `SERF_MEM_TRACE=1` allocation counter, Miri in `run-tests.sh` | **done** — 1,835,488 mallocs for the suite, now a metric rather than a probe |
 | 1 | `heap.rs`: the arena, `Oop` as a tagged pointer, `map_addr` tagging, the deref assertion | **done** — 10 tests green under `cargo miri test heap::` |
 | 2a | The collector over the arena, standalone: Cheney with forwarding, tenuring, remembered set, mark-sweep old space | **done** — 19 tests green under Miri, no VM integration |
-| 2b | The switch-over: `Value` becomes `Oop`, objects move into the arena, `gc.rs` retires | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
-| 2c | Key the inline caches and `lookup_cache` on the map | **done, ahead of the rest** — see below |
+| 2b | The Self object model on the arena: slots, descriptors, byte and vector payloads, `_Clone` | **done** — 25 tests green under Miri |
+| 2c | The flip: `Value` becomes `Oop`, `gc.rs` retires, and methods and activations come too | `core.snap` resident ~19 MB → ~8 MB; `Slots`, `Payload`, the handle table gone |
+| 2d | Key the inline caches and `lookup_cache` on the map | **done, ahead of the rest** — see below |
 | 3 | Roots: `each_root` rewrites, the shadow stack, the `prims.rs` audit | `SERF_GC_STRESS` green across the suite and a morphic boot |
 | 4 | Methods in the heap | image-load mallocs −170k; `walk_method`, `Seen.methods` gone |
 | 5 | Activations in the heap | `test.self` mallocs 1.86M → <1k; both pools and `walk_scope` gone |
@@ -556,7 +557,59 @@ bumps. Every tenured object was reserving a copy's worth of to-space and
 walking away from it. The replacement tests the reachable thing (pretenuring)
 and asserts the leak is gone.
 
-### Phase 2c, landed early
+### Phase 2b: the object model, and what the flip still needs
+
+An object on the arena is its header, then:
+
+```text
+payload[0 .. slots)              slot values            Oop
+payload[slots .. oops)           indexable elements     Oop   (an objVector)
+payload[oops .. oops + slots)    slot descriptors       raw: name:32 │ kind:8
+payload[oops + slots .. )        length, then bytes     raw   (a string)
+```
+
+Descriptors are in the raw region because an interned name is a number, not a
+reference. When maps arrive they take the descriptors with them and a clone
+stops carrying its own copy; the values, the elements and the bytes are what is
+left, and they are what actually differs between clones.
+
+Twenty-five tests green under Miri, including the one that matters most for the
+layout — a string whose bytes spell out plausible pointers, held in a slot of
+an object that gets scavenged, coming back byte-for-byte. Bytes are not traced,
+descriptors are not traced, slot values and elements are.
+
+A byte object keeps its exact length in a word of its own, because `size` counts
+whole words and a 46-byte string has to come back 46 bytes long. Getting that
+word's index wrong -- past the slot values but not past their descriptors --
+segfaulted the release test run, because release compiles out the bounds
+`debug_assert`. The debug `cargo test heap::` that phase 1 added to
+`run-tests.sh` reports it as an assertion instead. It earned its keep on the
+first bug it saw.
+
+#### What the flip still needs, which is more than it looks
+
+`Value` cannot become `Oop` on its own. An arena word is eight bytes and holds
+a tagged pointer or an immediate; it cannot hold an `Rc`. And `Payload` has two:
+
+```rust
+Method(Rc<Method>),
+Block(Rc<Method>, Option<Rc<Scope>>),
+```
+
+So the moment objects move into the arena, methods and activations have to go
+with them -- phases 4 and 5 -- or be reached through a side table the collector
+maintains. A method is born once and never churns, so an index into a Rust-side
+table is a fair bridge for it. An activation is not: `test.self` makes 226,222
+of them, and a table that never releases one is a leak, not a bridge.
+
+The flip is therefore 2c + 4 + 5 in one commit, and its size is worth stating
+before starting rather than discovering: 180 `Value::` sites, ~150 `Payload::`
+sites, 178 `borrow()` sites and 37 `Rc<Method>`/`Rc<Scope>` sites, across
+`value.rs`, `gc.rs`, `interp.rs`, `prims.rs`, `image_obj.rs` and `compile.rs`,
+with the `core.snap` round-trip as the acceptance test and the `prims.rs` root
+audit (phase 3) immediately behind it.
+
+### Phase 2d, landed early
 
 2b turned out not to need the arena at all, so it went first. Objects still own
 their slot vectors; what is interned is the shape — slot names and kinds plus

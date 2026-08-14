@@ -138,8 +138,24 @@ impl std::fmt::Debug for Oop {
 ///
 /// ```text
 /// word 0  mark:  forwarded:1 │ marked:1 │ dirty:1 │ age:8 │ kind:8 │ hash:22 │ size:23
-/// word 1  oops:  how many leading payload words hold `Oop`s; the rest are raw
+/// word 1  form:  slots:32 │ oops:32
 /// ```
+///
+/// `oops` is how many leading payload words hold `Oop`s; the rest are raw.
+/// `slots` is how many of those `Oop`s are named slots, which is where the
+/// payload splits:
+///
+/// ```text
+/// payload[0 .. slots)              slot values            Oop
+/// payload[slots .. oops)           indexable elements     Oop   (an objVector)
+/// payload[oops .. oops + slots)    slot descriptors       raw: name:32 │ kind:8
+/// payload[oops + slots .. )        indexable bytes        raw   (a string)
+/// ```
+///
+/// Descriptors sit in the raw region because they are not references -- an
+/// interned name is a number. When maps arrive they take the descriptors with
+/// them and every clone of a shape stops carrying its own copy; the values, the
+/// elements and the bytes are what is left, and they are what actually differs.
 ///
 /// This is the C++ VM's mark word widened -- `tag:2 │ hash:22 │ age:7 │
 /// marked:1` (`objects/markOop.hh:15`) -- plus the two bits a collector wants
@@ -309,11 +325,42 @@ pub struct Space {
     bump: Cell<usize>,
 }
 
-fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize) {
+fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize, slots: usize) {
     debug_assert!(oops <= size - HEADER_WORDS, "more oop words than payload");
+    debug_assert!(slots <= oops, "more named slots than oop words");
     unsafe {
         p.write(mark_of(size, kind));
-        p.add(1).write(oops as u64);
+        p.add(1).write(((slots as u64) << 32) | oops as u64);
+    }
+}
+
+/// What an object is made of, before it exists. `len` is the indexable part:
+/// elements for an `ObjVector`, bytes for a `Bytes`, ignored otherwise.
+#[derive(Clone, Copy, Debug)]
+pub struct Shape {
+    pub kind: Kind,
+    pub slots: usize,
+    pub len: usize,
+}
+
+impl Shape {
+    pub fn new(kind: Kind, slots: usize) -> Shape {
+        Shape { kind, slots, len: 0 }
+    }
+
+    pub fn indexable(kind: Kind, slots: usize, len: usize) -> Shape {
+        Shape { kind, slots, len }
+    }
+
+    /// (`Oop` words, raw words). A byte object keeps its exact length in a word
+    /// of its own, because `size` only counts whole words and a 46-byte string
+    /// has to come back 46 bytes long.
+    fn words(&self) -> (usize, usize) {
+        match self.kind {
+            Kind::ObjVector => (self.slots + self.len, self.slots),
+            Kind::Bytes => (self.slots, self.slots + 1 + self.len.div_ceil(8)),
+            _ => (self.slots, self.slots),
+        }
     }
 }
 
@@ -355,8 +402,19 @@ impl Space {
     /// Room for one object, header included. `None` when the space is full --
     /// which in a collector means "tenure it instead", not "find more memory",
     /// so it is an answer rather than an error.
-    pub fn alloc(&self, kind: Kind, oops: usize, raw: usize) -> Option<Oop> {
-        let size = HEADER_WORDS + oops + raw;
+    pub fn alloc(&self, s: Shape) -> Option<Oop> {
+        let (oops, raw) = s.words();
+        let o = self.alloc_words(s.kind, oops, s.slots, oops + raw)?;
+        if s.kind == Kind::Bytes {
+            set_raw(o, len_word(o), s.len as u64);
+        }
+        Some(o)
+    }
+
+    /// The layout spelled out rather than derived, for a copy: an evacuation
+    /// has an object in front of it and needs the same shape, not a fresh one.
+    fn alloc_words(&self, kind: Kind, oops: usize, slots: usize, payload: usize) -> Option<Oop> {
+        let size = HEADER_WORDS + payload;
         if size > MAX_OBJECT_WORDS {
             return None;
         }
@@ -366,7 +424,7 @@ impl Space {
         }
         self.bump.set(a + size);
         let p = at(self.start + a);
-        init_object(p, size, kind, oops);
+        init_object(p, size, kind, oops, slots);
         Some(Oop::obj(p))
     }
 
@@ -435,10 +493,20 @@ pub fn payload_words(o: Oop) -> usize {
     size_words(o) - HEADER_WORDS
 }
 
-/// How many leading payload words hold `Oop`s. The rest are raw: bytes, a
-/// bytecode run, the bits of a float.
+fn form(o: Oop) -> u64 {
+    unsafe { words_of(o).add(1).read() }
+}
+
+/// How many leading payload words hold `Oop`s. The rest are raw: slot
+/// descriptors, bytes, a bytecode run, the bits of a float.
 pub fn oop_words(o: Oop) -> usize {
-    unsafe { words_of(o).add(1).read() as usize }
+    (form(o) & 0xffff_ffff) as usize
+}
+
+/// How many named slots the object has. Its values are the first `slots` words
+/// of the payload and its descriptors are the first `slots` raw words.
+pub fn slots(o: Oop) -> usize {
+    (form(o) >> 32) as usize
 }
 
 pub fn kind(o: Oop) -> Kind {
@@ -517,6 +585,101 @@ pub fn raw(o: Oop, i: usize) -> u64 {
 
 pub fn set_raw(o: Oop, i: usize, v: u64) {
     unsafe { word_at(o, i).write(v) }
+}
+
+// -------------------------------------------------------------- named slots
+
+/// A slot's name and kind, packed into the descriptor word. The name is an
+/// interned symbol -- `value.rs`'s `Sym` -- which is a number, so it belongs in
+/// the raw region where the collector will not mistake it for a reference.
+pub fn slot_name(o: Oop, i: usize) -> u32 {
+    debug_assert!(i < slots(o), "slot {i} of an object with {} of them", slots(o));
+    raw(o, oop_words(o) + i) as u32
+}
+
+pub fn slot_kind(o: Oop, i: usize) -> u8 {
+    debug_assert!(i < slots(o), "slot {i} of an object with {} of them", slots(o));
+    (raw(o, oop_words(o) + i) >> 32) as u8
+}
+
+pub fn set_slot_desc(o: Oop, i: usize, name: u32, kind: u8) {
+    debug_assert!(i < slots(o), "slot {i} of an object with {} of them", slots(o));
+    set_raw(o, oop_words(o) + i, name as u64 | ((kind as u64) << 32));
+}
+
+pub fn slot_value(o: Oop, i: usize) -> Oop {
+    debug_assert!(i < slots(o), "slot {i} of an object with {} of them", slots(o));
+    field(o, i)
+}
+
+pub fn set_slot_value(o: Oop, i: usize, v: Oop) {
+    debug_assert!(i < slots(o), "slot {i} of an object with {} of them", slots(o));
+    set_field(o, i, v)
+}
+
+/// By interned name, which is what every hot caller already has. A linear scan,
+/// as `Obj::find_sym` is: an object's slots are few, and comparing numbers is
+/// what makes it cheap.
+pub fn find_slot(o: Oop, name: u32) -> Option<usize> {
+    (0..slots(o)).find(|&i| slot_name(o, i) == name)
+}
+
+// ---------------------------------------------------------- the indexable part
+
+/// Elements for an `ObjVector`, bytes for a `Bytes`, nothing for anything else.
+/// Where a byte object keeps its exact length: after the slot values *and*
+/// after their descriptors, which is the whole raw region a byte object has
+/// before its bytes begin.
+fn len_word(o: Oop) -> usize {
+    oop_words(o) + slots(o)
+}
+
+pub fn ilen(o: Oop) -> usize {
+    match kind(o) {
+        Kind::ObjVector => oop_words(o) - slots(o),
+        Kind::Bytes => raw(o, len_word(o)) as usize,
+        _ => 0,
+    }
+}
+
+pub fn element(o: Oop, i: usize) -> Oop {
+    debug_assert!(kind(o) == Kind::ObjVector && i < ilen(o), "element {i} out of range");
+    field(o, slots(o) + i)
+}
+
+pub fn set_element(o: Oop, i: usize, v: Oop) {
+    debug_assert!(kind(o) == Kind::ObjVector && i < ilen(o), "element {i} out of range");
+    set_field(o, slots(o) + i, v)
+}
+
+/// Bytes are packed into the raw words after the length. Reading one is a word
+/// load and a shift, which is what a word-addressed arena costs for byte data;
+/// `Value::bytes()` copies today anyway, so nothing regresses by it.
+fn byte_words(o: Oop) -> usize {
+    len_word(o) + 1
+}
+
+pub fn byte_at(o: Oop, i: usize) -> u8 {
+    debug_assert!(kind(o) == Kind::Bytes && i < ilen(o), "byte {i} out of range");
+    (raw(o, byte_words(o) + i / 8) >> ((i % 8) * 8)) as u8
+}
+
+pub fn set_byte_at(o: Oop, i: usize, b: u8) {
+    debug_assert!(kind(o) == Kind::Bytes && i < ilen(o), "byte {i} out of range");
+    let w = byte_words(o) + i / 8;
+    let sh = (i % 8) * 8;
+    set_raw(o, w, (raw(o, w) & !(0xffu64 << sh)) | ((b as u64) << sh));
+}
+
+pub fn set_bytes(o: Oop, src: &[u8]) {
+    debug_assert_eq!(ilen(o), src.len(), "byte object is the wrong length");
+    for (i, b) in src.iter().enumerate() {
+        set_byte_at(o, i, *b);
+    }
+}
+
+pub fn bytes_of(o: Oop) -> Vec<u8> {
+    (0..ilen(o)).map(|i| byte_at(o, i)).collect()
 }
 
 fn copy_payload(from: Oop, to: Oop) {
@@ -628,22 +791,26 @@ impl Heap {
     /// Allocate in the young generation. `None` means the space is full and the
     /// caller should collect -- allocation never collects on its own, because
     /// the caller's Rust locals are not roots.
-    pub fn alloc(&self, kind: Kind, oops: usize, raw: usize) -> Option<Oop> {
-        self.from_space().alloc(kind, oops, raw)
+    pub fn alloc(&self, s: Shape) -> Option<Oop> {
+        self.from_space().alloc(s)
     }
 
     /// Allocate, putting into the old generation anything the young space
     /// cannot take -- an object bigger than a semispace, or one arriving when
     /// the space is full and no collection is possible yet. The caller gets an
     /// object either way, which is what lets allocation be infallible.
-    pub fn alloc_or_tenure(&self, kind: Kind, oops: usize, raw: usize) -> Oop {
-        match self.alloc(kind, oops, raw) {
+    pub fn alloc_or_tenure(&self, s: Shape) -> Oop {
+        match self.alloc(s) {
             Some(o) => o,
             None => {
+                let (oops, raw) = s.words();
                 // born old with its fields already set and no barrier fired for
                 // it: whatever it comes to hold, the next scavenge has to know
-                let o = self.alloc_old(kind, oops, raw);
+                let o = self.alloc_old(s.kind, oops, s.slots, oops + raw);
                 self.record(o);
+                if s.kind == Kind::Bytes {
+                    set_raw(o, len_word(o), s.len as u64);
+                }
                 o
             }
         }
@@ -651,15 +818,32 @@ impl Heap {
 
     /// Allocate straight into the old generation: what a promotion does, and
     /// what pretenuring does.
-    fn alloc_old(&self, kind: Kind, oops: usize, raw: usize) -> Oop {
-        let size = HEADER_WORDS + oops + raw;
+    fn alloc_old(&self, kind: Kind, oops: usize, slots: usize, payload: usize) -> Oop {
+        let size = HEADER_WORDS + payload;
         self.old_live.set(self.old_live.get() + 1);
         if let Some(a) = self.old_free.borrow_mut().get_mut(&size).and_then(|v| v.pop()) {
             let p = from_addr(a);
-            init_object(p, size, kind, oops);
+            init_object(p, size, kind, oops, slots);
             return Oop::obj(p);
         }
-        self.old.alloc(kind, oops, raw).expect("old generation exhausted")
+        self.old
+            .alloc_words(kind, oops, slots, payload)
+            .expect("old generation exhausted")
+    }
+
+    /// A clone: the same shape, the same contents, its own identity. `_Clone`.
+    pub fn clone_object(&self, o: Oop) -> Oop {
+        let (oops, pay, ns) = (oop_words(o), payload_words(o), slots(o));
+        let c = match self.from_space().alloc_words(kind(o), oops, ns, pay) {
+            Some(c) => c,
+            None => {
+                let c = self.alloc_old(kind(o), oops, ns, pay);
+                self.record(c);
+                c
+            }
+        };
+        copy_payload(o, c);
+        c
     }
 
     pub fn is_young(&self, o: Oop) -> bool {
@@ -700,8 +884,7 @@ impl Heap {
         if !self.from_space().contains(o) {
             return o; // already old, or already copied into the to-space
         }
-        let (k, oops, pay) = (kind(o), oop_words(o), payload_words(o));
-        let raw = pay - oops;
+        let (k, oops, pay, ns) = (kind(o), oop_words(o), payload_words(o), slots(o));
         let a = age(o).saturating_add(1);
         // Ask the to-space only when the object is actually staying young: the
         // bump happens inside `alloc`, so testing the age afterwards would
@@ -715,11 +898,11 @@ impl Heap {
         // than by argument (universe.cpp:87 keeps a whole generation in reserve
         // for the same reason).
         let dst = if a >= PROMOTE_AGE {
-            self.alloc_old(k, oops, raw)
+            self.alloc_old(k, oops, ns, pay)
         } else {
-            match self.to_space().alloc(k, oops, raw) {
+            match self.to_space().alloc_words(k, oops, ns, pay) {
                 Some(d) => d,
-                None => self.alloc_old(k, oops, raw),
+                None => self.alloc_old(k, oops, ns, pay),
             }
         };
         let tenured = !self.is_young(dst);
@@ -889,7 +1072,7 @@ mod tests {
 
     /// A `Slots` object of `n` fields, all of them `Oop`s.
     fn obj(h: &Heap, n: usize) -> Oop {
-        h.alloc(Kind::Slots, n, 0).expect("young space full")
+        h.alloc(Shape::new(Kind::Slots, n)).expect("young space full")
     }
 
     #[test]
@@ -908,20 +1091,22 @@ mod tests {
     #[test]
     fn an_object_pointer_is_aligned_and_untagged() {
         let h = heap();
-        let o = h.alloc(Kind::Slots, 2, 1).unwrap();
+        let o = h.alloc(Shape::indexable(Kind::ObjVector, 2, 1)).unwrap();
         assert!(o.is_obj());
         assert!(!o.is_int(), "an object pointer must not read as an integer");
         assert_eq!(o.addr() & 7, 0, "object pointers carry no tag bits");
-        assert_eq!(size_words(o), HEADER_WORDS + 3);
-        assert_eq!(payload_words(o), 3);
-        assert_eq!(oop_words(o), 2);
-        assert_eq!(kind(o), Kind::Slots);
+        assert_eq!(slots(o), 2);
+        assert_eq!(ilen(o), 1);
+        assert_eq!(oop_words(o), 3, "two slot values and one element");
+        assert_eq!(payload_words(o), 5, "...and two descriptor words");
+        assert_eq!(size_words(o), HEADER_WORDS + 5);
+        assert_eq!(kind(o), Kind::ObjVector);
     }
 
     #[test]
     fn header_fields_do_not_tread_on_each_other() {
         let h = heap();
-        let o = h.alloc(Kind::Method, 5, 2).unwrap();
+        let o = h.alloc(Shape::new(Kind::Method, 5)).unwrap();
         set_hash(o, HASH_MASK as u32);
         set_age(o, 200);
         set_dirty(o, true);
@@ -929,9 +1114,10 @@ mod tests {
         assert_eq!(hash(o), HASH_MASK as u32);
         assert_eq!(age(o), 200);
         assert!(dirty(o) && marked(o));
-        assert_eq!(size_words(o), HEADER_WORDS + 7, "size was trampled");
+        assert_eq!(size_words(o), HEADER_WORDS + 10, "size was trampled");
         assert_eq!(kind(o), Kind::Method, "kind was trampled");
         assert_eq!(oop_words(o), 5);
+        assert_eq!(slots(o), 5, "the slot count was trampled");
         set_hash(o, 1);
         assert_eq!(age(o), 200, "writing the hash moved the age");
         assert!(dirty(o) && marked(o), "writing the hash moved a flag");
@@ -942,7 +1128,7 @@ mod tests {
     #[test]
     fn fields_hold_both_kinds_of_word() {
         let h = heap();
-        let o = h.alloc(Kind::Slots, 2, 2).unwrap();
+        let o = h.alloc(Shape::indexable(Kind::ObjVector, 2, 2)).unwrap();
         let other = obj(&h, 1);
         assert!(field(o, 0).is_null(), "a fresh heap word is not null");
         set_field(o, 0, Oop::int(-42));
@@ -974,19 +1160,19 @@ mod tests {
     fn the_space_walks_itself() {
         let s = Space::new(256);
         let sizes = [0usize, 1, 4, 2, 9];
-        let made: Vec<Oop> = sizes.iter().map(|n| s.alloc(Kind::Slots, *n, 0).unwrap()).collect();
+        let made: Vec<Oop> = sizes.iter().map(|n| s.alloc(Shape::new(Kind::Slots, *n)).unwrap()).collect();
         let seen: Vec<Oop> = s.walk().collect();
         assert_eq!(seen, made, "the walk did not find the objects in order");
-        assert_eq!(s.used(), sizes.iter().map(|n| n + HEADER_WORDS).sum::<usize>());
+        assert_eq!(s.used(), sizes.iter().map(|n| 2 * n + HEADER_WORDS).sum::<usize>());
     }
 
     #[test]
     fn a_full_space_answers_none_rather_than_growing() {
-        let s = Space::new(8);
-        assert!(s.alloc(Kind::Slots, 2, 0).is_some()); // 4 words
-        assert!(s.alloc(Kind::Slots, 2, 0).is_some()); // 8 words, exactly full
-        assert!(s.alloc(Kind::Slots, 0, 0).is_none(), "an overfull space allocated");
-        assert_eq!(s.used(), 8);
+        let s = Space::new(12);
+        assert!(s.alloc(Shape::new(Kind::Slots, 2)).is_some()); // 6 words
+        assert!(s.alloc(Shape::new(Kind::Slots, 2)).is_some()); // 12 words, exactly full
+        assert!(s.alloc(Shape::new(Kind::Slots, 0)).is_none(), "an overfull space allocated");
+        assert_eq!(s.used(), 12);
     }
 
     // ----------------------------------------------------------- collection
@@ -1004,7 +1190,7 @@ mod tests {
 
         let keep = roots.0[0];
         assert!(h.young_used() < before, "nothing was reclaimed");
-        assert_eq!(h.young_used(), HEADER_WORDS + 1, "more than the survivor came across");
+        assert_eq!(h.young_used(), HEADER_WORDS + 2, "more than the survivor came across");
         assert_eq!(field(keep, 0).as_int(), Some(7), "the survivor lost its contents");
         assert_eq!(age(keep), 1);
     }
@@ -1052,7 +1238,7 @@ mod tests {
         let a = roots.0[0];
         let b2 = field(a, 0);
         assert_eq!(field(b2, 0), a, "the cycle did not close back on the copy");
-        assert_eq!(h.young_used(), 2 * (HEADER_WORDS + 1), "an object was copied twice");
+        assert_eq!(h.young_used(), 2 * (HEADER_WORDS + 2), "an object was copied twice");
     }
 
     #[test]
@@ -1195,13 +1381,13 @@ mod tests {
     #[test]
     fn what_the_young_space_cannot_take_is_born_old() {
         let h = Heap::new(64, 2048);
-        let big = h.alloc_or_tenure(Kind::Bytes, 0, 200);
+        let big = h.alloc_or_tenure(Shape::indexable(Kind::Bytes, 0, 1600));
         assert!(!h.is_young(big), "an object bigger than a semispace stayed young");
-        assert_eq!(payload_words(big), 200, "the pretenured object is the wrong size");
+        assert_eq!(ilen(big), 1600, "the pretenured object is the wrong length");
 
         let mut roots = Vars(vec![big]);
-        while h.alloc(Kind::Slots, 1, 0).is_some() {}
-        let crammed = h.alloc_or_tenure(Kind::Slots, 1, 0);
+        while h.alloc(Shape::new(Kind::Slots, 1)).is_some() {}
+        let crammed = h.alloc_or_tenure(Shape::new(Kind::Slots, 1));
         assert!(!h.is_young(crammed), "an allocation into a full space was not tenured");
         set_field(crammed, 0, Oop::int(9));
         roots.0.push(crammed);
@@ -1218,6 +1404,152 @@ mod tests {
         let held = field(roots.0[1], 0);
         assert!(held.is_obj(), "a pretenured object's young referent was lost");
         assert_eq!(field(held, 0).as_int(), Some(4));
+    }
+
+    // ------------------------------------------------------- the object model
+
+    const DATA: u8 = 0;
+    const PARENT: u8 = 1;
+
+    /// Named slots: values in the scanned region, names and kinds in the raw
+    /// one, and the two indexed the same way.
+    #[test]
+    fn an_object_carries_its_slots() {
+        let h = heap();
+        let o = h.alloc(Shape::new(Kind::Slots, 3)).unwrap();
+        let parent = obj(&h, 0);
+        set_slot_desc(o, 0, 7, PARENT);
+        set_slot_value(o, 0, parent);
+        set_slot_desc(o, 1, 11, DATA);
+        set_slot_value(o, 1, Oop::int(42));
+        set_slot_desc(o, 2, 13, DATA);
+        set_slot_value(o, 2, Oop::null());
+
+        assert_eq!(slots(o), 3);
+        assert_eq!(slot_name(o, 0), 7);
+        assert_eq!(slot_kind(o, 0), PARENT);
+        assert_eq!(slot_value(o, 0), parent);
+        assert_eq!(slot_name(o, 1), 11);
+        assert_eq!(slot_kind(o, 1), DATA, "the name overwrote the kind");
+        assert_eq!(slot_value(o, 1).as_int(), Some(42));
+        assert_eq!(find_slot(o, 11), Some(1));
+        assert_eq!(find_slot(o, 13), Some(2));
+        assert_eq!(find_slot(o, 99), None);
+    }
+
+    #[test]
+    fn a_byte_object_is_its_bytes() {
+        let h = heap();
+        let text = b"hello: 720, and a tail long enough to need three words";
+        let o = h.alloc(Shape::indexable(Kind::Bytes, 1, text.len())).unwrap();
+        set_slot_desc(o, 0, 1, PARENT);
+        set_bytes(o, text);
+        assert_eq!(ilen(o), text.len(), "the length word did not survive the slots");
+        assert_eq!(bytes_of(o), text, "the bytes did not round-trip");
+        assert_eq!(byte_at(o, 0), b'h');
+        assert_eq!(byte_at(o, text.len() - 1), b's');
+        set_byte_at(o, 0, b'H');
+        assert_eq!(byte_at(o, 0), b'H');
+        assert_eq!(byte_at(o, 1), b'e', "writing one byte disturbed its neighbour");
+        assert_eq!(slot_name(o, 0), 1, "the bytes ran over the descriptor");
+    }
+
+    /// An empty string and a one-byte one are the edges the length word and the
+    /// word rounding both live on.
+    #[test]
+    fn a_byte_object_survives_its_edges() {
+        let h = heap();
+        for n in [0usize, 1, 7, 8, 9] {
+            let src: Vec<u8> = (0..n).map(|i| i as u8 + 1).collect();
+            let o = h.alloc(Shape::indexable(Kind::Bytes, 0, n)).unwrap();
+            set_bytes(o, &src);
+            assert_eq!(ilen(o), n);
+            assert_eq!(bytes_of(o), src, "a {n}-byte object did not round-trip");
+        }
+    }
+
+    #[test]
+    fn a_vector_holds_references_the_collector_can_see() {
+        let h = heap();
+        let v = h.alloc(Shape::indexable(Kind::ObjVector, 1, 3)).unwrap();
+        set_slot_desc(v, 0, 1, PARENT);
+        let a = obj(&h, 1);
+        set_slot_desc(a, 0, 5, DATA);
+        set_slot_value(a, 0, Oop::int(1));
+        set_element(v, 0, a);
+        set_element(v, 1, Oop::int(2));
+        set_element(v, 2, Oop::null());
+        assert_eq!(ilen(v), 3);
+        assert_eq!(element(v, 0), a);
+        assert_eq!(element(v, 1).as_int(), Some(2));
+
+        let mut roots = Vars(vec![v]);
+        h.scavenge(&mut roots);
+        let v = roots.0[0];
+        assert_eq!(ilen(v), 3, "the vector lost its length");
+        let a2 = element(v, 0);
+        assert!(a2.is_obj() && a2 != a, "the element did not follow its object");
+        assert_eq!(slot_value(a2, 0).as_int(), Some(1));
+        assert_eq!(element(v, 1).as_int(), Some(2), "an immediate element was disturbed");
+        assert_eq!(slot_name(v, 0), 1, "the descriptor did not survive the copy");
+    }
+
+    /// The whole layout through a collection: slot values traced, elements
+    /// traced, descriptors and bytes copied verbatim and not mistaken for
+    /// references.
+    #[test]
+    fn the_whole_layout_survives_a_scavenge() {
+        let h = heap();
+        let text = b"a string with bytes that look like pointers: \x08\x10\x18";
+        let s = h.alloc(Shape::indexable(Kind::Bytes, 1, text.len())).unwrap();
+        set_slot_desc(s, 0, 2, PARENT);
+        set_bytes(s, text);
+
+        let o = h.alloc(Shape::new(Kind::Slots, 2)).unwrap();
+        set_slot_desc(o, 0, 3, DATA);
+        set_slot_value(o, 0, s);
+        set_slot_desc(o, 1, 4, DATA);
+        set_slot_value(o, 1, Oop::int(-9));
+
+        let mut roots = Vars(vec![o]);
+        h.scavenge(&mut roots);
+
+        let o = roots.0[0];
+        assert_eq!(slot_name(o, 0), 3);
+        assert_eq!(slot_name(o, 1), 4);
+        assert_eq!(slot_value(o, 1).as_int(), Some(-9));
+        let s2 = slot_value(o, 0);
+        assert!(s2.is_obj() && s2 != s, "the string did not move with its holder");
+        assert_eq!(bytes_of(s2), text, "the bytes were traced as if they were references");
+        assert_eq!(slot_name(s2, 0), 2);
+    }
+
+    #[test]
+    fn a_clone_shares_the_shape_and_nothing_else() {
+        let h = heap();
+        let o = h.alloc(Shape::new(Kind::Slots, 2)).unwrap();
+        set_slot_desc(o, 0, 3, PARENT);
+        set_slot_value(o, 0, Oop::int(1));
+        set_slot_desc(o, 1, 4, DATA);
+        set_slot_value(o, 1, Oop::int(2));
+        set_hash(o, 55);
+
+        let c = h.clone_object(o);
+        assert_ne!(c, o, "a clone is the same object");
+        assert_eq!(slots(c), 2);
+        assert_eq!(slot_name(c, 1), 4);
+        assert_eq!(slot_kind(c, 0), PARENT);
+        assert_eq!(slot_value(c, 1).as_int(), Some(2));
+        set_slot_value(c, 1, Oop::int(9));
+        assert_eq!(slot_value(o, 1).as_int(), Some(2), "the clone shares its values");
+        assert_ne!(hash(c), 55, "a clone inherited its prototype's identity hash");
+
+        let text = b"cloned";
+        let s = h.alloc(Shape::indexable(Kind::Bytes, 0, text.len())).unwrap();
+        set_bytes(s, text);
+        let sc = h.clone_object(s);
+        assert_eq!(bytes_of(sc), text, "a byte object's clone lost its bytes");
+        assert_eq!(ilen(sc), text.len());
     }
 
     /// Promotion must not reserve to-space it then walks away from -- the bump
