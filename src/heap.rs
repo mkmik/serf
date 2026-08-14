@@ -386,9 +386,11 @@ impl Shape {
     fn words(&self) -> (usize, usize) {
         let head = self.slots + self.anno_words();
         match self.kind {
-            Kind::ObjVector => (head + self.len, self.slots),
+            // a byte object's `len` is bytes, packed after a length word
             Kind::Bytes => (head, self.slots + 1 + self.len.div_ceil(8)),
-            _ => (head, self.slots),
+            // everything else counts `len` in `Oop`s the collector traces: a
+            // vector's elements, an activation's receiver, chain and locals
+            _ => (head + self.len, self.slots),
         }
     }
 }
@@ -2041,6 +2043,137 @@ mod tests {
         }
         assert!(!live.is_empty(), "everything died");
         assert!(h.old_live() > 0, "nothing was ever tenured");
+    }
+
+    // ------------------------------------------------------- activation shape
+
+    // What an activation will look like once `Scope` moves here: a chain link,
+    // a marker standing in for the receiver, and its locals. All `Oop`s,
+    // because an immediate is one -- a program counter is `Oop::int(pc)` and
+    // the collector simply steps over it.
+    const A_LEXICAL: usize = 0;
+    const A_MARK: usize = 1;
+    const A_LOCALS: usize = 2;
+
+    fn activation(h: &Heap, lexical: Oop, marker: i64, locals: usize) -> Oop {
+        let a = h.alloc_or_tenure(Shape::indexable(Kind::Activation, 0, A_LOCALS + locals));
+        h.store(a, A_LEXICAL, lexical);
+        set_field(a, A_MARK, Oop::int(marker));
+        for i in 0..locals {
+            set_field(a, A_LOCALS + i, Oop::int(marker * 1000 + i as i64));
+        }
+        a
+    }
+
+    /// Walk an activation's lexical chain, checking each link is the one that
+    /// made it and its locals are intact.
+    fn check_chain(top: Oop, depth: i64) {
+        let mut cur = top;
+        let mut d = depth;
+        while cur.is_obj() {
+            assert_eq!(field(cur, A_MARK).as_int(), Some(d), "the chain is out of order");
+            for i in 0..oop_words(cur) - A_LOCALS {
+                assert_eq!(
+                    field(cur, A_LOCALS + i).as_int(),
+                    Some(d * 1000 + i as i64),
+                    "activation {d} lost local {i}"
+                );
+            }
+            cur = field(cur, A_LEXICAL);
+            d -= 1;
+        }
+        assert_eq!(d, -1, "the chain ended {} links early", d + 1);
+    }
+
+    /// The chain a block captures is as deep as the recursion that built it,
+    /// so a scavenge follows it link by link. Cheney does that iteratively --
+    /// the to-space is the queue -- which is what `walk_scope` in gc.rs needed
+    /// an explicit stack and a memo table to manage.
+    #[test]
+    fn a_deep_activation_chain_survives_intact() {
+        // shorter under Miri, which interprets every load; the chain is the
+        // point, and sixty links exercise it the same way
+        let deep: i64 = if cfg!(miri) { 60 } else { 600 };
+        let h = Heap::new(1 << 14, 1 << 15);
+        let mut top = Oop::null();
+        for d in 0..deep {
+            top = activation(&h, top, d, 3);
+        }
+        check_chain(top, deep - 1);
+
+        let mut roots = Vars(vec![top]);
+        for _ in 0..4 {
+            h.scavenge(&mut roots);
+            check_chain(roots.0[0], deep - 1);
+        }
+        h.collect(&mut roots, true);
+        check_chain(roots.0[0], deep - 1);
+        assert!(h.old_live() >= deep as usize, "a tenured chain lost links");
+    }
+
+    /// What a running interpreter actually does: push a frame, do a little
+    /// work, pop it. Almost everything dies immediately and in reverse order,
+    /// which is the case generation scavenging is built for -- and the case
+    /// `test.self` makes 226,222 times.
+    #[test]
+    fn activations_churn_without_accumulating() {
+        let (rounds, deep, ret) = if cfg!(miri) { (8usize, 10usize, 9) } else { (30, 50, 45) };
+        let h = Heap::new(1 << 14, 1 << 15);
+        let mut stack: Vec<Oop> = vec![];
+        let mut captured: Vec<Oop> = vec![];
+        let mut made = 0i64;
+
+        for round in 0..rounds {
+            // recurse a little, keeping the frame stack as the root set
+            for _ in 0..deep {
+                let lex = *stack.last().unwrap_or(&Oop::null());
+                stack.push(activation(&h, lex, made, 4));
+                made += 1;
+            }
+            // a block captures one frame in ten, and outlives it
+            if round % 3 == 0 {
+                if let Some(&a) = stack.get(stack.len() / 2) {
+                    let blk = h.alloc_or_tenure(Shape::indexable(Kind::Block, 0, 1));
+                    h.store(blk, 0, a);
+                    captured.push(blk);
+                }
+            }
+            // ...and then they return
+            stack.truncate(stack.len().saturating_sub(ret));
+
+            let mut roots = Vars(stack.iter().chain(captured.iter()).copied().collect());
+            h.collect(&mut roots, round % 6 == 5);
+            let n = stack.len();
+            stack = roots.0[..n].to_vec();
+            captured = roots.0[n..].to_vec();
+
+            // every captured activation still holds the frame it closed over
+            for blk in captured.iter() {
+                let a = field(*blk, 0);
+                assert!(a.is_obj(), "a block lost the activation it captured");
+                let d = field(a, A_MARK).as_int().expect("the activation is not one");
+                for i in 0..4 {
+                    assert_eq!(
+                        field(a, A_LOCALS + i).as_int(),
+                        Some(d * 1000 + i as i64),
+                        "a captured activation was mangled"
+                    );
+                }
+            }
+        }
+
+        assert!(!captured.is_empty(), "no activation was ever captured");
+        // everything made, against at most a few hundred ever live at once: the
+        // rest must have been forgotten rather than tenured
+        assert_eq!(made as usize, rounds * deep);
+        // the frames near the bottom never return, so they do tenure -- which
+        // is what says the bound above is a real one and not a vacuous pass
+        assert!(h.old_live() > 0, "nothing survived long enough to be tenured");
+        assert!(
+            h.old_live() < 300,
+            "activations accumulated in the old generation: {} of {made}",
+            h.old_live()
+        );
     }
 
     /// Promotion must not reserve to-space it then walks away from -- the bump
