@@ -258,7 +258,13 @@ fn young_words() -> usize {
 }
 
 fn old_words() -> usize {
-    env_words("SERF_OLD_WORDS", 1 << 21)
+    // A real world is the reason this is large. Clean-4.4 with its outliner
+    // caches filled needs more than 2M words, and the old space does not grow:
+    // the heap is one allocation, and growing it would move every object in it.
+    // Reserving costs address space, not memory -- the pages are zero-filled by
+    // the OS as they are touched -- so the number to pick is "more than any
+    // world will want", not "what this one uses".
+    env_words("SERF_OLD_WORDS", 1 << 24)
 }
 
 thread_local! {
@@ -1069,7 +1075,7 @@ impl Heap {
         }
         self.old
             .alloc_words(kind, oops, slots, payload, anno)
-            .expect("old generation exhausted")
+            .expect("old generation exhausted -- raise SERF_OLD_WORDS")
     }
 
     /// A clone: the same shape, the same contents, its own identity. `_Clone`.
