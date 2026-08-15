@@ -133,14 +133,14 @@ fn hash_of(v: &Value) -> i64 {
         Value::Int(i) => *i,
         Value::Float(f) => f.to_bits() as i64,
         Value::Obj(o) => {
-            if let Payload::Bytes(b) = &o.borrow().payload {
+            if let Some(b) = o.borrow().payload.bytes() {
                 let mut h: u64 = 0xcbf29ce484222325;
-                for c in b {
+                for c in &b {
                     h = (h ^ *c as u64).wrapping_mul(0x100000001b3);
                 }
                 return (h >> 1) as i64;
             }
-            o.id() as i64
+            identity_hash(&Value::Obj(*o))
         }
     }
 }
@@ -169,7 +169,7 @@ fn lookup_path(vm: &Vm, path: &[&str]) -> Option<Value> {
     let mut cur = vm.image_roots.as_ref()?[0].clone();
     for name in path {
         let hit = vm.lookup(&cur, name).ok()?;
-        let next = hit.holder.borrow().slots[hit.idx].value.clone();
+        let next = hit.holder.borrow().slots.get(hit.idx).value;
         cur = next;
     }
     Some(cur)
@@ -178,15 +178,12 @@ fn lookup_path(vm: &Vm, path: &[&str]) -> Option<Value> {
 fn make_mirror(vm: &Vm, on: &Value) -> Result<Value, String> {
     let roots = vm.image_roots.as_ref().ok_or("_Mirror needs a loaded image")?;
     let proto = roots[mirror_proto_index(vm, on)].clone();
-    let slots = proto.as_obj().ok_or("reflectTypeError")?.borrow().slots.clone();
-    Ok(Value::obj(slots, Payload::Mirror(on.clone())))
+    let slots: Vec<Slot> = proto.as_obj().ok_or("reflectTypeError")?.borrow().slots.iter().collect();
+    Ok(Value::obj(slots, Payload::Mirror(*on)))
 }
 
 fn reflectee(v: &Value) -> Result<Value, String> {
-    match &v.as_obj().ok_or("reflectTypeError")?.borrow().payload {
-        Payload::Mirror(r) => Ok(r.clone()),
-        _ => Err("reflectTypeError".into()),
-    }
+    v.as_obj().ok_or("reflectTypeError")?.borrow().payload.mirror().ok_or("reflectTypeError".into())
 }
 
 /// A mirror's argument is a mirror on the contents, but primitives that take
@@ -199,9 +196,9 @@ fn unmirror(v: &Value) -> Value {
 /// The slot a mirror primitive means by `name`, as `Map::find_nonVM_slot`
 /// does: an assignment name (`x:`) names the data slot it writes. Answers the
 /// slot's index and whether it was reached by its assignment name.
-fn slot_desc(slots: &[Slot], n: &str) -> Result<(usize, bool), String> {
+fn slot_desc(slots: &SlotsRef, n: &str) -> Result<(usize, bool), String> {
     let i = slots.iter().position(|s| sym_str(s.name) == n).ok_or("slotNameError")?;
-    if slots[i].kind != SlotKind::Assign {
+    if slots.get(i).kind != SlotKind::Assign {
         return Ok((i, false));
     }
     let base = &n[..n.len() - 1];
@@ -212,68 +209,60 @@ fn slot_desc(slots: &[Slot], n: &str) -> Result<(usize, bool), String> {
     Ok((j, true))
 }
 
-fn clone_payload(p: &Payload) -> Payload {
-    match p {
-        Payload::None => Payload::None,
-        Payload::Bytes(b) => Payload::Bytes(b.clone()),
-        Payload::Vector(x) => Payload::Vector(x.clone()),
-        Payload::Method(m) => Payload::Method(m.clone()),
-        Payload::Block(m, s) => Payload::Block(m.clone(), s.clone()),
-        Payload::Mirror(r) => Payload::Mirror(r.clone()),
-        Payload::Proxy(p) => Payload::Proxy(*p),
-    }
-}
-
 /// The pointer of a *live* proxy. A dead one, or a non-proxy, answers None.
 fn proxy_ptr(v: &Value) -> Option<u64> {
-    match &v.as_obj()?.borrow().payload {
-        Payload::Proxy(p) => *p,
-        _ => None,
-    }
+    v.as_obj()?.borrow().payload.proxy()
 }
 
 /// Self keeps an object's identity hash in its mark word, so it survives a
 /// snapshot; an object loaded from one must keep the hash it had, or every
-/// hashed collection in the image loses track of its own keys. Objects made
-/// since then get one from their address, in the same 22 bits.
-pub fn identity_hash(vm: &Vm, v: &Value) -> i64 {
+/// hashed collection in the image loses track of its own keys.
+///
+/// serf keeps it there too now. It cannot be derived from the address any
+/// more -- the address moves, and a hashed collection would lose its keys at
+/// the first collection -- so an object without one is given one on demand and
+/// keeps it for life. Zero means "not yet asked".
+pub fn identity_hash(v: &Value) -> i64 {
     match v {
-        Value::Obj(o) => match vm.id_hash.get(&o.id()) {
-            Some(h) => *h,
-            None => o.id() as i64 & 0x3f_ffff,
-        },
+        Value::Obj(o) => {
+            let h = crate::heap::hash(*o);
+            if h != 0 {
+                return h as i64;
+            }
+            // from the address it happens to have now, which is as good a
+            // source of distinct numbers as any -- it just must not be
+            // consulted twice
+            let mut n = ((o.id() >> 3) as u32) & 0x3f_ffff;
+            if n == 0 {
+                n = 1;
+            }
+            crate::heap::set_hash(*o, n);
+            n as i64
+        }
         _ => hash_of(v),
-    }
-}
-
-fn key_of(v: &Value) -> usize {
-    match v {
-        Value::Obj(o) => o.id(),
-        _ => 0,
     }
 }
 
 fn set_result(vm: &Vm, vec: &Value, items: &[Value]) -> Result<(), String> {
     let o = vec.as_obj().ok_or("TWAINS result must be a vector")?;
-    let mut b = o.borrow_mut();
-    match &mut b.payload {
-        Payload::Vector(x) => {
-            for (i, it) in items.iter().enumerate() {
-                if i < x.len() {
-                    x[i] = it.clone();
-                }
-            }
-            let _ = vm;
-            Ok(())
-        }
-        _ => Err("TWAINS result must be a vector".into()),
+    let p = o.borrow_mut().payload;
+    if p.kind() != PayKind::Vector {
+        return Err("TWAINS result must be a vector".into());
     }
+    for (i, it) in items.iter().enumerate() {
+        if i < p.vector_len() {
+            p.set_element(i, *it);
+        }
+    }
+    let _ = vm;
+    Ok(())
 }
 
 fn indexable_len(v: &Value, who: &str) -> Result<usize, String> {
-    match &as_obj(v, who)?.borrow().payload {
-        Payload::Bytes(b) => Ok(b.len()),
-        Payload::Vector(x) => Ok(x.len()),
+    let p = as_obj(v, who)?.borrow().payload;
+    match p.kind() {
+        PayKind::Bytes => Ok(p.byte_len()),
+        PayKind::Vector => Ok(p.vector_len()),
         _ => Err("badTypeError".into()),
     }
 }
@@ -285,16 +274,19 @@ fn mirror_proto_index(vm: &Vm, v: &Value) -> usize {
         Value::Float(_) => 25, // floatMirrorObj
         Value::Obj(o) => {
             let b = o.borrow();
-            match &b.payload {
-                Payload::Bytes(_) => {
+            match b.payload.kind() {
+                PayKind::Bytes => {
                     if b.slots.iter().any(|s| s.kind == SlotKind::Parent && s.value.id_eq(&vm.t_string)) { 29 } else { 22 }
                 }
-                Payload::Vector(_) => 26,
-                Payload::Method(m) => if m.is_block { 24 } else { 23 },
-                Payload::Block(..) => 21,
-                Payload::Mirror(_) => 36,
-                Payload::Proxy(_) => 33, // proxyMirrorObj
-                Payload::None => 27, // slotsMirrorObj
+                PayKind::Vector => 26,
+                PayKind::Method => {
+                    if b.payload.method().is_some_and(|m| m.is_block) { 24 } else { 23 }
+                }
+                PayKind::Block => 21,
+                PayKind::Mirror => 36,
+                PayKind::Proxy => 33, // proxyMirrorObj
+                // an activation or a boxed float has no mirror of its own
+                _ => 27, // slotsMirrorObj
             }
         }
     }
@@ -413,25 +405,15 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_Ceiling" => v(Value::Float(as_f(recv, name)?.ceil())),
         "_Truncate" => v(Value::Float(as_f(recv, name)?.trunc())),
         "_Hash" => v(Value::Int(hash_of(recv))),
-        "_IdentityHash" | "_ObjectID" => v(Value::Int(identity_hash(vm, recv))),
+        "_IdentityHash" | "_ObjectID" => v(Value::Int(identity_hash(recv))),
 
         // -------------------------------------------------------- identity
         "_Eq:" => v(vm.boolean(recv.id_eq(&args[0]))),
 
         // --------------------------------------------------------- cloning
-        "_Clone" => {
-            let o = as_obj(recv, name)?.borrow();
-            let payload = match &o.payload {
-                Payload::None => Payload::None,
-                Payload::Bytes(b) => Payload::Bytes(b.clone()),
-                Payload::Vector(x) => Payload::Vector(x.clone()),
-                Payload::Method(m) => Payload::Method(m.clone()),
-                Payload::Block(m, s) => Payload::Block(m.clone(), s.clone()),
-                Payload::Mirror(r) => Payload::Mirror(r.clone()),
-                Payload::Proxy(p) => Payload::Proxy(*p),
-            };
-            v(Value::obj(o.slots.clone(), payload))
-        }
+        // one memcpy of the same shape, and a fresh identity: the clone must
+        // not inherit its prototype's hash
+        "_Clone" => v(Value::Obj(crate::obj::clone_of(as_obj(recv, name)?))),
         // Resize a clone. As objVectorMap::cloneSize does, the existing
         // elements are kept and only the new ones get the filler -- filling
         // the whole thing would quietly empty every copy in the system.
@@ -441,17 +423,18 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 return Err("badSizeError".into());
             }
             let n = n as usize;
-            let o = as_obj(recv, name)?.borrow();
-            let payload = match &o.payload {
-                Payload::Bytes(b) => {
+            let at = as_obj(recv, name)?;
+            let slots: Vec<Slot> = at.borrow().slots.iter().collect();
+            let payload = match at.borrow().payload.kind() {
+                PayKind::Bytes => {
                     let f = as_i(&args[1], name).unwrap_or(0) as u8;
-                    let mut z = b.clone();
+                    let mut z = at.borrow().payload.bytes().unwrap();
                     z.resize(n, f);
                     Payload::Bytes(z)
                 }
-                Payload::Vector(x) => {
-                    let mut z = x.clone();
-                    z.resize(n, args[1].clone());
+                PayKind::Vector => {
+                    let mut z = at.borrow().payload.vector().unwrap();
+                    z.resize(n, args[1]);
                     Payload::Vector(z)
                 }
                 // a byte clone of a plain object starts empty
@@ -460,7 +443,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 }
                 _ => return Err("badTypeError".into()),
             };
-            v(Value::obj(o.slots.clone(), payload))
+            v(Value::obj(slots, payload))
         }
 
         // ------------------------------------------------------------ memory
@@ -470,20 +453,23 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         // roots are all reachable is between two bytecodes.
         // ponytail: _Tenure is a scavenge here, not "promote everything".
         "_Scavenge" | "_Tenure" => {
-            crate::gc::gc().request(false);
+            crate::gc::request(false);
             v(*recv)
         }
         "_GarbageCollect" => {
-            crate::gc::gc().request(true);
+            crate::gc::request(true);
             v(*recv)
         }
 
         // ------------------------------------------------------ indexables
-        "_ByteSize" => v(Value::Int(match &as_obj(recv, name)?.borrow().payload {
-            Payload::Bytes(b) => b.len() as i64,
-            Payload::Vector(x) => (x.len() * 4) as i64,
-            _ => return Err("badTypeError".into()),
-        })),
+        "_ByteSize" => {
+            let p = as_obj(recv, name)?.borrow().payload;
+            v(Value::Int(match p.kind() {
+                PayKind::Bytes => p.byte_len() as i64,
+                PayKind::Vector => (p.vector_len() * 4) as i64,
+                _ => return Err("badTypeError".into()),
+            }))
+        }
         "_ByteAt:" => call(vm, "_At:", recv, args),
         "_ByteAt:Put:" => call(vm, "_At:Put:", recv, args),
         "_ByteVectorConcatenate:Prototype:" => {
@@ -491,7 +477,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let b = args[0].bytes().ok_or("_ByteVectorConcatenate: argument is not a byte vector")?;
             let mut z = a;
             z.extend_from_slice(&b);
-            let slots = as_obj(&args[1], name)?.borrow().slots.clone();
+            let slots: Vec<Slot> = as_obj(&args[1], name)?.borrow().slots.iter().collect();
             v(Value::obj(slots, Payload::Bytes(z)))
         }
         // `string hash = canonicalize identityHash`, so this has to answer the
@@ -515,7 +501,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_ForeignIsLive" => v(vm.boolean(proxy_ptr(recv).is_some())),
         "_ForeignKill" => {
             if let Some(o) = recv.as_obj() {
-                o.borrow_mut().payload = Payload::Proxy(None);
+                o.borrow_mut().payload.kill_proxy();
             }
             v(recv.clone())
         }
@@ -526,7 +512,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_TypeSealResultProxy:" | "_TypeSeal:ResultProxy:" => {
             let p = proxy_ptr(recv);
             let t = args[args.len() - 1].clone();
-            as_obj(&t, name)?.borrow_mut().payload = Payload::Proxy(p);
+            as_obj(&t, name)?.borrow_mut().payload.set_proxy(p);
             v(t)
         }
         "_Sleep:" => {
@@ -534,10 +520,13 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             std::thread::sleep(std::time::Duration::from_millis(ms));
             v(recv.clone())
         }
-        "_ProxyIsNull" => match &as_obj(recv, name)?.borrow().payload {
-            Payload::Proxy(p) => v(vm.boolean(p.unwrap_or(0) == 0)),
-            _ => Err("badTypeError".into()),
-        },
+        "_ProxyIsNull" => {
+            let p = as_obj(recv, name)?.borrow().payload;
+            match p.kind() {
+                PayKind::Proxy => v(vm.boolean(p.proxy().unwrap_or(0) == 0)),
+                _ => Err("badTypeError".into()),
+            }
+        }
 
         // --------------------------------------------------------- mirrors
         "_Mirror" => v(make_mirror(vm, recv)?),
@@ -567,10 +556,10 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let (i, by_assignment) = slot_desc(&b.slots, &n)?;
             let yes = !by_assignment
                 && match name {
-                    "_MirrorIsParentAt:" => b.slots[i].kind == SlotKind::Parent,
+                    "_MirrorIsParentAt:" => b.slots.get(i).kind == SlotKind::Parent,
                     // assignable == there is an `x:` to write it with
                     "_MirrorIsAssignableAt:" => {
-                        let a = format!("{}:", b.slots[i].name);
+                        let a = format!("{}:", b.slots.get(i).name);
                         b.slots.iter().any(|s| s.kind == SlotKind::Assign && sym_str(s.name) == a)
                     }
                     // serf drops argument slots when it loads a method: they
@@ -583,26 +572,16 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_MirrorAnnotationAt:" => {
             let r = reflectee(recv)?;
             let n = as_name(&args[0], name)?;
-            let slot = {
-                let o = as_obj(&r, name)?;
-                let b = o.borrow();
-                let (i, _) = slot_desc(&b.slots, &n)?;
-                b.slots[i].name.to_string()
-            };
+            let at = as_obj(&r, name)?;
+            let (i, _) = slot_desc(&at.borrow().slots, &n)?;
             // Map::get_annotation defaults to the world's empty annotation,
             // never nil: `annotationIfFail:` parses whatever comes back.
-            let dflt = vm.image_roots.as_ref().map(|g| g[17].clone());
-            v(vm
-                .anno_slot
-                .get(&key_of(&r))
-                .and_then(|m| m.get(&sym(&slot)))
-                .cloned()
-                .or(dflt)
-                .unwrap_or_else(|| vm.nil_v()))
+            let dflt = vm.image_roots.as_ref().map(|g| g[17]);
+            v(crate::value::slot_anno(at, i).or(dflt).unwrap_or_else(|| vm.nil_v()))
         }
         // mirror.self: "the hash of a mirror is the identity hash of its
         // reflectee", so it has to be the same answer _IdentityHash gives
-        "_MirrorReflecteeIdentityHash" => v(Value::Int(identity_hash(vm, &reflectee(recv)?))),
+        "_MirrorReflecteeIdentityHash" => v(Value::Int(identity_hash(&reflectee(recv)?))),
         // A mirror on a *method* answers its source and its bytecodes
         // (methodMap::mirror_source and friends); a block method's source is
         // its enclosing method's, sliced by offset and length. This is what an
@@ -611,11 +590,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_MirrorSource" | "_MirrorSourceOffset" | "_MirrorSourceLength" | "_MirrorCodes"
         | "_MirrorLiterals" => {
             let r = reflectee(recv)?;
-            let m = match &as_obj(&r, name)?.borrow().payload {
-                Payload::Method(m) => m.clone(),
-                _ => return Err("reflectTypeError".into()),
-            };
-            let src = m.source.as_ref();
+            let m = as_obj(&r, name)?.borrow().payload.method().ok_or("reflectTypeError")?;
+            let src = m.source.get();
+            let src = src.as_ref();
             v(match name {
                 // codes are a *string*, not a byteVector: methodMap::fix_up_method
                 // ends with setCodes(new_string(...)), and the world counts on it
@@ -624,7 +601,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 "_MirrorCodes" => vm.bytes_with(vm.t_string.clone(), m.code.clone()),
                 // the sub-blocks of a method live in its literals, which is
                 // how anything walking a method reaches them
-                "_MirrorLiterals" => vm.vector(m.lits.clone()),
+                "_MirrorLiterals" => vm.vector(m.lits.borrow().clone()),
                 "_MirrorSource" => src.map_or_else(|| vm.string(""), |(s, _, _)| s.clone()),
                 "_MirrorSourceOffset" => Value::Int(src.map_or(0, |&(_, o, _)| o)),
                 _ => Value::Int(src.map_or(0, |&(_, _, l)| l)),
@@ -633,21 +610,20 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_MirrorCopyRemoveSlot:" => {
             let r = reflectee(recv)?;
             let n = as_name(&args[0], name)?;
-            let (slots, payload) = {
-                let o = as_obj(&r, name)?.borrow();
-                (o.slots.clone(), clone_payload(&o.payload))
-            };
-            let (i, _) = slot_desc(&slots, &n)?;
+            let at = as_obj(&r, name)?;
+            let (i, _) = slot_desc(&at.borrow().slots, &n)?;
             // an obj slot and the `x:` that writes it are one slot to Self
-            let base = slots[i].name.to_string();
+            let base = at.borrow().slots.get(i).name.to_string();
             let assign = format!("{}:", base);
-            let kept: Slots = slots
+            let kept: Vec<Slot> = at
+                .borrow()
+                .slots
                 .iter()
-                .copied()
                 .filter(|s| sym_str(s.name) != base && sym_str(s.name) != assign)
                 .collect();
-            let copy = Value::obj(kept, payload);
-            let mslots = as_obj(recv, name)?.borrow().slots.clone();
+            // the copy keeps the payload; `reshape` is what carries it across
+            let copy = Value::Obj(crate::obj::reshape(at, &kept));
+            let mslots: Vec<Slot> = as_obj(recv, name)?.borrow().slots.iter().collect();
             v(Value::obj(mslots, Payload::Mirror(copy)))
         }
         "_MirrorContentsAt:" => {
@@ -663,7 +639,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 let roots = vm.image_roots.as_ref().ok_or("reflectTypeError")?;
                 return v(roots[20].clone()); // assignmentMirrorObj
             }
-            let got = as_obj(&r, name)?.borrow().slots[i].value.clone();
+            let got = as_obj(&r, name)?.borrow().slots.get(i).value;
             // "Return a mirror on the contents of the specified slot"
             // (prim.cpp:1401), not the contents themselves
             v(make_mirror(vm, &got)?)
@@ -685,16 +661,15 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_MirrorDefine:" => {
             let r = reflectee(recv)?;
             let src = reflectee(&args[0]).unwrap_or_else(|_| args[0].clone());
-            let (slots, payload) = {
-                let o = as_obj(&src, name)?.borrow();
-                (o.slots.clone(), clone_payload(&o.payload))
-            };
-            {
-                let d = as_obj(&r, name)?;
-                let mut b = d.borrow_mut();
-                b.slots = slots;
-                b.payload = payload;
-            }
+            // "the reflectee keeps its identity and takes on the new slots" --
+            // which with direct pointers means building the new object and
+            // making the world stop naming the old one. That is
+            // `switch_pointers`, and it is what `define_prim` does in the C++
+            // VM for the same reason (memory/universe.cpp:315).
+            let dest = as_obj(&r, name)?;
+            let copy = crate::obj::clone_of(as_obj(&src, name)?);
+            crate::heap::set_hash(copy, crate::heap::hash(dest));
+            vm.switch(dest, copy);
             crate::value::lookup_gen_bump();
             // A successful define is the world's one programming change, so it
             // is the only thing that moves the timestamp -- `define_prim` holds
@@ -717,14 +692,14 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         }
         "_MirrorAnnotation" => {
             let r = reflectee(recv)?;
-            let dflt = vm.image_roots.as_ref().map(|g| g[18].clone());
-            v(vm.anno_obj.get(&key_of(&r)).cloned().or(dflt).unwrap_or_else(|| vm.nil_v()))
+            let dflt = vm.image_roots.as_ref().map(|g| g[18]);
+            let a = r.as_obj().and_then(crate::value::obj_anno);
+            v(a.or(dflt).unwrap_or_else(|| vm.nil_v()))
         }
         "_MirrorCopyAnnotation:" => {
             let r = reflectee(recv)?;
-            vm.anno_obj.insert(key_of(&r), args[0].clone());
-            vm.note_anno(&args[0]);
-            v(recv.clone())
+            vm.set_obj_anno(r, args[0]);
+            v(*recv)
         }
         // add or replace a slot on a copy of the reflectee, answering a
         // mirror on that copy
@@ -734,11 +709,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let parent = args.get(2).map_or(false, |b| b.id_eq(&vm.boolean(true)));
             // the contents come as a mirror on them, not as themselves
             let contents = unmirror(&args[1]);
-            let (slots, payload) = {
-                let o = as_obj(&r, name)?.borrow();
-                (o.slots.clone(), clone_payload(&o.payload))
-            };
-            let copy = Value::obj(slots, payload);
+            let copy = Value::Obj(crate::obj::clone_of(as_obj(&r, name)?));
             // storing the assignment object is how Self says "make this slot
             // assignable" (slotsMap::copy_add_slot)
             let assignment = vm.image_roots.as_ref().map_or(false, |g| contents.id_eq(&g[5]));
@@ -747,16 +718,24 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 (_, true) => SlotKind::Parent,
                 _ => SlotKind::Data,
             };
-            copy.as_obj().unwrap().borrow_mut().put(Slot {
-                name: n.as_str().into(),
-                kind,
-                value: if assignment { vm.nil_v() } else { contents },
-            });
+            // the copy widens, so it moves: `put_slot` answers where it went
+            let copy = vm.put_slot(
+                copy,
+                Slot {
+                    name: n.as_str().into(),
+                    kind,
+                    value: if assignment { vm.nil_v() } else { contents },
+                },
+            );
+            let mut copy = copy;
             if let Some(a) = args.get(4) {
-                vm.anno_slot.entry(key_of(&copy)).or_default().insert(sym(&n), a.clone());
-                vm.note_anno(a);
+                let i = copy.as_obj().and_then(|c| c.borrow().find(&n));
+                if let Some(i) = i {
+                    // widening for the annotation moves the object again
+                    copy = vm.set_slot_anno(copy, i, *a);
+                }
             }
-            let mslots = as_obj(recv, name)?.borrow().slots.clone();
+            let mslots: Vec<Slot> = as_obj(recv, name)?.borrow().slots.iter().collect();
             v(Value::obj(mslots, Payload::Mirror(copy)))
         }
 
@@ -788,11 +767,10 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             }
         }
         "_AbortProcess" => {
-            let k = key_of(recv);
-            vm.procs.remove(&k);
+            vm.take_proc(recv);
             // aborting the process we are running unwinds it; the TWAINS
             // wrapper reports that to the scheduler as 'aborted'
-            if vm.current_proc.as_ref().map_or(false, |p| key_of(p) == k) {
+            if vm.current_proc.as_ref().is_some_and(|p| p.id_eq(recv)) {
                 return Err("processAborted".into());
             }
             v(recv.clone())
@@ -809,16 +787,17 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
 
         "_NewProcessSize:Receiver:Selector:Arguments:" => {
             let sel = as_name(&args[2], name)?;
-            let a = match &as_obj(&args[3], name)?.borrow().payload {
-                Payload::Vector(x) => x.clone(),
-                _ => return Err("_NewProcessSize: Arguments: must be a vector".into()),
-            };
+            let a = as_obj(&args[3], name)?
+                .borrow()
+                .payload
+                .vector()
+                .ok_or("_NewProcessSize: Arguments: must be a vector")?;
             // shaped like the image's process prototype so the world's
             // process protocol finds its slots
-            let proto = vm.image_roots.as_ref().map(|r| r[10].clone());
-            let slots = match &proto {
-                Some(p) => as_obj(p, name)?.borrow().slots.clone(),
-                None => Slots::default(),
+            let proto = vm.image_roots.as_ref().map(|r| r[10]);
+            let slots: Vec<Slot> = match &proto {
+                Some(p) => as_obj(p, name)?.borrow().slots.iter().collect(),
+                None => vec![],
             };
             let obj = Value::obj(slots, Payload::None);
             // A process starts newborn. Cloning the prototype carries over
@@ -833,14 +812,13 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 }
             }
             let stack = crate::interp::stack_for_send(vm, args[1].clone(), &sel, a);
-            vm.procs.insert(key_of(&obj), stack);
+            vm.put_proc(obj, stack);
             v(obj)
         }
 
         "_TWAINSResultVector:SingleStep:StopAt:" => {
             vm.scheduler_running = true;
-            let k = key_of(recv);
-            let mut stack = match vm.procs.remove(&k) {
+            let mut stack = match vm.take_proc(recv) {
                 Some(s) => s,
                 // TWAINS on the process you are already in means "wait for the
                 // next signal" (processOopClass::TWAINS_await_signal), which is
@@ -876,7 +854,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let cause = match outcome {
                 Ok(crate::interp::Outcome::Yielded { rcvr, arg }) => {
                     set_result(vm, &args[0], &[rcvr, arg])?;
-                    vm.procs.insert(k, stack);
+                    vm.put_proc(*recv, stack);
                     "yielded"
                 }
                 Ok(crate::interp::Outcome::Done(r)) => {
@@ -1013,9 +991,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             if i < 0 || i as usize >= n {
                 return Err("badIndexError".into());
             }
-            match &o.payload {
-                Payload::Bytes(b) => v(Value::Int(b[i as usize] as i64)),
-                Payload::Vector(x) => v(x[i as usize].clone()),
+            match o.payload.kind() {
+                PayKind::Bytes => v(Value::Int(o.payload.byte_at(i as usize) as i64)),
+                PayKind::Vector => v(o.payload.element(i as usize)),
                 _ => unreachable!(),
             }
         }
@@ -1025,14 +1003,13 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             if i < 0 || i as usize >= n {
                 return Err("badIndexError".into());
             }
-            let mut o = as_obj(recv, name)?.borrow_mut();
-            match &mut o.payload {
-                Payload::Bytes(b) => b[i as usize] = as_i(&args[1], name)? as u8,
-                Payload::Vector(x) => x[i as usize] = args[1].clone(),
+            let o = as_obj(recv, name)?.borrow_mut();
+            match o.payload.kind() {
+                PayKind::Bytes => o.payload.set_byte_at(i as usize, as_i(&args[1], name)? as u8),
+                PayKind::Vector => o.payload.set_element(i as usize, args[1]),
                 _ => unreachable!(),
             }
-            drop(o);
-            v(recv.clone())
+            v(*recv)
         }
         // block copy, the workhorse behind copyFrom:UpTo: and friends
         "_CopyByteRangeDstPos:Src:SrcPos:Length:" | "_CopyRangeDstPos:Src:SrcPos:Length:" => {
@@ -1043,57 +1020,59 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 return Err("badIndexError".into());
             }
             let (dp, sp, n) = (dst_pos as usize, src_pos as usize, len as usize);
-            let src = args[1].clone();
-            let d = as_obj(recv, name)?;
-            let same = src.as_obj().map_or(false, |s| s == d);
-            let taken = if same { None } else { Some(as_obj(&src, name)?.borrow()) };
-            let mut db = d.borrow_mut();
-            let ok = match (&mut db.payload, taken.as_ref().map(|b| &b.payload)) {
-                (Payload::Bytes(x), Some(Payload::Bytes(y))) => {
-                    if dp + n > x.len() || sp + n > y.len() { false } else {
-                        x[dp..dp + n].copy_from_slice(&y[sp..sp + n]); true
-                    }
-                }
-                (Payload::Vector(x), Some(Payload::Vector(y))) => {
-                    if dp + n > x.len() || sp + n > y.len() { false } else {
-                        for k in 0..n { x[dp + k] = y[sp + k].clone(); }
+            let src = args[1];
+            let d = as_obj(recv, name)?.borrow_mut().payload;
+            let s = as_obj(&src, name)?.borrow().payload;
+            // read the source out first, so a copy overlapping itself moves
+            // the bytes it started with rather than the ones it just wrote
+            let ok = match (d.kind(), s.kind()) {
+                (PayKind::Bytes, PayKind::Bytes) => {
+                    if dp + n > d.byte_len() || sp + n > s.byte_len() {
+                        false
+                    } else {
+                        let t: Vec<u8> = (0..n).map(|k| s.byte_at(sp + k)).collect();
+                        for (k, b) in t.into_iter().enumerate() {
+                            d.set_byte_at(dp + k, b);
+                        }
                         true
                     }
                 }
-                (Payload::Bytes(x), None) => {
-                    if dp + n > x.len() || sp + n > x.len() { false } else {
-                        x.copy_within(sp..sp + n, dp); true
-                    }
-                }
-                (Payload::Vector(x), None) => {
-                    if dp + n > x.len() || sp + n > x.len() { false } else {
-                        let t: Vec<Value> = x[sp..sp + n].to_vec();
-                        x[dp..dp + n].clone_from_slice(&t); true
+                (PayKind::Vector, PayKind::Vector) => {
+                    if dp + n > d.vector_len() || sp + n > s.vector_len() {
+                        false
+                    } else {
+                        let t: Vec<Value> = (0..n).map(|k| s.element(sp + k)).collect();
+                        for (k, x) in t.into_iter().enumerate() {
+                            d.set_element(dp + k, x);
+                        }
+                        true
                     }
                 }
                 _ => return Err("badTypeError".into()),
             };
-            drop(db);
-            if !ok { return Err("badIndexError".into()) }
-            v(recv.clone())
+            if !ok {
+                return Err("badIndexError".into());
+            }
+            v(*recv)
         }
         "_Concatenate:" => {
             let a = as_obj(recv, name)?.borrow();
             let b = as_obj(&args[0], name)?.borrow();
-            let payload = match (&a.payload, &b.payload) {
-                (Payload::Bytes(x), Payload::Bytes(y)) => {
-                    let mut z = x.clone();
-                    z.extend_from_slice(y);
+            let payload = match (a.payload.kind(), b.payload.kind()) {
+                (PayKind::Bytes, PayKind::Bytes) => {
+                    let mut z = a.payload.bytes().unwrap();
+                    z.extend_from_slice(&b.payload.bytes().unwrap());
                     Payload::Bytes(z)
                 }
-                (Payload::Vector(x), Payload::Vector(y)) => {
-                    let mut z = x.clone();
-                    z.extend(y.iter().cloned());
+                (PayKind::Vector, PayKind::Vector) => {
+                    let mut z = a.payload.vector().unwrap();
+                    z.extend(b.payload.vector().unwrap());
                     Payload::Vector(z)
                 }
                 _ => return Err("badTypeError".into()),
             };
-            v(Value::obj(a.slots.clone(), payload))
+            let slots: Vec<Slot> = a.slots.iter().collect();
+            v(Value::obj(slots, payload))
         }
         "_ByteVectorCompare:" => {
             let a = recv.bytes().ok_or("_ByteVectorCompare: receiver is not a byte vector")?;
@@ -1106,31 +1085,24 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         }
 
         // ------------------------------------------------------ reflection
+        // Adding a slot widens the object, and an object is a fixed run of
+        // words -- so each one builds a new object and switches every pointer
+        // in the heap and every root to it. `put_slot` answers where the
+        // object went, because a `Value` in a Rust local is neither.
         "_AddSlots:" => {
-            let src = as_obj(&args[0], name)?.borrow().slots.clone();
-            let dst = as_obj(recv, name)?;
-            for s in src.iter().copied() {
-                dst.borrow_mut().put(s);
+            let src: Vec<Slot> = as_obj(&args[0], name)?.borrow().slots.iter().collect();
+            let mut dst = *recv;
+            for s in src {
+                dst = vm.put_slot(dst, s);
             }
-            v(recv.clone())
+            v(dst)
         }
         "_RemoveSlot:" => {
             let n = as_name(&args[0], name)?;
-            let with_colon = format!("{}:", n);
-            let o = as_obj(recv, name)?;
-            let before = o.borrow().slots.len();
-            crate::value::lookup_gen_bump();
-            {
-                // removing a slot changes the shape, and this is the one place
-                // that touches an object's slots without going through `put`
-                let mut b = o.borrow_mut();
-                b.forget_map();
-                b.slots.retain(|s| sym_str(s.name) != n && sym_str(s.name) != with_colon);
+            match vm.remove_slot(*recv, &n) {
+                Some(narrow) => v(narrow),
+                None => Err("slotNameError".into()),
             }
-            if o.borrow().slots.len() == before {
-                return Err("slotNameError".into());
-            }
-            v(recv.clone())
         }
         "_SlotNames" => {
             let names: Vec<Value> = match recv.as_obj() {
@@ -1147,7 +1119,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let n = as_name(&args[0], name)?;
             let o = as_obj(recv, name)?.borrow();
             match o.find(&n) {
-                Some(i) => v(o.slots[i].value.clone()),
+                Some(i) => v(o.slots.get(i).value),
                 None => Err("slotNameError".into()),
             }
         }
@@ -1165,7 +1137,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let n = as_name(&args[0], name)?;
             let o = as_obj(recv, name)?.borrow();
             match o.find(&n) {
-                Some(i) => v(vm.boolean(o.slots[i].kind == SlotKind::Parent)),
+                Some(i) => v(vm.boolean(o.slots.get(i).kind == SlotKind::Parent)),
                 None => Err("slotNameError".into()),
             }
         }
@@ -1198,9 +1170,11 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                     // prototype's 'the prototypical syntax error'
                     let msg = vm.string(&m);
                     if let Some(o) = args[1].as_obj() {
-                        let mut b = o.borrow_mut();
+                        let b = o.borrow_mut();
                         if let Some(i) = b.find("message") {
-                            b.slots[i].value = msg;
+                            // `slots.get` answers a `Slot` by value -- there is
+                            // no `&Slot` to write through in a heap that moves
+                            b.assign(i, msg);
                         }
                     }
                     Err("primitiveFailedError".into())
@@ -1276,7 +1250,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
     {
         let target = if prim.ends_with("ResultProxy:") { args.last() } else { Some(recv) };
         if let Some(t) = target.filter(|t| t.as_obj().is_some()) {
-            t.as_obj().unwrap().borrow_mut().payload = Payload::Proxy(Some(0));
+            t.as_obj().unwrap().borrow_mut().payload.set_proxy(Some(0));
             return Ok(P::Val(t.clone()));
         }
         return Ok(P::Val(Value::obj([], Payload::Proxy(Some(0)))));
@@ -1285,7 +1259,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
         .split_once("_delete")
         .is_some_and(|(_, sel)| sel == "delete" || sel == "basicDelete")
     {
-        as_obj(recv, name)?.borrow_mut().payload = Payload::Proxy(None);
+        as_obj(recv, name)?.borrow_mut().payload.set_proxy(None);
         return Ok(P::Val(recv.clone()));
     }
     if let Some(e) = crate::struct_table::ALLOC.iter().find(|e| prim.starts_with(e.0)) {
@@ -1302,7 +1276,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
         };
         return match target {
             Some(t) => {
-                t.as_obj().unwrap().borrow_mut().payload = Payload::Proxy(Some(p));
+                t.as_obj().unwrap().borrow_mut().payload.set_proxy(Some(p));
                 Ok(P::Val(t))
             }
             None => Ok(P::Val(Value::obj([], Payload::Proxy(Some(p))))),
@@ -1337,7 +1311,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
                     let t = args.last().cloned().filter(|t| t.as_obj().is_some());
                     match t {
                         Some(t) => {
-                            t.as_obj().unwrap().borrow_mut().payload = Payload::Proxy(Some(raw));
+                            t.as_obj().unwrap().borrow_mut().payload.set_proxy(Some(raw));
                             Ok(P::Val(t))
                         }
                         None => Ok(P::Val(Value::obj([], Payload::Proxy(Some(raw))))),
@@ -1475,9 +1449,11 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
     }
     for (v, i) in back {
         if let Some(o) = v.as_obj() {
-            if let Payload::Bytes(b) = &mut o.borrow_mut().payload {
-                let n = b.len();
-                b.copy_from_slice(&keep[i][..n]);
+            let p = o.borrow_mut().payload;
+            if p.kind() == PayKind::Bytes {
+                for k in 0..p.byte_len() {
+                    p.set_byte_at(k, keep[i][k]);
+                }
             }
         }
     }
@@ -1511,7 +1487,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
             }
             match result_proxy {
                 Some(t) => {
-                    as_obj(&t, name)?.borrow_mut().payload = Payload::Proxy(Some(r));
+                    as_obj(&t, name)?.borrow_mut().payload.set_proxy(Some(r));
                     v_of(t)
                 }
                 None => v_of(Value::obj([], Payload::Proxy(Some(r)))),
@@ -1579,19 +1555,24 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
         let f = vm.ffi.sym("XLookupString").ok_or("primitiveNotDefinedError")?;
         let mut ks: u64 = 0;
         let n = {
-            let mut b = o.borrow_mut();
-            let buf = match &mut b.payload {
-                Payload::Bytes(x) => x,
-                _ => return Err("badTypeError".into()),
-            };
-            let (p, len) = (buf.as_mut_ptr() as u64, buf.len() as u64);
-            crate::ffi::Ffi::call(f, &[evt, p, len, &mut ks as *mut u64 as u64, 0])?
+            // the arena is ours, not C's: hand the call a Rust buffer and
+            // copy the answer back, which is what the byte accessors are for
+            let p = o.borrow_mut().payload;
+            if p.kind() != PayKind::Bytes {
+                return Err("badTypeError".into());
+            }
+            let mut buf = p.bytes().unwrap();
+            let (ptr, len) = (buf.as_mut_ptr() as u64, buf.len() as u64);
+            let n = crate::ffi::Ffi::call(f, &[evt, ptr, len, &mut ks as *mut u64 as u64, 0])?;
+            for (k, b) in buf.iter().enumerate() {
+                p.set_byte_at(k, *b);
+            }
+            n
         };
         if let Some(o) = args[1].as_obj() {
-            if let Payload::Vector(x) = &mut o.borrow_mut().payload {
-                if let Some(first) = x.first_mut() {
-                    *first = Value::Int(ks as i64);
-                }
+            let p = o.borrow_mut().payload;
+            if p.kind() == PayKind::Vector && p.vector_len() > 0 {
+                p.set_element(0, Value::Int(ks as i64));
             }
         }
         return Ok(Some(P::Val(Value::Int(n as i32 as i64))));
@@ -1614,9 +1595,10 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
     // need the Self objects rather than converted words.
     if matches!(cname, "XFillPolygon_wrap" | "XDrawLines_wrap" | "XDrawString16_wrap") {
         let ints = |v: &Value| -> Result<Vec<i64>, String> {
-            match &v.as_obj().ok_or("badTypeError")?.borrow().payload {
-                Payload::Vector(x) => x.iter().map(|e| as_i(e, "wrap")).collect(),
-                _ => Err("badTypeError".into()),
+            let p = v.as_obj().ok_or("badTypeError")?.borrow().payload;
+            match p.vector() {
+                Some(x) => x.iter().map(|e| as_i(e, "wrap")).collect(),
+                None => Err("badTypeError".into()),
             }
         };
         let dpy = proxy_ptr(recv).ok_or("deadProxyError")?;
@@ -1667,31 +1649,30 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
         let put = cname == "XImagePutData_wrap";
         let f = unsafe { *((img + if put { F_PUT_PIXEL } else { F_GET_PIXEL }) as *const u64) };
         let map: Vec<i64> = if put {
-            match &args[1].as_obj().ok_or("badTypeError")?.borrow().payload {
-                Payload::Vector(x) => x.iter().map(|v| as_i(v, cname)).collect::<Result<_, _>>()?,
-                _ => return Err("badTypeError".into()),
+            match args[1].as_obj().ok_or("badTypeError")?.borrow().payload.vector() {
+                Some(x) => x.iter().map(|v| as_i(v, cname)).collect::<Result<_, _>>()?,
+                None => return Err("badTypeError".into()),
             }
         } else {
             vec![]
         };
         let o = args[0].as_obj().ok_or("badTypeError")?;
-        let mut b = o.borrow_mut();
-        let px = match &mut b.payload {
-            Payload::Bytes(x) => x,
-            _ => return Err("badTypeError".into()),
-        };
-        if px.len() < (w * h) as usize {
-            return Ok(Some(P::Val(recv.clone())));
+        let px = o.borrow_mut().payload;
+        if px.kind() != PayKind::Bytes {
+            return Err("badTypeError".into());
+        }
+        if px.byte_len() < (w * h) as usize {
+            return Ok(Some(P::Val(*recv)));
         }
         for y in 0..h {
             for x in 0..w {
                 let i = (y * w + x) as usize;
                 if put {
-                    let p = map.get(px[i] as usize).copied().unwrap_or(0);
+                    let p = map.get(px.byte_at(i) as usize).copied().unwrap_or(0);
                     crate::ffi::Ffi::call(f as *mut _, &[img as u64, x as u64, y as u64, p as u64])?;
                 } else {
                     let p = crate::ffi::Ffi::call(f as *mut _, &[img as u64, x as u64, y as u64])?;
-                    px[i] = p as u8;
+                    px.set_byte_at(i, p as u8);
                 }
             }
         }
@@ -1712,11 +1693,12 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
             .ok_or("primitiveNotDefinedError")?;
         crate::ffi::Ffi::call(f, &[dpy, p])?;
         let ty = unsafe { *(p as *const i32) };
-        let proto = match &args[1].as_obj().ok_or("badTypeError")?.borrow().payload {
-            Payload::Vector(x) => x.get(ty as usize).cloned().ok_or("badTypeError")?,
-            _ => return Err("badTypeError".into()),
-        };
-        let slots = as_obj(&proto, cname)?.borrow().slots.clone();
+        let pv = args[1].as_obj().ok_or("badTypeError")?.borrow().payload;
+        if pv.kind() != PayKind::Vector || ty as usize >= pv.vector_len() {
+            return Err("badTypeError".into());
+        }
+        let proto = pv.element(ty as usize);
+        let slots: Vec<Slot> = as_obj(&proto, cname)?.borrow().slots.iter().collect();
         return Ok(Some(P::Val(Value::obj(slots, Payload::Proxy(Some(p))))));
     }
     // The font metrics are reads of the XFontStruct the world already holds:
@@ -1758,7 +1740,7 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
         }
         let f = vm.ffi.sym("XFree").ok_or("primitiveNotDefinedError")?;
         crate::ffi::Ffi::call(f, &[p])?;
-        as_obj(recv, cname)?.borrow_mut().payload = Payload::Proxy(None);
+        as_obj(recv, cname)?.borrow_mut().payload.set_proxy(None);
         return Ok(Some(P::Val(recv.clone())));
     }
     let rw = match cname {
@@ -1777,8 +1759,8 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
         return Err("badSignError".into());
     }
     let o = buf.as_obj().ok_or("badTypeError")?;
-    let len = match &o.borrow().payload {
-        Payload::Bytes(b) => b.len(),
+    let len = match o.borrow().payload.kind() {
+        PayKind::Bytes => o.borrow().payload.byte_len(),
         _ => return Err("badTypeError".into()),
     };
     if offset as usize + n as usize > len {
@@ -1791,15 +1773,19 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
         .ffi
         .sym(if rw { "write" } else { "read" })
         .ok_or("primitiveNotDefinedError")?;
+    // read and write want a C pointer, and the arena is ours. Bounce through
+    // a Rust buffer: a write copies out of the object, a read copies back in.
+    let p = o.borrow_mut().payload;
+    let mut bounce: Vec<u8> = (0..n as usize).map(|k| p.byte_at(offset as usize + k)).collect();
     let got = {
-        let mut b = o.borrow_mut();
-        let bytes = match &mut b.payload {
-            Payload::Bytes(x) => x,
-            _ => unreachable!(),
-        };
-        let p = unsafe { bytes.as_mut_ptr().add(offset as usize) } as u64;
-        crate::ffi::Ffi::call(f, &[fd as u64, p, n as u64])? as i64
+        let ptr = bounce.as_mut_ptr() as u64;
+        crate::ffi::Ffi::call(f, &[fd as u64, ptr, n as u64])? as i64
     };
+    if !rw && got > 0 {
+        for k in 0..(got as usize).min(bounce.len()) {
+            p.set_byte_at(offset as usize + k, bounce[k]);
+        }
+    }
     if got as i32 == -1 {
         return Err(os_error());
     }
@@ -1855,10 +1841,11 @@ fn select_wrap(vec: &Value, args: &[Value]) -> Result<P, String> {
         .filter(|fd| (rd[*fd as usize / 8] | wr[*fd as usize / 8]) & (1 << (fd % 8)) != 0)
         .collect();
     if let Some(o) = vec.as_obj() {
-        if let Payload::Vector(x) = &mut o.borrow_mut().payload {
+        let p = o.borrow_mut().payload;
+        if p.kind() == PayKind::Vector {
             for (i, fd) in ready.iter().enumerate() {
-                if i < x.len() {
-                    x[i] = Value::Int(*fd);
+                if i < p.vector_len() {
+                    p.set_element(i, Value::Int(*fd));
                 }
             }
         }
@@ -2039,9 +2026,11 @@ fn untyped_glue(
     }
     for (v, i) in back {
         if let Some(o) = v.as_obj() {
-            if let Payload::Bytes(b) = &mut o.borrow_mut().payload {
-                let n = b.len();
-                b.copy_from_slice(&keep[i][..n]);
+            let p = o.borrow_mut().payload;
+            if p.kind() == PayKind::Bytes {
+                for k in 0..p.byte_len() {
+                    p.set_byte_at(k, keep[i][k]);
+                }
             }
         }
     }
@@ -2053,7 +2042,7 @@ fn untyped_glue(
             return Err("nullPointerError".into());
         }
         let target = if by_receiver { recv.clone() } else { args[args.len() - 1].clone() };
-        as_obj(&target, name)?.borrow_mut().payload = Payload::Proxy(Some(r));
+        as_obj(&target, name)?.borrow_mut().payload.set_proxy(Some(r));
         return Ok(P::Val(target));
     }
     Ok(P::Val(Value::Int((r & 0xffff_ffff) as i64)))
@@ -2080,16 +2069,19 @@ fn to_word(
             if v.id_eq(&vm.boolean(false)) {
                 return Ok(0);
             }
-            match &o.borrow().payload {
+            let pay = o.borrow().payload;
+            match pay.kind() {
                 // as general_proxy_cnvt: a dead proxy is not passable, but a
                 // live one pointing at 0 is (an fd, say)
-                Payload::Proxy(p) => p.ok_or("deadProxyError")?,
-                Payload::Bytes(b) => {
-                    let mut buf = b.clone();
+                PayKind::Proxy => pay.proxy().ok_or("deadProxyError")?,
+                PayKind::Bytes => {
+                    // C wants a pointer and the arena is ours, so the bytes go
+                    // out through a buffer `keep` owns for the length of the call
+                    let mut buf = pay.bytes().unwrap();
                     buf.push(0);
                     let p = buf.as_ptr() as u64;
                     keep.push(buf);
-                    back.push((v.clone(), keep.len() - 1));
+                    back.push((*v, keep.len() - 1));
                     p
                 }
                 _ => return Err("badTypeError".into()),

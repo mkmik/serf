@@ -89,7 +89,6 @@ struct Gen {
 struct Metrics {
     gens: [Gen; 2],
     allocated: AtomicU64,
-    slots_spilled: AtomicU64,
     maps: AtomicU64,
     switched: AtomicU64,
     site_hits: AtomicU64,
@@ -119,7 +118,6 @@ static M: Metrics = Metrics {
         },
     ],
     allocated: AtomicU64::new(0),
-    slots_spilled: AtomicU64::new(0),
     maps: AtomicU64::new(0),
     switched: AtomicU64::new(0),
     site_hits: AtomicU64::new(0),
@@ -153,13 +151,6 @@ pub struct Collection {
 /// two never interleave. Not a lock the VM itself ever touches.
 #[cfg(test)]
 pub static TOTALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// An object outgrew the slots that fit in its cell and had to take a vector.
-/// Counted because `INLINE_SLOTS` is a guess, and this is what says whether it
-/// is the right one for a real world.
-pub fn slots_spilled() {
-    M.slots_spilled.fetch_add(1, Relaxed);
-}
 
 /// A shape nothing had seen before. A world that mints these in a loop is
 /// reshaping objects rather than cloning them, and gains nothing from the
@@ -260,7 +251,6 @@ pub fn encode() -> String {
         ("serf_mem_frees_total", "Blocks returned to the system allocator.", "counter", FREES.load(Relaxed)),
         ("serf_mem_malloc_bytes_total", "Bytes asked of the system allocator.", "counter", MALLOC_BYTES.load(Relaxed)),
         ("serf_gc_objects_allocated_total", "Objects allocated.", "counter", M.allocated.load(Relaxed)),
-        ("serf_gc_slots_spilled_total", "Objects whose slots outgrew the cell and took a vector.", "counter", M.slots_spilled.load(Relaxed)),
         ("serf_maps_total", "Distinct object shapes interned.", "counter", M.maps.load(Relaxed)),
         ("serf_switch_pointers_total", "Heap walks to replace every reference to one object with another, as _AddSlots: needs.", "counter", M.switched.load(Relaxed)),
         ("serf_send_site_hits_total", "Send-site inline cache probes that hit.", "counter", M.site_hits.load(Relaxed)),

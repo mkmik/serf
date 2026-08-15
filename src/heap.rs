@@ -138,7 +138,7 @@ impl std::fmt::Debug for Oop {
 ///
 /// ```text
 /// word 0  mark:  forwarded:1 │ marked:1 │ dirty:1 │ age:8 │ kind:8 │ hash:22 │ size:23
-/// word 1  form:  slots:31 │ annotated:1 │ oops:32
+/// word 1  form:  slots:23 │ aux:8 │ annotated:1 │ oops:32
 /// word 2  shape: the memoised map, `gen:32 │ map:32`
 /// ```
 ///
@@ -249,11 +249,46 @@ fn env_words(name: &str, dflt: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
 }
 
+fn young_words() -> usize {
+    // Stress collects after every allocation, so a big young space would only
+    // make every scavenge walk more of a space that is nearly empty. The cell
+    // heap sized itself down for the same reason.
+    let dflt = if std::env::var_os("SERF_GC_STRESS").is_some() { 1 << 12 } else { 1 << 19 };
+    env_words("SERF_YOUNG_WORDS", dflt)
+}
+
+fn old_words() -> usize {
+    // A real world is the reason this is large. Clean-4.4 with its outliner
+    // caches filled needs more than 2M words, and the old space does not grow:
+    // the heap is one allocation, and growing it would move every object in it.
+    // Reserving costs address space, not memory -- the pages are zero-filled by
+    // the OS as they are touched -- so the number to pick is "more than any
+    // world will want", not "what this one uses".
+    env_words("SERF_OLD_WORDS", 1 << 24)
+}
+
 thread_local! {
     static REGION: Cell<Option<&'static Region>> = const { Cell::new(None) };
 }
 
-/// The heap, made on first use, one per thread, never replaced -- the same
+/// The collector, made on first use: one per thread, never replaced -- the
+/// arrangement `gc()` has. Sized from the environment so a big world can be
+/// given room without a rebuild.
+pub fn heap() -> &'static Heap {
+    thread_local! {
+        static H: Cell<Option<&'static Heap>> = const { Cell::new(None) };
+    }
+    H.with(|h| match h.get() {
+        Some(x) => x,
+        None => {
+            let x: &'static Heap = Box::leak(Box::new(Heap::new(young_words(), old_words())));
+            h.set(Some(x));
+            x
+        }
+    })
+}
+
+/// The region, made on first use, one per thread, never replaced -- the same
 /// arrangement `gc()` has.
 ///
 /// `alloc_zeroed` rather than a `Vec`: no `&mut [u64]` ever exists, so there is
@@ -266,7 +301,11 @@ fn region() -> &'static Region {
         None => {
             // ponytail: fixed at startup, no growth. The switch-over sizes it
             // for a real world; nothing stands on it yet.
-            let words = env_words("SERF_HEAP_WORDS", 1 << 18);
+            // big enough for the spaces `heap()` will carve, plus room for
+            // the ones tests make. Zeroed pages are faulted in as they are
+            // touched, so this reserves address space rather than memory.
+            let want = 2 * young_words() + old_words() + (1 << 18);
+            let words = env_words("SERF_HEAP_WORDS", want);
             assert!(words > 0, "the heap needs room for something");
             let p = unsafe { alloc_zeroed(Layout::from_size_align(words * 8, 8).unwrap()) };
             assert!(!p.is_null(), "out of memory for a {words}-word heap");
@@ -334,10 +373,13 @@ pub struct Space {
 }
 
 const ANNOTATED: u64 = 1 << 31;
+const AUX_SHIFT: u32 = 23;
+const AUX_MASK: u64 = 0xff;
+const SLOTS_MASK: u64 = (1 << AUX_SHIFT) - 1;
 
 fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize, slots: usize, anno: bool) {
     debug_assert!(oops <= size - HEADER_WORDS, "more oop words than payload");
-    debug_assert!(slots < ANNOTATED as usize, "more named slots than the form word holds");
+    debug_assert!(slots <= SLOTS_MASK as usize, "more named slots than the form word holds");
     unsafe {
         p.write(mark_of(size, kind));
         let f = ((slots as u64) << 32) | oops as u64 | if anno { ANNOTATED << 32 } else { 0 };
@@ -352,17 +394,28 @@ fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize, slots: usize, 
 pub struct Shape {
     pub kind: Kind,
     pub slots: usize,
+    /// traced fields: a vector's elements, an activation's locals, a byte
+    /// object's bytes
     pub len: usize,
+    /// untraced words: a proxy's foreign pointer, a float's bits, a method's
+    /// bytecodes -- things that are not references and must not be followed
+    pub raw: usize,
     pub annotated: bool,
 }
 
 impl Shape {
     pub fn new(kind: Kind, slots: usize) -> Shape {
-        Shape { kind, slots, len: 0, annotated: false }
+        Shape { kind, slots, len: 0, raw: 0, annotated: false }
     }
 
     pub fn indexable(kind: Kind, slots: usize, len: usize) -> Shape {
-        Shape { kind, slots, len, annotated: false }
+        Shape { kind, slots, len, raw: 0, annotated: false }
+    }
+
+    /// Words the collector will not look at.
+    pub fn with_raw(mut self, raw: usize) -> Shape {
+        self.raw = raw;
+        self
     }
 
     /// Room for an object annotation and one per slot. A loaded world wants
@@ -387,10 +440,10 @@ impl Shape {
         let head = self.slots + self.anno_words();
         match self.kind {
             // a byte object's `len` is bytes, packed after a length word
-            Kind::Bytes => (head, self.slots + 1 + self.len.div_ceil(8)),
+            Kind::Bytes => (head, self.slots + 1 + self.len.div_ceil(8) + self.raw),
             // everything else counts `len` in `Oop`s the collector traces: a
             // vector's elements, an activation's receiver, chain and locals
-            _ => (head + self.len, self.slots),
+            _ => (head + self.len, self.slots + self.raw),
         }
     }
 }
@@ -556,7 +609,20 @@ pub fn oop_words(o: Oop) -> usize {
 /// How many named slots the object has. Its values are the first `slots` words
 /// of the payload and its descriptors are the first `slots` raw words.
 pub fn slots(o: Oop) -> usize {
-    ((form(o) >> 32) & (ANNOTATED - 1)) as usize
+    ((form(o) >> 32) & SLOTS_MASK) as usize
+}
+
+/// A byte the VM may use for whatever an object needs remembering about that
+/// the collector does not care about. The image writer keeps the map type the
+/// object arrived with here, because a Rust-side table keyed on an address
+/// cannot survive the address moving.
+pub fn aux(o: Oop) -> u8 {
+    ((form(o) >> (32 + AUX_SHIFT)) & AUX_MASK) as u8
+}
+
+pub fn set_aux(o: Oop, v: u8) {
+    let f = form(o) & !((AUX_MASK) << (32 + AUX_SHIFT));
+    unsafe { words_of(o).add(1).write(f | ((v as u64) << (32 + AUX_SHIFT))) }
 }
 
 pub fn is_annotated(o: Oop) -> bool {
@@ -693,6 +759,20 @@ pub fn raw(o: Oop, i: usize) -> u64 {
 
 pub fn set_raw(o: Oop, i: usize, v: u64) {
     unsafe { word_at(o, i).write(v) }
+}
+
+/// An untraced word of an object's own, past its descriptors: a proxy's
+/// foreign pointer, a float's bits.
+fn aux_at(o: Oop) -> usize {
+    oop_words(o) + slots(o) + if kind(o) == Kind::Bytes { 1 + ilen(o).div_ceil(8) } else { 0 }
+}
+
+pub fn aux_word(o: Oop, i: usize) -> u64 {
+    raw(o, aux_at(o) + i)
+}
+
+pub fn set_aux_word(o: Oop, i: usize, v: u64) {
+    set_raw(o, aux_at(o) + i, v)
 }
 
 // -------------------------------------------------------------- named slots
@@ -847,6 +927,18 @@ fn set_forwarded(o: Oop, to: Oop) {
 pub trait Roots {
     fn each(&mut self, f: &mut dyn FnMut(&mut Oop));
 
+    /// References that must not keep their object alive, handed over after the
+    /// collection has decided what lives. Answer `Some(where it went)` to keep
+    /// the reference, `None` to drop it.
+    ///
+    /// The interpreter's one use is the list of activations a tail call
+    /// displaced: it compares them for identity and never reads them, so an
+    /// entry nothing else holds is useless -- and with a handle table it was
+    /// merely useless, where a direct pointer into an abandoned space is not.
+    /// `Rc::strong_count` used to answer this question; the collector answers
+    /// it now.
+    fn weak(&mut self, _f: &mut dyn FnMut(Oop) -> Option<Oop>) {}
+
     /// An object the collection is about to forget. The heap itself needs no
     /// such hook -- abandoning a space is one store -- but anything holding
     /// Rust memory on an object's behalf does, and during the switch-over a
@@ -920,6 +1012,17 @@ impl Heap {
         self.old_free.borrow().iter().map(|(n, v)| n * v.len()).sum()
     }
 
+    /// The young space is filling; the interpreter should collect at its next
+    /// safepoint. Allocation never collects on its own, because the caller's
+    /// Rust locals are not roots.
+    pub fn wants_collection(&self) -> bool {
+        self.from_space().used() * 4 >= self.from_space().capacity() * 3
+    }
+
+    pub fn old_wants_major(&self) -> bool {
+        self.old.used() * 4 >= self.old.capacity() * 3
+    }
+
     pub fn remembered_len(&self) -> usize {
         self.remembered.borrow().len()
     }
@@ -972,7 +1075,7 @@ impl Heap {
         }
         self.old
             .alloc_words(kind, oops, slots, payload, anno)
-            .expect("old generation exhausted")
+            .expect("old generation exhausted -- raise SERF_OLD_WORDS")
     }
 
     /// A clone: the same shape, the same contents, its own identity. `_Clone`.
@@ -1030,6 +1133,11 @@ impl Heap {
         }
         let (k, oops, pay, ns, an) =
             (kind(o), oop_words(o), payload_words(o), slots(o), is_annotated(o));
+        debug_assert!(
+            oops <= pay && pay < 1 << 20,
+            "corrupt object at {:#x}: kind {:?} oops {} payload {} slots {}",
+            o.addr(), k, oops, pay, ns
+        );
         let a = age(o).saturating_add(1);
         // Ask the to-space only when the object is actually staying young: the
         // bump happens inside `alloc`, so testing the age afterwards would
@@ -1074,6 +1182,17 @@ impl Heap {
             if !v.is_obj() {
                 continue;
             }
+            debug_assert!(
+                !self.from_space().contains(v)
+                    || forwarded(v).is_some()
+                    || {
+                        let m = mark(v);
+                        let sz = (m & SIZE_MASK) as usize;
+                        sz >= HEADER_WORDS && oop_words(v) <= sz - HEADER_WORDS
+                    },
+                "scanning {:?} at {:#x} (oops {} slots {}): field {} holds {:#x}, which is not an object",
+                kind(o), o.addr(), oop_words(o), slots(o), i, v.addr()
+            );
             let n = self.evacuate(v, promoted);
             if n != v {
                 set_field(o, i, n);
@@ -1125,6 +1244,19 @@ impl Heap {
                 }
                 None => break,
             }
+        }
+
+        // weak references, now that what lives has been decided: an object
+        // still sitting in the from-space was never reached
+        {
+            let from = self.from_space();
+            roots.weak(&mut |o| {
+                if !o.is_obj() || !from.contains(o) {
+                    Some(o)
+                } else {
+                    forwarded(o)
+                }
+            });
         }
 
         // whatever is still in the from-space was never reached. Forgetting it
@@ -1230,15 +1362,60 @@ impl Heap {
         crate::metrics::switched();
     }
 
+    /// Walk every space and check that each object still describes itself.
+    /// A moving collector's failures are all of one shape -- a word that is
+    /// not what it says it is -- and the only useful place to notice is the
+    /// step *before* the one that trips over it.
+    pub fn verify(&self, when: &str) {
+        for (which, sp) in [("young", self.from_space()), ("old", &self.old)] {
+            let mut w = 0usize;
+            while w < sp.used() {
+                let o = Oop::obj(at(sp.start + w));
+                let m = mark(o);
+                let size = (m & SIZE_MASK) as usize;
+                let bad = m & FORWARDED != 0
+                    || size < HEADER_WORDS
+                    || w + size > sp.used()
+                    || oop_words(o) > size - HEADER_WORDS
+                    || slots(o) > oop_words(o);
+                assert!(
+                    !bad,
+                    "{when}: {which} space, word {w}: object at {:#x} says size {} oops {} slots {}",
+                    o.addr(),
+                    size,
+                    oop_words(o),
+                    slots(o)
+                );
+                w += size;
+            }
+        }
+    }
+
     /// Collect. `major` sweeps the old generation as well.
     pub fn collect(&self, roots: &mut dyn Roots, major: bool) {
+        if VERIFY.with(|v| *v) {
+            self.verify("before");
+        }
         if major {
             self.mark_all(roots);
+            // before the sweep, because a swept run goes on the free list and
+            // the scavenge's promotions may take it straight back
+            roots.weak(&mut |o| (!o.is_obj() || marked(o)).then_some(o));
             self.sweep_old(roots);
             self.majors.set(self.majors.get() + 1);
         }
         self.scavenge(roots);
+        if VERIFY.with(|v| *v) {
+            self.verify("after");
+        }
     }
+}
+
+thread_local! {
+    /// `SERF_HEAP_VERIFY=1`: walk every space before and after each collection.
+    /// Its own flag, not `SERF_GC_VERIFY`: this is O(heap) per collection, so
+    /// on a loaded world it is a debugging session rather than a test.
+    static VERIFY: bool = std::env::var_os("SERF_HEAP_VERIFY").is_some();
 }
 
 #[cfg(test)]
@@ -1741,6 +1918,25 @@ mod tests {
         let sc = h.clone_object(s);
         assert_eq!(bytes_of(sc), text, "a byte object's clone lost its bytes");
         assert_eq!(ilen(sc), text.len());
+    }
+
+    #[test]
+    fn untraced_words_are_not_followed() {
+        let h = heap();
+        // a proxy's foreign pointer is an arbitrary integer that must never be
+        // mistaken for a reference, however much it looks like one
+        let p = h.alloc(Shape::new(Kind::Proxy, 1).with_raw(1)).unwrap();
+        set_slot_desc(p, 0, 1, PARENT);
+        set_slot_value(p, 0, Oop::int(3));
+        let fake = h.alloc(Shape::new(Kind::Slots, 0)).unwrap().addr() as u64;
+        set_aux_word(p, 0, fake);
+
+        let mut roots = Vars(vec![p]);
+        h.scavenge(&mut roots);
+        let p = roots.0[0];
+        assert_eq!(aux_word(p, 0), fake, "the foreign pointer was rewritten");
+        assert_eq!(slot_value(p, 0).as_int(), Some(3));
+        assert_eq!(slot_name(p, 0), 1);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! them (all control flow is message sends to blocks); they exist in the C++
 //! VM only for the `_BranchTo:` reflective primitives.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::interp;
@@ -163,7 +164,7 @@ fn eval_const(vm: &mut Vm, e: &Expr, file: &Rc<str>) -> Result<Value, String> {
     let o = ObjLit { args: vec![], slots: vec![], body: vec![e.clone()], line: 0 };
     let m = compile_method(vm, &o, "<slot initializer>", file)?;
     let lobby = vm.lobby.clone();
-    let scope = interp::new_scope(m, lobby.clone(), lobby, vec![], None);
+    let scope = interp::new_scope(m, lobby, lobby, &[], None);
     interp::run(vm, scope).map_err(|u| interp::describe(vm, u))
 }
 
@@ -254,15 +255,16 @@ impl<'a> C<'a> {
             arg_slots: (0..mb.nargs).collect(),
             slot_flags: (0..mb.names.len()).map(|i| if i < mb.nargs { 2 << 2 } else { 0 }).collect(),
             slot_names: mb.names,
-            slot_inits: mb.inits,
+            slot_inits: RefCell::new(mb.inits),
             code: mb.code,
-            lits: mb.lits,
+            lits: RefCell::new(mb.lits),
             lit_strs: mb.lit_strs,
             is_block: mb.is_block,
             file: self.file.clone(),
             line: mb.line,
-            source: None,
+            source: Cell::new(None),
             sites: Default::default(),
+            max_stack: std::cell::Cell::new(u32::MAX),
         }))
     }
 
