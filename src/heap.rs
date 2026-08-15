@@ -138,7 +138,7 @@ impl std::fmt::Debug for Oop {
 ///
 /// ```text
 /// word 0  mark:  forwarded:1 │ marked:1 │ dirty:1 │ age:8 │ kind:8 │ hash:22 │ size:23
-/// word 1  form:  slots:31 │ annotated:1 │ oops:32
+/// word 1  form:  slots:23 │ aux:8 │ annotated:1 │ oops:32
 /// word 2  shape: the memoised map, `gen:32 │ map:32`
 /// ```
 ///
@@ -334,10 +334,13 @@ pub struct Space {
 }
 
 const ANNOTATED: u64 = 1 << 31;
+const AUX_SHIFT: u32 = 23;
+const AUX_MASK: u64 = 0xff;
+const SLOTS_MASK: u64 = (1 << AUX_SHIFT) - 1;
 
 fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize, slots: usize, anno: bool) {
     debug_assert!(oops <= size - HEADER_WORDS, "more oop words than payload");
-    debug_assert!(slots < ANNOTATED as usize, "more named slots than the form word holds");
+    debug_assert!(slots <= SLOTS_MASK as usize, "more named slots than the form word holds");
     unsafe {
         p.write(mark_of(size, kind));
         let f = ((slots as u64) << 32) | oops as u64 | if anno { ANNOTATED << 32 } else { 0 };
@@ -352,17 +355,28 @@ fn init_object(p: *mut u64, size: usize, kind: Kind, oops: usize, slots: usize, 
 pub struct Shape {
     pub kind: Kind,
     pub slots: usize,
+    /// traced fields: a vector's elements, an activation's locals, a byte
+    /// object's bytes
     pub len: usize,
+    /// untraced words: a proxy's foreign pointer, a float's bits, a method's
+    /// bytecodes -- things that are not references and must not be followed
+    pub raw: usize,
     pub annotated: bool,
 }
 
 impl Shape {
     pub fn new(kind: Kind, slots: usize) -> Shape {
-        Shape { kind, slots, len: 0, annotated: false }
+        Shape { kind, slots, len: 0, raw: 0, annotated: false }
     }
 
     pub fn indexable(kind: Kind, slots: usize, len: usize) -> Shape {
-        Shape { kind, slots, len, annotated: false }
+        Shape { kind, slots, len, raw: 0, annotated: false }
+    }
+
+    /// Words the collector will not look at.
+    pub fn with_raw(mut self, raw: usize) -> Shape {
+        self.raw = raw;
+        self
     }
 
     /// Room for an object annotation and one per slot. A loaded world wants
@@ -387,10 +401,10 @@ impl Shape {
         let head = self.slots + self.anno_words();
         match self.kind {
             // a byte object's `len` is bytes, packed after a length word
-            Kind::Bytes => (head, self.slots + 1 + self.len.div_ceil(8)),
+            Kind::Bytes => (head, self.slots + 1 + self.len.div_ceil(8) + self.raw),
             // everything else counts `len` in `Oop`s the collector traces: a
             // vector's elements, an activation's receiver, chain and locals
-            _ => (head + self.len, self.slots),
+            _ => (head + self.len, self.slots + self.raw),
         }
     }
 }
@@ -556,7 +570,20 @@ pub fn oop_words(o: Oop) -> usize {
 /// How many named slots the object has. Its values are the first `slots` words
 /// of the payload and its descriptors are the first `slots` raw words.
 pub fn slots(o: Oop) -> usize {
-    ((form(o) >> 32) & (ANNOTATED - 1)) as usize
+    ((form(o) >> 32) & SLOTS_MASK) as usize
+}
+
+/// A byte the VM may use for whatever an object needs remembering about that
+/// the collector does not care about. The image writer keeps the map type the
+/// object arrived with here, because a Rust-side table keyed on an address
+/// cannot survive the address moving.
+pub fn aux(o: Oop) -> u8 {
+    ((form(o) >> (32 + AUX_SHIFT)) & AUX_MASK) as u8
+}
+
+pub fn set_aux(o: Oop, v: u8) {
+    let f = form(o) & !((AUX_MASK) << (32 + AUX_SHIFT));
+    unsafe { words_of(o).add(1).write(f | ((v as u64) << (32 + AUX_SHIFT))) }
 }
 
 pub fn is_annotated(o: Oop) -> bool {
@@ -693,6 +720,20 @@ pub fn raw(o: Oop, i: usize) -> u64 {
 
 pub fn set_raw(o: Oop, i: usize, v: u64) {
     unsafe { word_at(o, i).write(v) }
+}
+
+/// An untraced word of an object's own, past its descriptors: a proxy's
+/// foreign pointer, a float's bits.
+fn aux_at(o: Oop) -> usize {
+    oop_words(o) + slots(o) + if kind(o) == Kind::Bytes { 1 + ilen(o).div_ceil(8) } else { 0 }
+}
+
+pub fn aux_word(o: Oop, i: usize) -> u64 {
+    raw(o, aux_at(o) + i)
+}
+
+pub fn set_aux_word(o: Oop, i: usize, v: u64) {
+    set_raw(o, aux_at(o) + i, v)
 }
 
 // -------------------------------------------------------------- named slots
@@ -1741,6 +1782,25 @@ mod tests {
         let sc = h.clone_object(s);
         assert_eq!(bytes_of(sc), text, "a byte object's clone lost its bytes");
         assert_eq!(ilen(sc), text.len());
+    }
+
+    #[test]
+    fn untraced_words_are_not_followed() {
+        let h = heap();
+        // a proxy's foreign pointer is an arbitrary integer that must never be
+        // mistaken for a reference, however much it looks like one
+        let p = h.alloc(Shape::new(Kind::Proxy, 1).with_raw(1)).unwrap();
+        set_slot_desc(p, 0, 1, PARENT);
+        set_slot_value(p, 0, Oop::int(3));
+        let fake = h.alloc(Shape::new(Kind::Slots, 0)).unwrap().addr() as u64;
+        set_aux_word(p, 0, fake);
+
+        let mut roots = Vars(vec![p]);
+        h.scavenge(&mut roots);
+        let p = roots.0[0];
+        assert_eq!(aux_word(p, 0), fake, "the foreign pointer was rewritten");
+        assert_eq!(slot_value(p, 0).as_int(), Some(3));
+        assert_eq!(slot_name(p, 0), 1);
     }
 
     #[test]
