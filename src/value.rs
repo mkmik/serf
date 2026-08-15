@@ -1,29 +1,37 @@
 //! Object model: prototypes, slots, multiple-parent lookup.
 //!
 //! Follows vm/src/any/objects: everything is an object with named slots;
-//! inheritance is delegation through slots marked as parents. Every object
-//! carries its own slot vector, but its *shape* -- slot names and kinds, and
-//! the parent values a search recurses into -- is interned as a `MapRef`, the
-//! way the C++ VM interns a map. That is what the method caches key on, since
-//! a thousand clones of one prototype share one shape and no two of them share
-//! an identity.
-//! ponytail: the map is only the key; the slots themselves are still per
-//! object, which is what a real map would share.
+//! inheritance is delegation through slots marked as parents.
 //!
-//! An object lives in the heap in `gc.rs`; a `Value` names one by handle, so a
-//! `Value` is `Copy` and identity is the handle.
+//! An object is a run of words in the arena (`heap.rs`), laid out by `obj.rs`,
+//! and a `Value` naming one holds its address. A `Value` is `Copy`, and
+//! identity is the address -- which moves, so nothing outside the heap may key
+//! on it across a collection.
+//!
+//! An object's *shape* -- slot names and kinds, and the parent values a search
+//! recurses into -- is interned as a `MapRef`, the way the C++ VM interns a
+//! map, and that is what the method caches key on: a thousand clones of one
+//! prototype share one shape and no two of them share an identity.
+//! ponytail: the map is only the key; the descriptors themselves are still per
+//! object, which is what a real map would share.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-pub use crate::gc::ObjRef;
+use crate::heap::{self, Kind, Oop};
+use crate::obj;
+pub use crate::obj::{act, Payload, SlotKind};
+
+/// An object's address. Stable only between collections.
+pub type ObjRef = Oop;
 
 thread_local! {
     /// The programming timestamp of the object graph itself: bumped by
     /// anything that can change what a lookup finds -- adding or removing a
     /// slot, writing a parent slot, `_MirrorDefine:` -- and by a collection,
-    /// because dead handle ids are recycled. `Vm::lookup` memoises against it.
+    /// because a shape is keyed on parent addresses and a collection moves
+    /// them. `Vm::lookup` memoises against it.
     static LOOKUP_GEN: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -42,19 +50,12 @@ pub enum Value {
     Obj(ObjRef),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum SlotKind {
-    Data,
-    Parent,
-    /// `x:` -- writes the data slot named by `Slot::name` minus its trailing colon.
-    Assign,
-}
+// ---------------------------------------------------------------- symbols
 
-/// An interned slot name. Two things want this. A `Slot` has to be `Copy` for
-/// the young generation to abandon a from-space by resetting a length rather
-/// than by running a destructor per dead slot, and an `Rc<str>` has one. And
-/// comparing names is what lookup spends its time on, which a `u32` compare
-/// settles without touching the string at all.
+/// An interned slot name. Comparing names is what lookup spends its time on,
+/// which a `u32` compare settles without touching the string at all -- and a
+/// number is not a reference, so a descriptor holding one sits in the part of
+/// an object the collector does not walk.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Sym(u32);
 
@@ -113,26 +114,10 @@ impl From<&str> for Sym {
     }
 }
 
-/// A method with nothing in it, for tests that need one to hang an object or
-/// an activation off.
-#[cfg(test)]
-pub fn test_method() -> Rc<Method> {
-    Rc::new(Method {
-        sel: "t".into(),
-        nargs: 0,
-        arg_slots: vec![],
-        slot_names: vec![],
-        slot_flags: vec![],
-        slot_inits: vec![],
-        code: vec![],
-        lits: vec![],
-        lit_strs: vec![],
-        is_block: false,
-        file: "t".into(),
-        line: 0,
-        source: None,
-        sites: Default::default(),
-    })
+impl std::fmt::Display for Sym {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(sym_str(*self))
+    }
 }
 
 #[cfg(test)]
@@ -148,18 +133,16 @@ mod sym_tests {
             assert_eq!(sym_str(Sym(i as u32)), *n);
         }
         assert_eq!(sym("parent"), SYM_PARENT);
-        // interning is by content: a name built at runtime is the same symbol
         assert_eq!(sym(&format!("par{}", "ent")), SYM_PARENT);
         assert_ne!(sym("parent "), SYM_PARENT);
     }
 }
 
-impl std::fmt::Display for Sym {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(sym_str(*self))
-    }
-}
+// ------------------------------------------------------------------ slots
 
+/// One slot, as a caller sees it. Objects store the name and kind packed into
+/// a descriptor word and the value in the traced region, so this is a view
+/// assembled on read and taken apart on write -- never a thing in the heap.
 #[derive(Clone, Copy)]
 pub struct Slot {
     pub name: Sym,
@@ -167,277 +150,293 @@ pub struct Slot {
     pub value: Value,
 }
 
-pub struct Obj {
-    pub slots: Slots,
-    pub payload: Payload,
-    /// This object's map, memoised. `NO_MAP` until something asks for it, and
-    /// back to `NO_MAP` whenever the shape changes. Not in the shape itself:
-    /// two objects share a map, so the map cannot hold anything per-object.
-    map: Cell<u32>,
+pub fn slot(name: &str, kind: SlotKind, value: Value) -> Slot {
+    Slot { name: sym(name), kind, value }
 }
 
-const NO_MAP: u32 = u32::MAX;
+/// An object's slots. A `Copy` handle rather than a vector: `len`, `iter` and
+/// `for s in &slots` read as they always did, and only indexing became `get`,
+/// because there is no `&Slot` to hand back from a heap that moves.
+#[derive(Clone, Copy)]
+pub struct SlotsRef(ObjRef);
+
+impl SlotsRef {
+    pub fn len(&self) -> usize {
+        obj::slot_count(self.0)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn get(&self, i: usize) -> Slot {
+        Slot {
+            name: obj::slot_name(self.0, i),
+            kind: obj::slot_kind(self.0, i),
+            value: obj::slot_value(self.0, i),
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = Slot> + '_ {
+        (0..self.len()).map(|i| self.get(i))
+    }
+}
+
+impl IntoIterator for &SlotsRef {
+    type Item = Slot;
+    type IntoIter = std::vec::IntoIter<Slot>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter().collect::<Vec<_>>().into_iter()
+    }
+}
+
+// ----------------------------------------------------------------- payload
+
+/// What an object's payload *is*, for a caller that wants to branch on it.
+/// `Payload` builds one; this reads one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PayKind {
+    None,
+    Bytes,
+    Vector,
+    Method,
+    Block,
+    Mirror,
+    Proxy,
+    Float,
+    Activation,
+}
+
+pub fn pay_kind(o: ObjRef) -> PayKind {
+    match heap::kind(o) {
+        Kind::Slots | Kind::Map => PayKind::None,
+        Kind::Bytes => PayKind::Bytes,
+        Kind::ObjVector => PayKind::Vector,
+        Kind::Method => PayKind::Method,
+        Kind::Block => PayKind::Block,
+        Kind::Mirror => PayKind::Mirror,
+        Kind::Proxy => PayKind::Proxy,
+        Kind::Float => PayKind::Float,
+        Kind::Activation => PayKind::Activation,
+    }
+}
+
+/// An object's payload, as a `Copy` handle. The kind decides which accessor
+/// means anything.
+#[derive(Clone, Copy)]
+pub struct PayRef(ObjRef);
+
+impl PayRef {
+    pub fn kind(&self) -> PayKind {
+        pay_kind(self.0)
+    }
+    pub fn is_none(&self) -> bool {
+        self.kind() == PayKind::None
+    }
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        obj::bytes(self.0)
+    }
+    pub fn byte_len(&self) -> usize {
+        obj::byte_len(self.0)
+    }
+    pub fn byte_at(&self, i: usize) -> u8 {
+        heap::byte_at(self.0, i)
+    }
+    pub fn set_byte_at(&self, i: usize, b: u8) {
+        heap::set_byte_at(self.0, i, b)
+    }
+    pub fn vector(&self) -> Option<Vec<Value>> {
+        (self.kind() == PayKind::Vector).then(|| obj::elements(self.0))
+    }
+    pub fn vector_len(&self) -> usize {
+        if self.kind() == PayKind::Vector {
+            heap::ilen(self.0)
+        } else {
+            0
+        }
+    }
+    pub fn element(&self, i: usize) -> Value {
+        obj::from_oop(heap::element(self.0, i))
+    }
+    pub fn set_element(&self, i: usize, v: Value) {
+        let w = obj::to_oop(v);
+        heap::set_element(self.0, i, w);
+        if w.is_obj() {
+            heap::heap().record(self.0);
+        }
+    }
+    pub fn method(&self) -> Option<Rc<Method>> {
+        obj::method_of(self.0)
+    }
+    pub fn block_scope(&self) -> Option<ObjRef> {
+        obj::block_scope(self.0)
+    }
+    pub fn set_block_scope(&self, s: Option<ObjRef>) {
+        obj::set_block_scope(self.0, s)
+    }
+    pub fn mirror(&self) -> Option<Value> {
+        (self.kind() == PayKind::Mirror).then(|| obj::mirror_of(self.0))
+    }
+    pub fn proxy(&self) -> Option<u64> {
+        obj::proxy(self.0)
+    }
+    pub fn kill_proxy(&self) {
+        obj::kill_proxy(self.0)
+    }
+}
+
+// ------------------------------------------------------------- the object
+
+/// A borrowed object. `Copy`, because there is nothing to guard: the words are
+/// in the arena and every read goes to them. Held only within a statement --
+/// an object moves, and a view that outlived a safepoint would name a space
+/// that has been abandoned.
+#[derive(Clone, Copy)]
+pub struct Obj {
+    pub slots: SlotsRef,
+    pub payload: PayRef,
+    at: ObjRef,
+}
 
 impl Obj {
-    pub fn new(slots: Slots, payload: Payload) -> Obj {
-        Obj { slots, payload, map: Cell::new(NO_MAP) }
+    /// By interned name. Every hot caller already has one; `find` is for the
+    /// cold ones that hold a string and pay a hash to get here.
+    pub fn find_sym(&self, name: Sym) -> Option<usize> {
+        obj::find(self.at, name)
     }
-
-    /// The shape this object's lookups depend on. Interned, so every object
-    /// like it answers the same `MapRef` -- which is what makes it a usable
-    /// cache key where the object's own identity is not.
+    pub fn find(&self, name: &str) -> Option<usize> {
+        self.find_sym(sym(name))
+    }
+    /// Write a slot's value. A parent write rewires the object graph and so
+    /// invalidates memoised lookups and this object's shape; a data write
+    /// cannot change what a lookup finds, which is the point of keeping data
+    /// values out of the shape.
+    pub fn assign(&self, i: usize, v: Value) {
+        obj::assign(self.at, i, v)
+    }
     pub fn map(&self) -> MapRef {
-        let m = self.map.get();
-        if m != NO_MAP {
-            if MAP_VERIFY.with(|v| *v) {
-                verify_map(self);
-            }
-            return MapRef(m);
-        }
-        let r = intern_shape(self);
-        self.map.set(r.0);
-        r
+        map_of(self.at)
     }
-
-    /// The shape changed, so the memoised map is wrong. Call from anywhere that
-    /// adds, removes or reorders a slot, or writes a parent slot's value.
-    pub fn forget_map(&self) {
-        self.map.set(NO_MAP);
+    pub fn oop(&self) -> ObjRef {
+        self.at
     }
 }
 
-// ------------------------------------------------------------------- maps
+impl ObjRef {
+    pub fn borrow(self) -> Obj {
+        Obj { slots: SlotsRef(self), payload: PayRef(self), at: self }
+    }
+    /// The same view, with the write barrier fired: an old object that may now
+    /// hold a young reference has to be scanned by the next scavenge.
+    /// Conservative -- it fires for reads dressed as writes -- which is the
+    /// trade the C++ VM's unconditional card store makes.
+    pub fn borrow_mut(self) -> Obj {
+        heap::heap().record(self);
+        self.borrow()
+    }
+    /// Identity, for a table that lives no longer than a collection. An object
+    /// moves, so nothing may key on this across one.
+    pub fn id(self) -> usize {
+        self.addr()
+    }
+}
+
+// -------------------------------------------------------------------- maps
 
 /// A map: the shape a lookup depends on, interned so that every object of that
 /// shape names the same one. The C++ VM keeps slot descriptors in a map and
 /// keys its lookups on it -- `MethodLookupKey` "adds the receiver map to that
-/// info, and is specific to a given receiver map" (lookup/key.hh:49). serf
-/// keeps the descriptors in the object for now and interns only the key, which
-/// is the part a cache needs: 76% of core.snap's objects share 81 shapes, so a
-/// cache keyed on the map hits where one keyed on the receiver cannot.
+/// info, and is specific to a given receiver map" (lookup/key.hh:49).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct MapRef(u32);
 
-/// A parent slot's value, as something hashable. Only parents are in the shape:
-/// a search recurses into them, so two objects whose parents differ must not
-/// share a cache entry. A data slot's value cannot change what a lookup finds.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum VKey {
-    Obj(u32),
-    Int(i64),
-    Float(u64),
-}
-
-fn vkey(v: Value) -> VKey {
-    match v {
-        Value::Obj(o) => VKey::Obj(o.0),
-        Value::Int(i) => VKey::Int(i),
-        Value::Float(f) => VKey::Float(f.to_bits()),
-    }
-}
-
-/// Slot names and kinds in order, plus the value of every parent slot.
+/// Slot names and kinds in order, plus the address of every parent slot's
+/// value. Addresses move, so a shape is only good for one `LOOKUP_GEN` -- and
+/// a collection bumps that, which is what makes keying on them sound.
 #[derive(PartialEq, Eq, Hash)]
-struct Shape(Vec<(Sym, SlotKind, Option<VKey>)>);
+struct Shape(Vec<(u32, u8, usize)>);
 
-fn shape_of(o: &Obj) -> Shape {
+fn shape_of(o: ObjRef) -> Shape {
     Shape(
-        o.slots
-            .iter()
-            .map(|s| {
-                let v = if s.kind == SlotKind::Parent { Some(vkey(s.value)) } else { None };
-                (s.name, s.kind, v)
+        (0..obj::slot_count(o))
+            .map(|i| {
+                let v = if obj::slot_kind(o, i) == SlotKind::Parent {
+                    heap::slot_value(o, i).addr()
+                } else {
+                    0
+                };
+                (heap::slot_name(o, i), heap::slot_kind(o, i), v)
             })
             .collect(),
     )
 }
 
 thread_local! {
-    /// Interned shapes. An `Rc` so the table and its index share one copy.
-    /// Entries are never removed: a shape nothing has any more is a few dozen
-    /// bytes, and dropping one would need to know that no object still names
-    /// it. `serf_maps_total` says whether a world is minting them in a loop.
-    /// ponytail: monotonic table, no eviction.
-    static MAPS: RefCell<(Vec<Rc<Shape>>, HashMap<Rc<Shape>, MapRef>)> =
-        RefCell::new((vec![], HashMap::new()));
+    /// Interned shapes, and the generation they were interned at. A collection
+    /// moves the parents a shape is keyed on, so the whole table is dropped
+    /// when the generation moves -- the same event that drops the lookup cache.
+    static MAPS: RefCell<(u64, Vec<Rc<Shape>>, HashMap<Rc<Shape>, MapRef>)> =
+        RefCell::new((0, Vec::new(), HashMap::new()));
 }
 
-fn intern_shape(o: &Obj) -> MapRef {
+fn intern_shape(o: ObjRef) -> MapRef {
+    let gen = lookup_gen();
     let s = shape_of(o);
     MAPS.with(|t| {
         let mut t = t.borrow_mut();
-        if let Some(&m) = t.1.get(&s) {
+        if t.0 != gen {
+            t.1.clear();
+            t.2.clear();
+            t.0 = gen;
+        }
+        if let Some(&m) = t.2.get(&s) {
             return m;
         }
         let s = Rc::new(s);
-        let m = MapRef(t.0.len() as u32);
-        t.0.push(s.clone());
-        t.1.insert(s, m);
+        let m = MapRef(t.1.len() as u32);
+        t.1.push(s.clone());
+        t.2.insert(s, m);
         crate::metrics::map_minted();
         m
     })
 }
 
+/// The shape this object's lookups depend on, memoised in the object against
+/// the generation it was computed at.
+pub fn map_of(o: ObjRef) -> MapRef {
+    let gen = lookup_gen() as u32;
+    if let Some(m) = heap::shape_memo(o, gen) {
+        if MAP_VERIFY.with(|v| *v) {
+            verify_map(o, MapRef(m));
+        }
+        return MapRef(m);
+    }
+    let m = intern_shape(o);
+    heap::set_shape_memo(o, gen, m.0);
+    m
+}
+
+/// The shape changed, so the memoised map is wrong.
+pub fn forget_map(o: ObjRef) {
+    heap::set_shape_memo(o, u32::MAX, u32::MAX);
+}
+
 thread_local! {
     /// `SERF_MAP_VERIFY=1`: check every memoised map against a freshly computed
-    /// shape. The invalidation points are `put`, a parent `assign` and
-    /// `_RemoveSlot`, and this is what says nobody has added a fourth.
+    /// shape, so a mutation that changed a shape without saying so fails where
+    /// the stale map is used rather than by dispatching somewhere else.
     static MAP_VERIFY: bool = std::env::var_os("SERF_MAP_VERIFY").is_some();
 }
 
-/// Recompute the shape and check it against the memoised map, so a mutation
-/// that forgot to call `forget_map` fails where the stale map is used rather
-/// than by dispatching to the wrong method somewhere else entirely.
-fn verify_map(o: &Obj) {
-    let cached = o.map.get();
-    if cached == NO_MAP {
-        return;
-    }
-    let fresh = MAPS.with(|t| t.borrow().1.get(&shape_of(o)).copied());
-    if fresh != Some(MapRef(cached)) {
-        panic!("stale map: object memoised map {} but its shape interns to {:?} -- \
-                a slot was changed without forget_map()", cached, fresh);
+fn verify_map(o: ObjRef, cached: MapRef) {
+    let fresh = MAPS.with(|t| t.borrow().2.get(&shape_of(o)).copied());
+    if fresh != Some(cached) {
+        panic!(
+            "stale map: object memoised {:?} but its shape interns to {:?} -- \
+             a slot was changed without forget_map()",
+            cached, fresh
+        );
     }
 }
 
-/// How many slots live in the cell itself. A young space is a fixed array of
-/// cells allocated once and reused forever, so a slot that fits inline costs
-/// no `malloc` when the object is born and no `free` when it dies -- the
-/// scavenge abandons the from-space by forgetting it, which is what a copying
-/// collector is supposed to do.
-///
-/// ponytail: 4, which holds a string's parent slot and a small clone, at 24
-/// bytes a slot and two semispaces. Raise it if a real world's objects turn
-/// out to spill often -- `serf_gc_slots_spilled` says how often they do.
-pub const INLINE_SLOTS: usize = 4;
-
-const EMPTY_SLOT: Slot = Slot { name: SYM_PARENT, kind: SlotKind::Data, value: Value::Int(0) };
-
-/// An object's slots: inline while they fit, on the heap when they do not.
-/// Derefs to `[Slot]`, so reading them reads the same as a vector did.
-#[derive(Clone)]
-pub enum Slots {
-    Inline { n: u8, a: [Slot; INLINE_SLOTS] },
-    Spilled(Vec<Slot>),
-}
-
-impl Default for Slots {
-    fn default() -> Slots {
-        Slots::Inline { n: 0, a: [EMPTY_SLOT; INLINE_SLOTS] }
-    }
-}
-
-impl Slots {
-    pub fn from_slice(s: &[Slot]) -> Slots {
-        if s.len() <= INLINE_SLOTS {
-            let mut a = [EMPTY_SLOT; INLINE_SLOTS];
-            a[..s.len()].copy_from_slice(s);
-            Slots::Inline { n: s.len() as u8, a }
-        } else {
-            crate::metrics::slots_spilled();
-            Slots::Spilled(s.to_vec())
-        }
-    }
-
-    pub fn push(&mut self, s: Slot) {
-        match self {
-            Slots::Inline { n, a } if (*n as usize) < INLINE_SLOTS => {
-                a[*n as usize] = s;
-                *n += 1;
-            }
-            Slots::Inline { n, a } => {
-                let mut v = a[..*n as usize].to_vec();
-                v.push(s);
-                crate::metrics::slots_spilled();
-                *self = Slots::Spilled(v);
-            }
-            Slots::Spilled(v) => v.push(s),
-        }
-    }
-
-    pub fn retain(&mut self, f: impl FnMut(&Slot) -> bool) {
-        match self {
-            Slots::Inline { n, a } => {
-                let mut v = a[..*n as usize].to_vec();
-                v.retain(f);
-                *n = v.len() as u8;
-                a[..v.len()].copy_from_slice(&v);
-            }
-            Slots::Spilled(v) => v.retain(f),
-        }
-    }
-}
-
-impl std::ops::Deref for Slots {
-    type Target = [Slot];
-    fn deref(&self) -> &[Slot] {
-        match self {
-            Slots::Inline { n, a } => &a[..*n as usize],
-            Slots::Spilled(v) => v,
-        }
-    }
-}
-
-impl std::ops::DerefMut for Slots {
-    fn deref_mut(&mut self) -> &mut [Slot] {
-        match self {
-            Slots::Inline { n, a } => &mut a[..*n as usize],
-            Slots::Spilled(v) => v,
-        }
-    }
-}
-
-impl FromIterator<Slot> for Slots {
-    fn from_iter<T: IntoIterator<Item = Slot>>(it: T) -> Slots {
-        let v: Vec<Slot> = it.into_iter().collect();
-        Slots::from_slice(&v)
-    }
-}
-
-impl<'a> IntoIterator for &'a Slots {
-    type Item = &'a Slot;
-    type IntoIter = std::slice::Iter<'a, Slot>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-/// An object is built from a fixed-size array where the count is known, which
-/// is most places, and from a vector where it is not. The array form is the
-/// one that costs nothing: it never touches the heap on the way in.
-impl<const N: usize> From<[Slot; N]> for Slots {
-    fn from(a: [Slot; N]) -> Slots {
-        Slots::from_slice(&a)
-    }
-}
-
-impl From<&[Slot]> for Slots {
-    fn from(s: &[Slot]) -> Slots {
-        Slots::from_slice(s)
-    }
-}
-
-impl From<Vec<Slot>> for Slots {
-    fn from(v: Vec<Slot>) -> Slots {
-        Slots::from_slice(&v)
-    }
-}
-
-pub enum Payload {
-    None,
-    /// strings and byte vectors; they differ only in their parent
-    Bytes(Vec<u8>),
-    Vector(Vec<Value>),
-    Method(Rc<Method>),
-    /// block prototype (`None`) or a block closed over an activation
-    Block(Rc<Method>, Option<Rc<Scope>>),
-    /// a mirror: the reflectee lives in a fixed word, not in a slot
-    Mirror(Value),
-    /// a foreign pointer held by a proxy object. `None` is a *dead* proxy:
-    /// Self kills one by stamping its type seal, not by nulling its pointer,
-    /// so a live proxy may legitimately point at 0 -- `stdin` is fd 0.
-    Proxy(Option<u64>),
-}
+// ------------------------------------------------------------------ method
 
 /// Compiled code. Args occupy slot indices `0..nargs`, locals follow.
 pub struct Method {
@@ -461,8 +460,6 @@ pub struct Method {
     /// (`_sourceOffset`/`_sourceLen`, non-zero only for a block, whose source
     /// string is its enclosing method's). Only a loaded method has one: serf's
     /// parser does not record source spans.
-    /// ponytail: None means "no source"; give the parser spans if editing
-    /// methods from within a loaded world ever needs to write one back.
     pub source: Option<(Value, i64, i64)>,
     /// Inline caches, one per literal; sized on the method's first send. Not
     /// a GC root: an entry is only read at the generation it was filled at,
@@ -470,13 +467,7 @@ pub struct Method {
     pub sites: RefCell<Vec<Site>>,
 }
 
-/// A send site's inline cache: the last receiver seen there, and what lookup
-/// found for it. serf's compiler emits a fresh literal per send, so a literal
-/// index *is* a site id; the C++ compiler shares literals between sends of the
-/// same selector, where this degrades to one entry per (method, selector).
-///
-/// ponytail: monomorphic -- one entry, no polymorphic slots. Most sites never
-/// see a second receiver; widen it to 4 when a miss counter says otherwise.
+/// A send site's inline cache.
 #[derive(Clone, Copy)]
 pub struct Site {
     /// arity of the selector in this literal, a pure function of it -- so
@@ -485,9 +476,7 @@ pub struct Site {
     /// The `LOOKUP_GEN` that was true at, the last receiver seen here, its map,
     /// and what lookup found. Two ways in: the same receiver again hits without
     /// touching the object at all, and a *different* receiver of the same shape
-    /// hits after one deref to read its map. The first is what a monomorphic
-    /// site wants and is the cheaper of the two; the second is what a loop over
-    /// a clone family wants, and receiver keying alone could never give it.
+    /// hits after one deref to read its map.
     hit: Option<(u64, ObjRef, MapRef, MapHit)>,
 }
 
@@ -516,8 +505,7 @@ impl Method {
     }
 
     /// The same receiver as last time? Then the answer stands, and reading the
-    /// object to find its map was not necessary. Tried first because it is the
-    /// common case and the only one that touches nothing.
+    /// object to find its map was not necessary.
     pub fn site_hit_recv(&self, i: usize, r: ObjRef) -> Option<MapHit> {
         match self.sites()[i].hit {
             Some((g, s, _, h)) if s == r && g == lookup_gen() => {
@@ -529,8 +517,7 @@ impl Method {
     }
 
     /// A different receiver, but of the same shape. This is the probe receiver
-    /// keying could not make: a loop over a thousand clones of one prototype
-    /// arrives here a thousand times and hits every time.
+    /// keying could not make.
     pub fn site_hit_map(&self, i: usize, k: MapRef) -> Option<MapHit> {
         match self.sites()[i].hit {
             Some((g, _, m, h)) if m == k && g == lookup_gen() => {
@@ -549,107 +536,78 @@ impl Method {
     }
 }
 
-/// One activation's mutable state. Lives on the heap because blocks capture it.
-pub struct Scope {
-    pub method: Rc<Method>,
-    pub recv: Value,
-    /// object that held the activated slot; start point for undirected resends
-    pub holder: Value,
-    pub slots: RefCell<Vec<Value>>,
-    pub lexical: Option<Rc<Scope>>,
-    /// `None` means "I am the home" (an ordinary method)
-    pub home: Option<Rc<Scope>>,
-    pub dead: Cell<bool>,
-}
+// -------------------------------------------------------------- activations
 
-impl Scope {
-    pub fn home_of(s: &Rc<Scope>) -> Rc<Scope> {
-        s.home.clone().unwrap_or_else(|| s.clone())
+/// An activation is a heap object now, so there is no `Rc` to hand back and no
+/// pool to hand it to: a frame that returns simply stops naming it, and the
+/// next scavenge forgets it. This is where 1.79M of the 1.86M mallocs a test
+/// run used to make have gone.
+pub fn new_activation(
+    m: Rc<Method>,
+    recv: Value,
+    holder: Value,
+    args: &[Value],
+    lexical: Option<ObjRef>,
+) -> ObjRef {
+    let inits = m.slot_inits.clone();
+    let arg_slots = m.arg_slots.clone();
+    let home = lexical.map(home_of);
+    let a = obj::new_activation(m, inits.len());
+    obj::act_set(a, act::RECV, recv);
+    obj::act_set(a, act::HOLDER, holder);
+    obj::act_set_link(a, act::LEXICAL, lexical);
+    obj::act_set_link(a, act::HOME, home);
+    obj::act_set_dead(a, false);
+    for (i, v) in inits.iter().enumerate() {
+        obj::act_set_local(a, i, *v);
     }
-}
-
-/// An activation's slot buffer goes back to the pool rather than to malloc.
-/// Dropping the from-space was more than half spent here: a block in the young
-/// generation holds its captured activation, so a scavenge that collects the
-/// block frees the activation too, and `free` on this thread ends in `madvise`.
-impl Drop for Scope {
-    fn drop(&mut self) {
-        give_vals(std::mem::take(self.slots.get_mut()));
+    for (i, v) in args.iter().enumerate() {
+        obj::act_set_local(a, arg_slots[i], *v);
     }
+    a
 }
 
-thread_local! {
-    /// Recycled `Vec<Value>` buffers. An activation's slots and a send's
-    /// arguments have the same shape and the same lifetime -- born at a send,
-    /// dead a moment later -- so they come from here and go back, and in the
-    /// steady state a send allocates nothing at all.
-    /// ponytail: a plain stack, not a size-classed pool; every buffer in it is
-    /// a handful of `Value`s wide.
-    static VALS: RefCell<Vec<Vec<Value>>> = const { RefCell::new(Vec::new()) };
+pub fn home_of(a: ObjRef) -> ObjRef {
+    obj::act_link(a, act::HOME).unwrap_or(a)
 }
 
-/// Cap on both how many buffers are kept and how big a kept one may be: a
-/// method with hundreds of slots is rare enough that recycling its buffer
-/// would cost more memory than it saves.
-const VALS_KEPT: usize = 256;
-const VALS_WIDEST: usize = 64;
-
-pub fn take_vals() -> Vec<Value> {
-    VALS.try_with(|p| p.borrow_mut().pop()).ok().flatten().unwrap_or_default()
+pub fn act_method(a: ObjRef) -> Rc<Method> {
+    obj::act_method(a)
 }
 
-thread_local! {
-    /// Activations nobody holds any more. An `Rc` cannot hand its allocation
-    /// back as it drops, so a frame that has finished with one offers it here
-    /// instead: uniquely owned, it can be refilled in place by the next send,
-    /// slot buffer and all. An activation some block captured has a second
-    /// reference and is declined, and freed the ordinary way.
-    static SCOPES: RefCell<Vec<Rc<Scope>>> = const { RefCell::new(Vec::new()) };
+pub fn act_recv(a: ObjRef) -> Value {
+    obj::act_get(a, act::RECV)
 }
 
-const SCOPES_KEPT: usize = 256;
-
-/// Offer a finished activation to the pool. Declines any that is still
-/// referenced -- that is what makes refilling it in place sound.
-pub fn give_scope(mut s: Rc<Scope>) {
-    let Some(m) = Rc::get_mut(&mut s) else { return };
-    // park it holding nothing: its lexical chain and the values in its slots
-    // must not stay reachable just because the buffer is worth keeping
-    m.lexical = None;
-    m.home = None;
-    m.slots.get_mut().clear();
-    // `try_with`, not `with`: at thread exit these two pools are destroyed in
-    // an order neither of them picks, and dropping a parked activation runs
-    // `Scope::drop`, which reaches for the other one. Losing a buffer on the
-    // way out costs nothing.
-    let _ = SCOPES.try_with(|p| {
-        let mut p = p.borrow_mut();
-        if p.len() < SCOPES_KEPT {
-            p.push(s);
-        }
-    });
+pub fn act_holder(a: ObjRef) -> Value {
+    obj::act_get(a, act::HOLDER)
 }
 
-pub fn take_scope() -> Option<Rc<Scope>> {
-    SCOPES.try_with(|p| p.borrow_mut().pop()).ok().flatten()
+pub fn act_lexical(a: ObjRef) -> Option<ObjRef> {
+    obj::act_link(a, act::LEXICAL)
 }
 
-pub fn give_vals(mut v: Vec<Value>) {
-    if v.capacity() == 0 || v.capacity() > VALS_WIDEST {
-        return;
-    }
-    v.clear(); // `Value` is `Copy`, so this is just a length store
-    let _ = VALS.try_with(|p| {
-        let mut p = p.borrow_mut();
-        if p.len() < VALS_KEPT {
-            p.push(v);
-        }
-    });
+pub fn act_dead(a: ObjRef) -> bool {
+    obj::act_dead(a)
 }
+
+pub fn act_set_dead(a: ObjRef, d: bool) {
+    obj::act_set_dead(a, d)
+}
+
+pub fn act_local(a: ObjRef, i: usize) -> Value {
+    obj::act_local(a, i)
+}
+
+pub fn act_set_local(a: ObjRef, i: usize, v: Value) {
+    obj::act_set_local(a, i, v)
+}
+
+// ------------------------------------------------------------------- values
 
 impl Value {
-    pub fn obj(slots: impl Into<Slots>, payload: Payload) -> Value {
-        Value::Obj(crate::gc::alloc(slots.into(), payload))
+    pub fn obj(slots: impl AsRef<[Slot]>, payload: Payload) -> Value {
+        Value::Obj(obj::make(slots.as_ref(), payload, false))
     }
     pub fn id_eq(&self, o: &Value) -> bool {
         match (self, o) {
@@ -666,60 +624,13 @@ impl Value {
         }
     }
     pub fn method(&self) -> Option<Rc<Method>> {
-        match self {
-            Value::Obj(o) => match &o.borrow().payload {
-                Payload::Method(m) => Some(m.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
+        self.as_obj().and_then(obj::method_of)
     }
     pub fn bytes(&self) -> Option<Vec<u8>> {
-        match self {
-            Value::Obj(o) => match &o.borrow().payload {
-                Payload::Bytes(b) => Some(b.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
+        self.as_obj().and_then(obj::bytes)
     }
     pub fn as_str(&self) -> Option<String> {
         self.bytes().map(|b| String::from_utf8_lossy(&b).into_owned())
-    }
-}
-
-pub fn slot(name: &str, kind: SlotKind, value: Value) -> Slot {
-    Slot { name: sym(name), kind, value }
-}
-
-impl Obj {
-    /// By interned name. Every hot caller already has one; `find` is for the
-    /// cold ones that hold a string and pay a hash to get here.
-    pub fn find_sym(&self, name: Sym) -> Option<usize> {
-        self.slots.iter().position(|s| s.name == name)
-    }
-    pub fn find(&self, name: &str) -> Option<usize> {
-        self.find_sym(sym(name))
-    }
-    /// Add or replace by name.
-    pub fn put(&mut self, s: Slot) {
-        lookup_gen_bump();
-        self.forget_map();
-        match self.find_sym(s.name) {
-            Some(i) => self.slots[i] = s,
-            None => self.slots.push(s),
-        }
-    }
-    /// Write a slot's value. A parent write rewires the object graph and so
-    /// invalidates memoised lookups and this object's map; a data write cannot
-    /// change what a lookup finds, so it leaves both alone -- which is the
-    /// point of keeping data values out of the shape.
-    pub fn assign(&mut self, i: usize, v: Value) {
-        if self.slots[i].kind == SlotKind::Parent {
-            lookup_gen_bump();
-            self.forget_map();
-        }
-        self.slots[i].value = v;
     }
 }
 
@@ -731,16 +642,6 @@ pub enum LookupErr {
     Ambiguous,
 }
 
-/// One edge into the object graph. A `Scope` is not a heap object -- it is
-/// reference counted, and holding one alive keeps the `Value`s inside it alive
-/// too -- so the collector has to be told about it separately. A `Method` needs
-/// no such case: one is only ever reached through the scope it runs in or the
-/// object that holds it.
-pub enum Root {
-    Val(Value),
-    Scope(Rc<Scope>),
-}
-
 /// Where a selector was found: a slot index in some holder object.
 #[derive(Clone, Copy)]
 pub struct Hit {
@@ -750,10 +651,7 @@ pub struct Hit {
 
 /// The same answer, relative to the object the search started from: a slot in
 /// that object itself, or a slot in one particular ancestor. The distinction is
-/// what makes a hit cacheable across a whole clone family -- a `Hit`'s `holder`
-/// is the receiver when the slot is the receiver's own, and every object
-/// sharing a map has a different one. An ancestor is shared, because a parent
-/// slot's value is part of the shape.
+/// what makes a hit cacheable across a whole clone family.
 #[derive(Clone, Copy)]
 pub enum MapHit {
     OnSelf(usize),
@@ -776,11 +674,10 @@ impl MapHit {
     }
 }
 
-/// Memoised `lookup` results, selector -> start object -> outcome. Entries are
-/// valid only for the `LOOKUP_GEN` they were filled at; the whole cache is
-/// dropped when the generation moves, which also covers recycled handle ids.
-/// ponytail: whole-cache flush on any shape change; per-object invalidation
-/// if a mutation-heavy workload ever thrashes it.
+/// Memoised `lookup` results, selector -> receiver shape -> outcome. Entries
+/// are valid only for the `LOOKUP_GEN` they were filled at; the whole cache is
+/// dropped when the generation moves, which also covers a collection having
+/// moved every address a shape is keyed on.
 #[derive(Default)]
 pub struct LookupCache {
     gen: u64,
@@ -809,45 +706,22 @@ pub struct Vm {
     /// the 40 VM roots of a loaded image, so it can be written back out
     pub image_roots: Option<Vec<Value>>,
     pub image_strings: Option<Vec<Value>>,
-    /// Self keeps annotations and the object's kind in its map; serf has no
-    /// maps, so a loaded image parks them here keyed by object identity, and
-    /// the image writer puts them back.
-    pub anno_obj: std::collections::HashMap<usize, Value>,
-    /// nested by object rather than keyed on (object, slot): a collection
-    /// walks this to drop dead entries, and morphic holds 456k annotations
-    /// against 138k objects, so the walk is the object count either way
-    pub anno_slot: std::collections::HashMap<usize, std::collections::HashMap<Sym, Value>>,
-    /// Annotation values that may still be young. The two tables above are
-    /// Rust side, so they cannot be in the collector's remembered set; this
-    /// is their write barrier, and a scavenge takes it as the root set rather
-    /// than walking a loaded world's couple of hundred thousand entries. An
-    /// old annotation needs no barrier: old objects neither move nor die
-    /// outside a major collection, and a major walks both tables in full.
-    pub anno_young: Vec<Value>,
-    /// Identity hashes carried over from a snapshot. Self keeps an object's
-    /// hash in its mark word, so hashed collections survive a save; computing
-    /// a fresh one on load would leave every dictionary in the image unable
-    /// to find its own keys.
-    pub id_hash: std::collections::HashMap<usize, i64>,
-    pub obj_kind: std::collections::HashMap<usize, u8>,
     /// dynamically loaded C libraries, for the image's glue primitives
     pub ffi: crate::ffi::Ffi,
-    /// parked Self process stacks, keyed by process object identity
-    pub procs: std::collections::HashMap<usize, Vec<crate::interp::Frame>>,
+    /// parked Self process stacks. A list rather than a map: the key is an
+    /// object, and an object's address is not a key across a collection.
+    pub procs: Vec<(Value, Vec<crate::interp::Frame>)>,
     /// frame stacks lent to the Vm while the interpreter is somewhere it could
-    /// collect. A nested run (the scheduler stepping a process, a fail block,
-    /// `_Parse…`) leaves the outer stacks as Rust locals, where the collector
-    /// cannot see them, so `run_stack` lends its own across anything that
-    /// might re-enter.
+    /// collect. A nested run leaves the outer stacks as Rust locals, where the
+    /// collector cannot see them, so `run_stack` lends its own across anything
+    /// that might re-enter.
     pub stacks: Vec<Vec<crate::interp::Frame>>,
     /// values held in Rust locals across a call that can re-enter the
     /// interpreter, and so across a collection
     pub temp_roots: Vec<Value>,
     /// the process the scheduler is currently running, for _ThisProcess
     pub current_proc: Option<Value>,
-    /// stand-in process for code run outside the scheduler, which must not be
-    /// identical to the world's schedulerProcess or its error handler
-    /// resets its own recursion guard forever
+    /// stand-in process for code run outside the scheduler
     pub vm_proc: Option<Value>,
     pub signals_blocked: bool,
     /// true while the world's own scheduler loop is on the stack
@@ -856,11 +730,11 @@ pub struct Vm {
     pub timestamp: i64,
     /// C structs handed to foreign code; kept alive for the VM's lifetime
     pub c_heap: Vec<Vec<u8>>,
-    pub flags: std::collections::HashMap<String, Value>,
+    pub flags: HashMap<String, Value>,
     /// Self canonicalises strings: `traits canonicalString =` tests identity
     /// first, so a string serf hands the world must be the world's own object
     /// or it compares unequal to every literal.
-    pub canonical: std::collections::HashMap<Vec<u8>, Value>,
+    pub canonical: HashMap<Vec<u8>, Value>,
     /// see `lookup`; not a GC root -- entries never outlive their generation,
     /// and a collection bumps it
     pub lookup_cache: RefCell<LookupCache>,
@@ -880,52 +754,35 @@ impl Vm {
         let t_vector = mk();
         let t_block = mk();
         let traits = Value::obj(
-            vec![
-                slot("object", SlotKind::Data, t_object.clone()),
-                slot("smallInt", SlotKind::Data, t_smallint.clone()),
-                slot("float", SlotKind::Data, t_float.clone()),
-                slot("string", SlotKind::Data, t_string.clone()),
-                slot("byteVector", SlotKind::Data, t_bytevector.clone()),
-                slot("vector", SlotKind::Data, t_vector.clone()),
-                slot("block", SlotKind::Data, t_block.clone()),
+            [
+                slot("object", SlotKind::Data, t_object),
+                slot("smallInt", SlotKind::Data, t_smallint),
+                slot("float", SlotKind::Data, t_float),
+                slot("string", SlotKind::Data, t_string),
+                slot("byteVector", SlotKind::Data, t_bytevector),
+                slot("vector", SlotKind::Data, t_vector),
+                slot("block", SlotKind::Data, t_block),
             ],
             Payload::None,
         );
         let globals = Value::obj(
-            vec![
+            [
                 slot("traits", SlotKind::Data, traits),
-                slot("nil", SlotKind::Data, nil.clone()),
-                slot("true", SlotKind::Data, tru.clone()),
-                slot("false", SlotKind::Data, fals.clone()),
+                slot("nil", SlotKind::Data, nil),
+                slot("true", SlotKind::Data, tru),
+                slot("false", SlotKind::Data, fals),
             ],
             Payload::None,
         );
-        let lobby = Value::obj(
-            vec![slot("globals", SlotKind::Parent, globals.clone())],
-            Payload::None,
-        );
+        let lobby = Value::obj([slot("globals", SlotKind::Parent, globals)], Payload::None);
         // prototypes: Self code cannot conjure an indexable out of nothing
-        let string_proto = Value::obj(
-            vec![slot("parent", SlotKind::Parent, t_string.clone())],
-            Payload::Bytes(vec![]),
-        );
-        let bv_proto = Value::obj(
-            vec![slot("parent", SlotKind::Parent, t_bytevector.clone())],
-            Payload::Bytes(vec![]),
-        );
-        let vec_proto = Value::obj(
-            vec![slot("parent", SlotKind::Parent, t_vector.clone())],
-            Payload::Vector(vec![]),
-        );
-        {
-            let mut g = globals.as_obj().unwrap().borrow_mut();
-            g.put(slot("lobby", SlotKind::Data, lobby.clone()));
-            g.put(slot("globals", SlotKind::Data, globals.clone()));
-            g.put(slot("string", SlotKind::Data, string_proto));
-            g.put(slot("byteVector", SlotKind::Data, bv_proto));
-            g.put(slot("vector", SlotKind::Data, vec_proto));
-        }
-        Vm {
+        let string_proto =
+            Value::obj([slot("parent", SlotKind::Parent, t_string)], Payload::Bytes(vec![]));
+        let bv_proto =
+            Value::obj([slot("parent", SlotKind::Parent, t_bytevector)], Payload::Bytes(vec![]));
+        let vec_proto =
+            Value::obj([slot("parent", SlotKind::Parent, t_vector)], Payload::Vector(vec![]));
+        let mut vm = Vm {
             lobby,
             globals,
             nil,
@@ -942,13 +799,8 @@ impl Vm {
             image_false: None,
             image_roots: None,
             image_strings: None,
-            anno_obj: std::collections::HashMap::new(),
-            anno_slot: std::collections::HashMap::new(),
-            anno_young: vec![],
-            id_hash: std::collections::HashMap::new(),
-            obj_kind: std::collections::HashMap::new(),
             ffi: crate::ffi::Ffi::default(),
-            procs: std::collections::HashMap::new(),
+            procs: vec![],
             stacks: vec![],
             temp_roots: vec![],
             current_proc: None,
@@ -957,129 +809,102 @@ impl Vm {
             scheduler_running: false,
             timestamp: 0,
             c_heap: vec![],
-            flags: std::collections::HashMap::new(),
-            canonical: std::collections::HashMap::new(),
+            flags: HashMap::new(),
+            canonical: HashMap::new(),
             lookup_cache: RefCell::new(LookupCache::default()),
-        }
-    }
-
-    /// Everything the collector must treat as live. Miss one and the object it
-    /// names is collected out from under the VM, so this walks every field of
-    /// `Vm` that can hold a `Value`, however deeply.
-    ///
-    /// The address-keyed side tables are handled as weak-key tables: their
-    /// contents are traced here, and `sweep_weak` then drops whole entries
-    /// whose key object turned out to be dead. An entry therefore outlives its
-    /// object by one collection, which costs nothing and avoids a fixpoint.
-    /// `major` when the caller is a mark & sweep, which may free an old
-    /// object and so has to see every reference the VM holds. A scavenge only
-    /// needs the ones that could name something young.
-    pub fn each_root(&self, major: bool, f: &mut dyn FnMut(Root)) {
-        let mut v = |x: &Value| f(Root::Val(*x));
-        for x in [
-            &self.lobby,
-            &self.globals,
-            &self.nil,
-            &self.tru,
-            &self.fals,
-            &self.t_smallint,
-            &self.t_float,
-            &self.t_string,
-            &self.t_bytevector,
-            &self.t_vector,
-            &self.t_block,
+        };
+        for (n, v) in [
+            ("lobby", lobby),
+            ("globals", globals),
+            ("string", string_proto),
+            ("byteVector", bv_proto),
+            ("vector", vec_proto),
         ] {
-            v(x);
+            let g = vm.globals;
+            vm.put_slot(g, slot(n, SlotKind::Data, v));
         }
-        for x in [&self.image_true, &self.image_false, &self.current_proc, &self.vm_proc] {
-            if let Some(x) = x {
-                v(x);
-            }
-        }
-        for x in self.image_roots.iter().chain(self.image_strings.iter()).flatten() {
-            v(x);
-        }
-        // canonical strings are strong, as the C++ VM's string table is at a
-        // scavenge (stringTable.hh:87). ponytail: prune them at a major
-        // collection if a long session ever accumulates too many.
-        for x in self.canonical.values().chain(self.flags.values()) {
-            v(x);
-        }
-        // A loaded world has one of these per annotated slot -- a couple of
-        // hundred thousand for morphic, where walking them was about a third
-        // of every scavenge (5.8ms -> 3.9ms once it stopped). Only a major
-        // has to see them: an old object neither moves nor dies outside one,
-        // so a scavenge takes the write barrier's list instead.
-        if major {
-            for x in self.anno_obj.values().chain(self.anno_slot.values().flatten().map(|(_, v)| v)) {
-                v(x);
-            }
-        } else {
-            for x in self.anno_young.iter() {
-                v(x);
-            }
-        }
-        for x in self.temp_roots.iter() {
-            v(x);
-        }
-        for fs in self.stacks.iter().chain(self.procs.values()) {
-            crate::interp::frame_roots(fs, f);
-        }
+        vm
     }
 
-    /// Record an annotation value as a scavenge root. Call after every insert
-    /// into `anno_obj` or `anno_slot`; an old value costs nothing but one
-    /// scavenge's worth of list.
-    pub fn note_anno(&mut self, v: &Value) {
-        if matches!(v, Value::Obj(_)) {
-            self.anno_young.push(*v);
+    /// Add or replace a slot. An object is a fixed run of words, so adding one
+    /// builds a wider object and switches every pointer to it --
+    /// `universe::switch_pointers` (memory/universe.cpp:315), which is the bill
+    /// direct pointers come with and is affordable because this happens while a
+    /// world is being programmed, not while it runs.
+    pub fn put_slot(&mut self, o: Value, s: Slot) {
+        lookup_gen_bump();
+        let Some(at) = o.as_obj() else { return };
+        if let Some(i) = obj::find(at, s.name) {
+            forget_map(at);
+            heap::set_slot_desc(at, i, s.name.id(), s.kind as u8);
+            obj::assign(at, i, s.value);
+            return;
         }
+        let wide = obj::grow(at, &[s]);
+        self.switch(at, wide);
     }
 
-    /// Drop side-table entries whose object died. Handle ids are recycled, so a
-    /// stale entry would otherwise reattach an annotation or an identity hash
-    /// to an unrelated object later on.
-    pub fn sweep_weak(&mut self, dead: &dyn Fn(usize) -> bool) {
-        self.anno_obj.retain(|k, _| !dead(*k));
-        self.anno_slot.retain(|k, _| !dead(*k));
-        self.id_hash.retain(|k, _| !dead(*k));
-        self.obj_kind.retain(|k, _| !dead(*k));
-        self.procs.retain(|k, _| !dead(*k));
+    /// Drop the slots a name owns -- the data slot and its assignment slot.
+    /// Answers whether anything went.
+    pub fn remove_slot(&mut self, o: Value, name: &str) -> bool {
+        lookup_gen_bump();
+        let Some(at) = o.as_obj() else { return false };
+        let colon = format!("{}:", name);
+        let keep: Vec<Slot> = at
+            .borrow()
+            .slots
+            .iter()
+            .filter(|s| sym_str(s.name) != name && sym_str(s.name) != colon)
+            .collect();
+        if keep.len() == obj::slot_count(at) {
+            return false;
+        }
+        let narrow = obj::reshape(at, &keep);
+        self.switch(at, narrow);
+        true
+    }
+
+    fn switch(&mut self, from: ObjRef, to: ObjRef) {
+        let mut r = VmRoots { vm: self };
+        heap::heap().switch_pointers(&mut r, from, to);
     }
 
     pub fn is_false(&self, v: &Value) -> bool {
-        v.id_eq(&self.fals) || self.image_false.as_ref().map_or(false, |f| v.id_eq(f))
+        v.id_eq(&self.fals) || self.image_false.as_ref().is_some_and(|f| v.id_eq(f))
+    }
+
+    /// nil, the image's if one is loaded.
+    pub fn nil_v(&self) -> Value {
+        self.image_roots.as_ref().map_or(self.nil, |r| r[1])
     }
 
     /// Primitives must answer with the *image's* booleans when one is loaded,
     /// or the world's `ifTrue:` finds no methods on them.
-    /// nil, the image's if one is loaded.
-    pub fn nil_v(&self) -> Value {
-        self.image_roots.as_ref().map_or_else(|| self.nil.clone(), |r| r[1].clone())
-    }
-
     pub fn boolean(&self, b: bool) -> Value {
         if b {
-            self.image_true.clone().unwrap_or_else(|| self.tru.clone())
+            self.image_true.unwrap_or(self.tru)
         } else {
-            self.image_false.clone().unwrap_or_else(|| self.fals.clone())
+            self.image_false.unwrap_or(self.fals)
         }
     }
 
     pub fn string(&self, s: &str) -> Value {
         if let Some(v) = self.canonical.get(s.as_bytes()) {
-            return v.clone();
+            return *v;
         }
-        self.bytes_with(self.t_string.clone(), s.as_bytes().to_vec())
+        self.bytes_with(self.t_string, s.as_bytes().to_vec())
     }
 
     pub fn bytes_with(&self, parent: Value, b: Vec<u8>) -> Value {
-        Value::obj([Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: parent }], Payload::Bytes(b))
+        Value::obj(
+            [Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: parent }],
+            Payload::Bytes(b),
+        )
     }
 
     pub fn vector(&self, v: Vec<Value>) -> Value {
         Value::obj(
-            vec![Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: self.t_vector }],
+            [Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: self.t_vector }],
             Payload::Vector(v),
         )
     }
@@ -1088,15 +913,13 @@ impl Vm {
     /// none of their own, so lookup starts in their traits.
     fn implicit_parent(&self, v: &Value) -> Option<Value> {
         match v {
-            Value::Int(_) => Some(self.t_smallint.clone()),
-            Value::Float(_) => Some(self.t_float.clone()),
+            Value::Int(_) => Some(self.t_smallint),
+            Value::Float(_) => Some(self.t_float),
             Value::Obj(_) => None,
         }
     }
 
-    /// The object a search actually starts from, and so what a memoised
-    /// lookup is keyed on: an immediate has none of its own slots, so it
-    /// starts in its traits and every int shares one entry.
+    /// The object a search actually starts from.
     pub fn lookup_key(&self, recv: &Value) -> ObjRef {
         match recv.as_obj() {
             Some(o) => o,
@@ -1105,12 +928,10 @@ impl Vm {
     }
 
     /// The object a search starts from, and the map a memoised result is keyed
-    /// on. Every object of that shape shares the entry, which is the whole
-    /// point: the receiver's own identity would give each clone its own.
+    /// on. Every object of that shape shares the entry.
     pub fn map_key(&self, recv: &Value) -> (ObjRef, MapRef) {
         let start = self.lookup_key(recv);
-        let m = start.borrow().map();
-        (start, m)
+        (start, map_of(start))
     }
 
     pub fn lookup(&self, recv: &Value, sel: &str) -> Result<Hit, LookupErr> {
@@ -1150,7 +971,7 @@ impl Vm {
         let r = stored.map(|h| h.at(start));
         let mut c = self.lookup_cache.borrow_mut();
         // ponytail: crude size cap; an LRU if a world ever legitimately holds
-        // this many live (receiver, selector) pairs
+        // this many live (shape, selector) pairs
         if c.len >= 1 << 20 {
             c.map.clear();
             c.len = 0;
@@ -1194,7 +1015,7 @@ impl Vm {
             return;
         }
         seen.push(o);
-        if let Some(idx) = o.borrow().find(sel) {
+        if let Some(idx) = obj::find(o, sym(sel)) {
             if !hits.iter().any(|h| h.holder == o && h.idx == idx) {
                 hits.push(Hit { holder: o, idx });
             }
@@ -1203,20 +1024,82 @@ impl Vm {
         self.search_parents(o, sel, hits, seen);
     }
 
-    /// Recurse into each parent, re-borrowing per slot rather than collecting
-    /// the parents into a vector: nothing can mutate the object mid-search.
     fn search_parents(&self, o: ObjRef, sel: &str, hits: &mut Vec<Hit>, seen: &mut Vec<ObjRef>) {
-        let n = o.borrow().slots.len();
-        for i in 0..n {
-            let b = o.borrow();
-            let s = &b.slots[i];
-            if s.kind != SlotKind::Parent {
+        for i in 0..obj::slot_count(o) {
+            if obj::slot_kind(o, i) != SlotKind::Parent {
                 continue;
             }
-            let p = s.value;
-            drop(b);
+            let p = obj::slot_value(o, i);
             self.search(&p, sel, hits, seen);
         }
+    }
+}
+
+// ------------------------------------------------------------------- roots
+
+/// Everything the collector must treat as live, as slots it may rewrite.
+///
+/// With a handle table nothing had to be rewritten and a stale reference was
+/// merely stale. With direct pointers a root the collector does not know about
+/// is a pointer into a space that has been abandoned, so this walks every
+/// field of `Vm` that can hold a `Value`, however deeply.
+pub struct VmRoots<'a> {
+    pub vm: &'a mut Vm,
+}
+
+pub fn rewrite(v: &mut Value, f: &mut dyn FnMut(&mut Oop)) {
+    let mut w = obj::to_oop(*v);
+    if w.is_obj() {
+        f(&mut w);
+        *v = obj::from_oop(w);
+    }
+}
+
+impl heap::Roots for VmRoots<'_> {
+    fn each(&mut self, f: &mut dyn FnMut(&mut Oop)) {
+        let vm = &mut *self.vm;
+        for x in [
+            &mut vm.lobby,
+            &mut vm.globals,
+            &mut vm.nil,
+            &mut vm.tru,
+            &mut vm.fals,
+            &mut vm.t_smallint,
+            &mut vm.t_float,
+            &mut vm.t_string,
+            &mut vm.t_bytevector,
+            &mut vm.t_vector,
+            &mut vm.t_block,
+        ] {
+            rewrite(x, f);
+        }
+        for x in [&mut vm.image_true, &mut vm.image_false, &mut vm.current_proc, &mut vm.vm_proc] {
+            if let Some(x) = x {
+                rewrite(x, f);
+            }
+        }
+        for x in vm.image_roots.iter_mut().chain(vm.image_strings.iter_mut()).flatten() {
+            rewrite(x, f);
+        }
+        // canonical strings are strong, as the C++ VM's string table is at a
+        // scavenge (stringTable.hh:87)
+        for x in vm.canonical.values_mut().chain(vm.flags.values_mut()) {
+            rewrite(x, f);
+        }
+        for x in vm.temp_roots.iter_mut() {
+            rewrite(x, f);
+        }
+        for (p, fs) in vm.procs.iter_mut() {
+            rewrite(p, f);
+            crate::interp::frame_roots(fs, f);
+        }
+        for fs in vm.stacks.iter_mut() {
+            crate::interp::frame_roots(fs, f);
+        }
+    }
+
+    fn dying(&mut self, o: Oop) {
+        obj::on_dying(o);
     }
 }
 
@@ -1246,21 +1129,25 @@ pub fn default_print_string(vm: &Vm, v: &Value) -> String {
                 return "false".into();
             }
             let b = o.borrow();
-            match &b.payload {
-                Payload::Bytes(bytes) => format!("'{}'", String::from_utf8_lossy(bytes)),
-                Payload::Vector(items) => {
+            match b.payload.kind() {
+                PayKind::Bytes => {
+                    format!("'{}'", String::from_utf8_lossy(&b.payload.bytes().unwrap()))
+                }
+                PayKind::Vector => {
                     let parts: Vec<String> =
-                        items.iter().map(|i| default_print_string(vm, i)).collect();
+                        b.payload.vector().unwrap().iter().map(|i| default_print_string(vm, i)).collect();
                     format!("({}. )", parts.join(". "))
                 }
-                Payload::Method(m) => format!("<method {}>", m.sel),
-                Payload::Block(m, _) => format!("<block {}>", m.sel),
-                Payload::Mirror(_) => "<mirror>".to_string(),
-                Payload::Proxy(p) => match p {
+                PayKind::Method => format!("<method {}>", b.payload.method().unwrap().sel),
+                PayKind::Block => format!("<block {}>", b.payload.method().unwrap().sel),
+                PayKind::Mirror => "<mirror>".to_string(),
+                PayKind::Float => fmt_float(f64::from_bits(heap::aux_word(*o, 0))),
+                PayKind::Activation => "<activation>".to_string(),
+                PayKind::Proxy => match b.payload.proxy() {
                     Some(p) => format!("<proxy {:#x}>", p),
                     None => "<dead proxy>".into(),
                 },
-                Payload::None => {
+                PayKind::None => {
                     let names: Vec<String> = b
                         .slots
                         .iter()
@@ -1273,4 +1160,26 @@ pub fn default_print_string(vm: &Vm, v: &Value) -> String {
             }
         }
     }
+}
+
+/// A method with nothing in it, for tests that need one to hang an object or
+/// an activation off.
+#[cfg(test)]
+pub fn test_method() -> Rc<Method> {
+    Rc::new(Method {
+        sel: "t".into(),
+        nargs: 0,
+        arg_slots: vec![],
+        slot_names: vec![],
+        slot_flags: vec![],
+        slot_inits: vec![],
+        code: vec![],
+        lits: vec![],
+        lit_strs: vec![],
+        is_block: false,
+        file: "t".into(),
+        line: 0,
+        source: None,
+        sites: Default::default(),
+    })
 }

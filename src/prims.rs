@@ -169,7 +169,7 @@ fn lookup_path(vm: &Vm, path: &[&str]) -> Option<Value> {
     let mut cur = vm.image_roots.as_ref()?[0].clone();
     for name in path {
         let hit = vm.lookup(&cur, name).ok()?;
-        let next = hit.holder.borrow().slots[hit.idx].value.clone();
+        let next = hit.holder.borrow().slots.get(hit.idx).value;
         cur = next;
     }
     Some(cur)
@@ -470,11 +470,11 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         // roots are all reachable is between two bytecodes.
         // ponytail: _Tenure is a scavenge here, not "promote everything".
         "_Scavenge" | "_Tenure" => {
-            crate::gc::gc().request(false);
+            crate::gc::request(false);
             v(*recv)
         }
         "_GarbageCollect" => {
-            crate::gc::gc().request(true);
+            crate::gc::request(true);
             v(*recv)
         }
 
@@ -567,10 +567,10 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let (i, by_assignment) = slot_desc(&b.slots, &n)?;
             let yes = !by_assignment
                 && match name {
-                    "_MirrorIsParentAt:" => b.slots[i].kind == SlotKind::Parent,
+                    "_MirrorIsParentAt:" => b.slots.get(i).kind == SlotKind::Parent,
                     // assignable == there is an `x:` to write it with
                     "_MirrorIsAssignableAt:" => {
-                        let a = format!("{}:", b.slots[i].name);
+                        let a = format!("{}:", b.slots.get(i).name);
                         b.slots.iter().any(|s| s.kind == SlotKind::Assign && sym_str(s.name) == a)
                     }
                     // serf drops argument slots when it loads a method: they
@@ -587,7 +587,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 let o = as_obj(&r, name)?;
                 let b = o.borrow();
                 let (i, _) = slot_desc(&b.slots, &n)?;
-                b.slots[i].name.to_string()
+                b.slots.get(i).name.to_string()
             };
             // Map::get_annotation defaults to the world's empty annotation,
             // never nil: `annotationIfFail:` parses whatever comes back.
@@ -663,7 +663,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 let roots = vm.image_roots.as_ref().ok_or("reflectTypeError")?;
                 return v(roots[20].clone()); // assignmentMirrorObj
             }
-            let got = as_obj(&r, name)?.borrow().slots[i].value.clone();
+            let got = as_obj(&r, name)?.borrow().slots.get(i).value;
             // "Return a mirror on the contents of the specified slot"
             // (prim.cpp:1401), not the contents themselves
             v(make_mirror(vm, &got)?)
@@ -1147,7 +1147,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let n = as_name(&args[0], name)?;
             let o = as_obj(recv, name)?.borrow();
             match o.find(&n) {
-                Some(i) => v(o.slots[i].value.clone()),
+                Some(i) => v(o.slots.get(i).value),
                 None => Err("slotNameError".into()),
             }
         }
@@ -1165,7 +1165,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             let n = as_name(&args[0], name)?;
             let o = as_obj(recv, name)?.borrow();
             match o.find(&n) {
-                Some(i) => v(vm.boolean(o.slots[i].kind == SlotKind::Parent)),
+                Some(i) => v(vm.boolean(o.slots.get(i).kind == SlotKind::Parent)),
                 None => Err("slotNameError".into()),
             }
         }
@@ -1200,7 +1200,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                     if let Some(o) = args[1].as_obj() {
                         let mut b = o.borrow_mut();
                         if let Some(i) = b.find("message") {
-                            b.slots[i].value = msg;
+                            b.slots.get(i).value = msg;
                         }
                     }
                     Err("primitiveFailedError".into())

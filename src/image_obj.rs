@@ -1126,7 +1126,7 @@ impl<'a> Builder<'a> {
                     .slots
                     .iter()
                     .find(|s| s.value.method().is_some())
-                    .map(|s| s.value.clone())
+                    .map(|s| s.value)
                     .ok_or("block object has no value method slot")?;
                 let vmeth = self.tagged(&mv)?;
                 e.put(addr + 8, as_smi(0)); // scopeHomeFr: no live home

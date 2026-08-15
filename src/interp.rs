@@ -26,47 +26,51 @@ pub enum Unwind {
 }
 
 pub struct Frame {
-    scope: Rc<Scope>,
+    scope: ObjRef,
     stack: Vec<Value>,
     pc: usize,
     /// activations this frame tail-called away from. They have not returned --
     /// their continuation is now this frame's -- so a block returning
     /// non-locally to one of them has to find it here.
-    tail_of: Vec<Rc<Scope>>,
+    tail_of: Vec<ObjRef>,
 }
 
 impl Frame {
-    fn new(scope: Rc<Scope>) -> Frame {
+    fn new(scope: ObjRef) -> Frame {
         Frame { scope, stack: vec![], pc: 0, tail_of: vec![] }
     }
 
     /// This frame's activation and every one whose continuation it took over
-    /// have now genuinely returned. Consumes the frame, because that is also
-    /// where its two buffers and -- if no block captured it -- its activation
-    /// go back to their pools instead of to `free`.
-    fn retire(mut self) {
-        self.scope.dead.set(true);
+    /// have now genuinely returned. There is nothing to hand back: an
+    /// activation is a heap object, so the frame simply stops naming it and the
+    /// next scavenge forgets it. The pools this used to feed are gone.
+    fn retire(self) {
+        act_set_dead(self.scope, true);
         for s in self.tail_of.iter() {
-            s.dead.set(true);
+            act_set_dead(*s, true);
         }
-        give_vals(std::mem::take(&mut self.stack));
-        give_scope(self.scope);
     }
 
-    fn is_home(&self, target: &Rc<Scope>) -> bool {
-        Rc::ptr_eq(&self.scope, target) || self.tail_of.iter().any(|s| Rc::ptr_eq(s, target))
+    fn is_home(&self, target: ObjRef) -> bool {
+        self.scope == target || self.tail_of.iter().any(|s| *s == target)
     }
 }
 
-/// Everything a frame stack keeps alive. Not `tail_of`: those activations are
-/// held for their identity as a non-local return target, and nothing ever reads
-/// their slots through this list. Whatever *can* read them -- the block that
-/// captured one -- is an object, and reaching that object traces the scope.
-pub fn frame_roots(fs: &[Frame], f: &mut dyn FnMut(Root)) {
-    for fr in fs.iter() {
-        f(Root::Scope(fr.scope.clone()));
-        for v in fr.stack.iter() {
-            f(Root::Val(*v));
+/// Everything a frame stack keeps alive, as slots the collector may rewrite.
+///
+/// `tail_of` is in here now, where it was not before: with a handle table an
+/// untraced reference was merely stale, but a direct pointer into a space that
+/// has been abandoned is not, and a non-local return still compares against
+/// these. The activations themselves stay alive either way -- a block that
+/// captured one holds it -- but the pointer has to be moved with them.
+pub fn frame_roots(fs: &mut [Frame], f: &mut dyn FnMut(&mut ObjRef)) {
+    for fr in fs.iter_mut() {
+        f(&mut fr.scope);
+        for s in fr.tail_of.iter_mut() {
+            f(s);
+        }
+        for v in fr.stack.iter_mut() {
+            crate::value::rewrite(v, f);
         }
     }
 }
@@ -91,46 +95,16 @@ pub enum Outcome {
     Yielded { rcvr: Value, arg: Value },
 }
 
+/// An activation is a heap object, so this is one bump and a few stores -- the
+/// pools that used to stand between a send and `malloc` are gone with it.
 pub fn new_scope(
     m: Rc<Method>,
     recv: Value,
     holder: Value,
     args: Vec<Value>,
-    lexical: Option<Rc<Scope>>,
-) -> Rc<Scope> {
-    let home = lexical.as_ref().map(Scope::home_of);
-    // A pooled activation is refilled where it lies; only a pool miss allocates.
-    let mut rc = match take_scope() {
-        Some(rc) => rc,
-        None => Rc::new(Scope {
-            method: m.clone(),
-            recv,
-            holder,
-            slots: RefCell::new(take_vals()),
-            lexical: None,
-            home: None,
-            dead: Cell::new(false),
-        }),
-    };
-    {
-        let s = Rc::get_mut(&mut rc).expect("a fresh or pooled activation is uniquely owned");
-        let slots = s.slots.get_mut();
-        slots.clear();
-        slots.extend_from_slice(&m.slot_inits);
-        for (i, a) in args.iter().enumerate() {
-            slots[m.arg_slots[i]] = *a;
-        }
-        s.method = m;
-        s.recv = recv;
-        s.holder = holder;
-        s.lexical = lexical;
-        s.home = home;
-        s.dead.set(false);
-    }
-    // the caller built this to pass the arguments in; it is the same shape as
-    // the buffer the next send will want
-    give_vals(args);
-    rc
+    lexical: Option<ObjRef>,
+) -> ObjRef {
+    crate::value::new_activation(m, recv, holder, &args, lexical)
 }
 
 /// The error the current process is suspending for, if any. The world's own
@@ -143,7 +117,7 @@ fn cause_of_error(vm: &mut Vm) -> Option<String> {
     let err = {
         let b = o.borrow();
         let i = b.find("causeOfError")?;
-        let v = b.slots[i].value.clone();
+        let v = b.slots.get(i).value;
         if v.id_eq(&nil) {
             return None;
         }
@@ -165,7 +139,7 @@ fn cause_of_error(vm: &mut Vm) -> Option<String> {
             }
         }
         if let Some(i) = b.find("receiver") {
-            parts.push(format!("receiver: {:.200}", default_print_string(vm, &b.slots[i].value)));
+            parts.push(format!("receiver: {:.200}", default_print_string(vm, &b.slots.get(i).value)));
         }
     }
     if parts.is_empty() {
@@ -279,7 +253,7 @@ fn err(frames: &[Frame], msg: String) -> Unwind {
         .map(|f| {
             format!(
                 "  at {} ({}:{})",
-                f.scope.method.sel, f.scope.method.file, f.scope.method.line
+                act_method(f.scope).sel, act_method(f.scope).file, act_method(f.scope).line
             )
         })
         .collect();
@@ -356,7 +330,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
 
         let (at_end, op, x) = {
             let f = frames.last().unwrap();
-            let code = &f.scope.method.code;
+            let code = &act_method(f.scope).code;
             if f.pc >= code.len() {
                 (true, 0u8, 0usize)
             } else {
@@ -367,7 +341,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
 
         if at_end {
             let f = frames.pop().unwrap();
-            let res = f.stack.last().cloned().unwrap_or_else(|| f.scope.recv.clone());
+            let res = f.stack.last().cloned().unwrap_or_else(|| act_recv(f.scope));
             f.retire();
             match frames.last_mut() {
                 None => return Ok(Outcome::Done(res)),
@@ -384,7 +358,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let idx = (index << 4) | x;
                 index = 0;
                 let f = frames.last().unwrap();
-                let lit = match f.scope.method.lits.get(idx) {
+                let lit = match act_method(f.scope).lits.get(idx) {
                     Some(l) => l.clone(),
                     None => return Err(err(frames, "literal index out of range".into())),
                 };
@@ -497,7 +471,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     let recv = if normal {
                         f.stack.pop().unwrap()
                     } else {
-                        f.scope.recv.clone()
+                        act_recv(f.scope)
                     };
                     (recv, args)
                 };
@@ -625,7 +599,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     } else if let Some(d) = cur_del.take() {
                         match vm.lookup(&holder, &d) {
                             Ok(h) => {
-                                let dv = h.holder.borrow().slots[h.idx].value.clone();
+                                let dv = h.holder.borrow().slots.get(h.idx).value;
                                 vm.lookup(&dv, &cur_sel)
                             }
                             Err(_) => {
@@ -693,8 +667,8 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
 
                     let (kind, val, sname) = {
                         let b = hit.holder.borrow();
-                        let s = &b.slots[hit.idx];
-                        (s.kind, s.value.clone(), s.name.clone())
+                        let s = &b.slots.get(hit.idx);
+                        (s.kind, s.value, s.name)
                     };
 
                     if kind == SlotKind::Assign {
@@ -749,7 +723,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     // are simply retired.
                     let tail = {
                         let f = frames.last().unwrap();
-                        f.pc >= f.scope.method.code.len() && f.stack.is_empty()
+                        f.pc >= act_method(f.scope).code.len() && f.stack.is_empty()
                     };
                     let mut carried = vec![];
                     if tail {
@@ -777,7 +751,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     if frames.len() >= vm.max_frames {
                         let mut h: std::collections::HashMap<String, usize> = Default::default();
                         for f in frames.iter() {
-                            *h.entry(format!("{} ({}:{})", f.scope.method.sel, f.scope.method.file, f.scope.method.line))
+                            *h.entry(format!("{} ({}:{})", act_method(f.scope).sel, act_method(f.scope).file, act_method(f.scope).line))
                                 .or_insert(0) += 1;
                         }
                         let mut v: Vec<_> = h.into_iter().collect();
@@ -838,7 +812,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 match dest {
                     Some(d) => {
                         let f = frames.last_mut().unwrap();
-                        if d > f.scope.method.code.len() {
+                        if d > act_method(f.scope).code.len() {
                             return Err(err(frames, "branch target out of range".into()));
                         }
                         f.pc = d;

@@ -990,6 +990,17 @@ impl Heap {
         self.old_free.borrow().iter().map(|(n, v)| n * v.len()).sum()
     }
 
+    /// The young space is filling; the interpreter should collect at its next
+    /// safepoint. Allocation never collects on its own, because the caller's
+    /// Rust locals are not roots.
+    pub fn wants_collection(&self) -> bool {
+        self.from_space().used() * 4 >= self.from_space().capacity() * 3
+    }
+
+    pub fn old_wants_major(&self) -> bool {
+        self.old.used() * 4 >= self.old.capacity() * 3
+    }
+
     pub fn remembered_len(&self) -> usize {
         self.remembered.borrow().len()
     }

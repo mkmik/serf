@@ -165,7 +165,7 @@ fn load_image(vm: &mut Vm, path: &str) -> Result<usize, String> {
     for (root, dest) in [(4usize, 0usize), (6, 1), (7, 2), (8, 3)] {
         let proto = ld.value(snap.vm_oops[root])?;
         let parent = proto.as_obj().and_then(|o| {
-            o.borrow().slots.iter().find(|s| s.kind == value::SlotKind::Parent).map(|s| s.value.clone())
+            o.borrow().slots.iter().find(|s| s.kind == value::SlotKind::Parent).map(|s| s.value)
         });
         if let Some(p) = parent {
             match dest {
@@ -364,7 +364,7 @@ fn world_stats(vm: &Vm) -> String {
                 };
                 *bykind.entry(k).or_insert(0usize) += 1;
             }
-            work.push(sl.value.clone());
+            work.push(sl.value);
         }
         match &o.payload {
             value::Payload::Bytes(b) => { strs += 1; strbytes += b.len() }
@@ -394,7 +394,7 @@ fn world_stats(vm: &Vm) -> String {
         objs, slots, parents, assigns, annos, strs, strbytes, vecs, vecelems,
         meths, code, lits, blocks, floats, ints, bykind,
         shapes.len(), objs as f64 / shapes.len().max(1) as f64,
-        gc::gc().count(), gc::gc().young_used(), gc::gc().old_used()
+        (gc::young_used() + gc::old_used()), gc::young_used(), gc::old_used()
     )
 }
 
@@ -468,7 +468,7 @@ fn main() {
                     let o = match v.as_obj() { Some(o) => o.clone(), None => continue };
                     if !seen.insert(o.id()) { continue }
                     let b = o.borrow();
-                    for sl in &b.slots { work.push(sl.value.clone()) }
+                    for sl in &b.slots { work.push(sl.value) }
                     match &b.payload {
                         value::Payload::Vector(x) => work.extend(x.iter().cloned()),
                         value::Payload::Method(m) | value::Payload::Block(m, _) => {

@@ -14,34 +14,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::heap::{self, Kind, Oop, Shape};
-use crate::value::{Method, Sym};
-
-/// What `Value` becomes at the flip: the same three cases, with an arena
-/// pointer where the handle used to be. Kept separate until then so this
-/// module can be built and tested while `gc.rs` still owns `Value`.
-#[derive(Clone, Copy, Debug)]
-pub enum Val {
-    Int(i64),
-    Float(f64),
-    Obj(Oop),
-}
-
-impl Val {
-    pub fn id_eq(&self, o: &Val) -> bool {
-        match (self, o) {
-            (Val::Int(a), Val::Int(b)) => a == b,
-            (Val::Float(a), Val::Float(b)) => a == b,
-            (Val::Obj(a), Val::Obj(b)) => a == b,
-            _ => false,
-        }
-    }
-    pub fn as_obj(&self) -> Option<Oop> {
-        match self {
-            Val::Obj(o) => Some(*o),
-            _ => None,
-        }
-    }
-}
+use crate::value::{Method, Slot, Sym, Value as Val};
 
 // ------------------------------------------------------------------ the word
 
@@ -89,7 +62,7 @@ pub enum SlotKind {
 }
 
 impl SlotKind {
-    fn to_byte(self) -> u8 {
+    pub fn to_byte(self) -> u8 {
         self as u8
     }
     fn from_byte(b: u8) -> SlotKind {
@@ -195,18 +168,122 @@ fn anno_span(o: Oop) -> usize {
 
 /// Build one. The shape is decided by the payload, the slots are written, and
 /// the payload fills what is left.
-pub fn make(slots: &[(Sym, SlotKind, Val)], payload: Payload, anno: bool) -> Oop {
+pub fn make(slots: &[Slot], payload: Payload, anno: bool) -> Oop {
     let mut shape = payload.shape(slots.len());
     if anno {
         shape = shape.annotated();
     }
     let o = heap::heap().alloc_or_tenure(shape);
-    for (i, (name, kind, v)) in slots.iter().enumerate() {
-        heap::set_slot_desc(o, i, name.id(), kind.to_byte());
-        heap::set_slot_value(o, i, to_oop(*v));
-    }
+    write_slots(o, slots);
     payload.fill(o);
     o
+}
+
+fn write_slots(o: Oop, slots: &[Slot]) {
+    for (i, s) in slots.iter().enumerate() {
+        heap::set_slot_desc(o, i, s.name.id(), s.kind.to_byte());
+        heap::set_slot_value(o, i, to_oop(s.value));
+    }
+}
+
+/// The same object with more slots. An object is a fixed run of words, so
+/// `_AddSlots:` cannot widen one in place -- it builds this and the caller
+/// switches every pointer over. The payload comes across verbatim.
+pub fn grow(o: Oop, extra: &[Slot]) -> Oop {
+    let mut all: Vec<Slot> = (0..slot_count(o)).map(|i| read_slot(o, i)).collect();
+    all.extend_from_slice(extra);
+    reshape(o, &all)
+}
+
+/// The same object with a different slot list and the same payload.
+pub fn reshape(o: Oop, slots: &[Slot]) -> Oop {
+    let h = heap::heap();
+    let mut shape = shape_like(o, slots.len());
+    if heap::is_annotated(o) {
+        shape = shape.annotated();
+    }
+    let n = h.alloc_or_tenure(shape);
+    write_slots(n, slots);
+    copy_payload_across(o, n);
+    heap::set_hash(n, heap::hash(o));
+    heap::set_aux(n, heap::aux(o));
+    n
+}
+
+fn shape_like(o: Oop, slots: usize) -> Shape {
+    match heap::kind(o) {
+        Kind::Bytes => Shape::indexable(Kind::Bytes, slots, heap::ilen(o)),
+        Kind::ObjVector => Shape::indexable(Kind::ObjVector, slots, heap::ilen(o)),
+        Kind::Method => Shape::indexable(Kind::Method, slots, 1),
+        Kind::Block => Shape::indexable(Kind::Block, slots, 2),
+        Kind::Mirror => Shape::indexable(Kind::Mirror, slots, 1),
+        Kind::Proxy => Shape::new(Kind::Proxy, slots).with_raw(2),
+        Kind::Float => Shape::new(Kind::Float, slots).with_raw(1),
+        Kind::Activation => Shape::indexable(Kind::Activation, slots, heap::oop_words(o)),
+        k => Shape::new(k, slots),
+    }
+}
+
+fn copy_payload_across(from: Oop, to: Oop) {
+    match heap::kind(from) {
+        Kind::Bytes => {
+            for i in 0..heap::ilen(from) {
+                heap::set_byte_at(to, i, heap::byte_at(from, i));
+            }
+        }
+        Kind::ObjVector => {
+            for i in 0..heap::ilen(from) {
+                heap::set_element(to, i, heap::element(from, i));
+            }
+        }
+        Kind::Method | Kind::Mirror => set_field(to, 0, field(from, 0)),
+        Kind::Block => {
+            set_field(to, 0, field(from, 0));
+            set_field(to, 1, field(from, 1));
+        }
+        Kind::Proxy => {
+            heap::set_aux_word(to, 0, heap::aux_word(from, 0));
+            heap::set_aux_word(to, 1, heap::aux_word(from, 1));
+        }
+        Kind::Float => heap::set_aux_word(to, 0, heap::aux_word(from, 0)),
+        _ => {}
+    }
+    heap::heap().record(to);
+}
+
+fn read_slot(o: Oop, i: usize) -> Slot {
+    Slot { name: slot_name(o, i), kind: slot_kind(o, i), value: slot_value(o, i) }
+}
+
+/// `_Clone`: the same shape, the same contents, its own identity.
+pub fn clone_of(o: Oop) -> Oop {
+    let c = heap::heap().clone_object(o);
+    heap::set_hash(c, 0);
+    c
+}
+
+pub fn mirror_of(o: Oop) -> Val {
+    from_oop(field(o, F_MIRROR))
+}
+
+pub fn set_mirror(o: Oop, v: Val) {
+    let w = to_oop(v);
+    set_field(o, F_MIRROR, w);
+    if w.is_obj() {
+        heap::heap().record(o);
+    }
+}
+
+pub fn set_block_scope(o: Oop, s: Option<Oop>) {
+    set_field(o, F_BLOCK_SCOPE, s.unwrap_or_else(Oop::null));
+    if s.is_some() {
+        heap::heap().record(o);
+    }
+}
+
+/// Self kills a proxy by stamping its type seal, not by nulling its pointer.
+pub fn kill_proxy(o: Oop) {
+    heap::set_aux_word(o, 1, 0);
 }
 
 // ------------------------------------------------------------------ accessors
