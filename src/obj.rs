@@ -506,6 +506,128 @@ mod tests {
         assert!(act_local(a, 2).id_eq(&Val::Int(77)), "the dead flag hit a local");
     }
 
+    /// Roots for the world below: a handful of registers the collector may
+    /// rewrite, which is the interface `Vm::each_root` becomes.
+    struct World {
+        regs: Vec<Oop>,
+    }
+
+    impl heap::Roots for World {
+        fn each(&mut self, f: &mut dyn FnMut(&mut Oop)) {
+            for o in self.regs.iter_mut() {
+                f(o);
+            }
+        }
+        fn dying(&mut self, o: Oop) {
+            on_dying(o);
+        }
+    }
+
+    /// Lookup, done the way `Vm::search` does it: the receiver's own slots
+    /// first, then every parent in parallel.
+    fn lookup(start: Oop, name: Sym, seen: &mut Vec<Oop>) -> Option<(Oop, usize)> {
+        if seen.contains(&start) {
+            return None;
+        }
+        seen.push(start);
+        if let Some(i) = find(start, name) {
+            return Some((start, i));
+        }
+        for i in 0..slot_count(start) {
+            if slot_kind(start, i) == SlotKind::Parent {
+                if let Val::Obj(p) = slot_value(start, i) {
+                    if let Some(hit) = lookup(p, name, seen) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The shape of a real world in miniature -- a lobby whose parent is
+    /// globals, a traits chain three deep, a string, a vector, a method object
+    /// and a block holding the activation it closed over -- collected until it
+    /// has been moved, tenured and swept around, with lookup checked at every
+    /// step. This is the last thing that could say the layout does not carry
+    /// what Self actually needs.
+    #[test]
+    fn a_miniature_world_survives_being_collected() {
+        let t_object = make(&[], Payload::None, false);
+        let t_string = make(&[s("parent", SlotKind::Parent, Val::Obj(t_object))], Payload::None, false);
+        let greeting = make(
+            &[s("parent", SlotKind::Parent, Val::Obj(t_string))],
+            Payload::Bytes(b"hello: 720".to_vec()),
+            false,
+        );
+        let traits = make(
+            &[
+                s("object", SlotKind::Data, Val::Obj(t_object)),
+                s("string", SlotKind::Data, Val::Obj(t_string)),
+            ],
+            Payload::None,
+            false,
+        );
+        let m = crate::value::test_method();
+        let meth = make(&[], Payload::Method(m.clone()), false);
+        let act = new_activation(m.clone(), 2);
+        act_set_local(act, 0, Val::Obj(greeting));
+        let blk = make(&[], Payload::Block(m.clone(), Some(act)), false);
+        let vec = make(
+            &[s("parent", SlotKind::Parent, Val::Obj(t_object))],
+            Payload::Vector(vec![Val::Obj(greeting), Val::Int(7), Val::Obj(blk)]),
+            false,
+        );
+        let globals = make(
+            &[
+                s("traits", SlotKind::Data, Val::Obj(traits)),
+                s("greet", SlotKind::Data, Val::Obj(meth)),
+                s("all", SlotKind::Data, Val::Obj(vec)),
+                s("hi", SlotKind::Data, Val::Obj(greeting)),
+            ],
+            Payload::None,
+            false,
+        );
+        let lobby = make(
+            &[s("globals", SlotKind::Parent, Val::Obj(globals))],
+            Payload::None,
+            false,
+        );
+
+        let h = heap::heap();
+        let mut w = World { regs: vec![lobby] };
+        for round in 0..8 {
+            h.collect(&mut w, round % 3 == 2);
+            let lobby = w.regs[0];
+
+            // the lobby still reaches globals' slots through its parent
+            let (holder, i) = lookup(lobby, sym("hi"), &mut vec![])
+                .unwrap_or_else(|| panic!("round {round}: lookup through the parent failed"));
+            let hi = slot_value(holder, i).as_obj().expect("the string is gone");
+            assert_eq!(bytes(hi), Some(b"hello: 720".to_vec()), "round {round}: the string");
+
+            // ...and the method object still names its method
+            let (mh, mi) = lookup(lobby, sym("greet"), &mut vec![]).expect("no method slot");
+            let mo = slot_value(mh, mi).as_obj().unwrap();
+            assert!(Rc::ptr_eq(&method_of(mo).expect("not a method"), &m), "the method moved");
+
+            // ...and the vector still holds the same three things, with the
+            // block still holding the activation, still holding the string
+            let (vh, vi) = lookup(lobby, sym("all"), &mut vec![]).expect("no vector slot");
+            let v = slot_value(vh, vi).as_obj().unwrap();
+            let items = elements(v);
+            assert_eq!(items.len(), 3, "round {round}: the vector changed length");
+            assert!(items[0].id_eq(&Val::Obj(hi)), "the vector lost its string");
+            assert!(items[1].id_eq(&Val::Int(7)));
+            let b = items[2].as_obj().expect("the block is gone");
+            let a = block_scope(b).expect("the block lost its activation");
+            let held = act_local(a, 0).as_obj().expect("the activation lost its local");
+            assert_eq!(bytes(held), Some(b"hello: 720".to_vec()), "round {round}: through the block");
+            assert!(Rc::ptr_eq(&act_method(a), &m), "the activation lost its method");
+        }
+        assert!(h.old_live() > 0, "nothing in the world was ever tenured");
+    }
+
     /// A method object's index goes back on the free list when the object is
     /// collected, so `interp::send`'s one-shot methods do not pile up.
     #[test]
