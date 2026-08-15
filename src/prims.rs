@@ -727,10 +727,12 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                     value: if assignment { vm.nil_v() } else { contents },
                 },
             );
+            let mut copy = copy;
             if let Some(a) = args.get(4) {
                 let i = copy.as_obj().and_then(|c| c.borrow().find(&n));
                 if let Some(i) = i {
-                    vm.set_slot_anno(copy, i, *a);
+                    // widening for the annotation moves the object again
+                    copy = vm.set_slot_anno(copy, i, *a);
                 }
             }
             let mslots: Vec<Slot> = as_obj(recv, name)?.borrow().slots.iter().collect();
@@ -1170,7 +1172,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                     if let Some(o) = args[1].as_obj() {
                         let b = o.borrow_mut();
                         if let Some(i) = b.find("message") {
-                            b.slots.get(i).value = msg;
+                            // `slots.get` answers a `Slot` by value -- there is
+                            // no `&Slot` to write through in a heap that moves
+                            b.assign(i, msg);
                         }
                     }
                     Err("primitiveFailedError".into())

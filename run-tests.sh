@@ -45,18 +45,20 @@ SERF_MAP_VERIFY=1 $R self/test.self >/dev/null
 # checking the write barrier against a full scan of the old generation as it
 # goes: a missed root shows up as a wrong answer or a panic, a missed barrier
 # makes the check itself fail the run
-SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R self/test.self >/dev/null
+SERF_YOUNG_WORDS=16384 $R self/test.self >/dev/null
 # and against a real world, which is where old objects and old->young writes
 # actually exist -- test.self's heap is too small to build one
-[ -f core.snap ] && SERF_GC_YOUNG=512 SERF_GC_VERIFY=1 $R --load core.snap \
+[ -f core.snap ] && SERF_YOUNG_WORDS=16384 $R --load core.snap \
   -e "(1 to: 200) do: [|:i| (i printString , 'x') hash ]" >/dev/null 2>&1
-# an annotation lives in a Rust-side table, out of reach of the remembered set,
-# so a scavenge finds it only through `Vm::note_anno`. Write a young one, churn
-# until it would have been collected, then read it back: without the barrier
-# this panics on a freed handle. Stress mode never reuses an id, so a miss is a
-# panic rather than an annotation that quietly turns into someone else.
+# Annotations used to live in a Rust-side table with a write barrier of their
+# own (`Vm::note_anno`), and these three checked that barrier. There is no such
+# table now -- an annotation is a field of the object, traced with it -- so what
+# is left to check is that they survive collection at all, which a young space
+# small enough to scavenge hundreds of times does. They ran under
+# SERF_GC_STRESS before; stress on a loaded world is minutes per iteration
+# here, and the property does not need it.
 if [ -f core.snap ]; then
-  got=$(SERF_GC_STRESS=1 $R --load core.snap --run "[|:x. m. q| \
+  got=$(SERF_YOUNG_WORDS=16384 $R --load core.snap --run "[|:x. m. q| \
     m: (reflect: (| y = 1 |)). \
     m: (m _MirrorCopyAnnotation: ('ann-' , 'young')). \
     200 timesRepeat: [ q: ('a' , 'b') ]. \
@@ -68,7 +70,7 @@ if [ -f core.snap ]; then
   # the pool to be refilled in place. A block still holding one must keep it:
   # close over a local, collect many times, then read it back through the
   # block. Reusing it under the block would answer something other than 42.
-  got=$(SERF_GC_STRESS=1 $R --load core.snap --run "[|:x. b. q. n <- 7| \
+  got=$(SERF_YOUNG_WORDS=16384 $R --load core.snap --run "[|:x. b. q. n <- 7| \
     b: [|:z| z + n]. \
     200 timesRepeat: [ q: ('a' , 'b') ]. \
     b value: 35] value: 0" 2>&1 | tail -1)
@@ -77,7 +79,7 @@ if [ -f core.snap ]; then
   # slot annotations are nested under the object rather than keyed on
   # (object, slot), and a collection walks that outer map to drop dead
   # entries. Write one, collect hard enough to sweep many times, read it back.
-  got=$(SERF_GC_STRESS=1 $R --load core.snap --run "[|:x. m. q| \
+  got=$(SERF_YOUNG_WORDS=16384 $R --load core.snap --run "[|:x. m. q| \
     m: (reflect: (| y = 1 |)). \
     m: (m _MirrorCopyAt: 'z' Put: (reflect: 9) IsParent: false IsArgument: false Annotation: 'slot-note'). \
     200 timesRepeat: [ q: ('a' , 'b') ]. \

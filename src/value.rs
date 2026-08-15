@@ -740,14 +740,20 @@ impl Vm {
         heap::heap().record(wide);
     }
 
-    pub fn set_slot_anno(&mut self, o: Value, i: usize, a: Value) {
-        let Some(at) = o.as_obj() else { return };
+    /// Annotating an object that has no room for annotations widens it, and a
+    /// wider object is a different one -- so this answers where the object
+    /// went. A `Value` in a Rust local is not a root and `switch_pointers` does
+    /// not reach it; the caller has to take the answer.
+    #[must_use]
+    pub fn set_slot_anno(&mut self, o: Value, i: usize, a: Value) -> Value {
+        let Some(at) = o.as_obj() else { return o };
         let wide = obj::annotate(at);
         if wide != at {
             self.switch(at, wide);
         }
         heap::set_slot_anno(wide, i, obj::to_oop(a));
         heap::heap().record(wide);
+        Value::Obj(wide)
     }
 }
 

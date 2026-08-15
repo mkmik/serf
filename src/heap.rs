@@ -250,7 +250,11 @@ fn env_words(name: &str, dflt: usize) -> usize {
 }
 
 fn young_words() -> usize {
-    env_words("SERF_YOUNG_WORDS", 1 << 19)
+    // Stress collects after every allocation, so a big young space would only
+    // make every scavenge walk more of a space that is nearly empty. The cell
+    // heap sized itself down for the same reason.
+    let dflt = if std::env::var_os("SERF_GC_STRESS").is_some() { 1 << 12 } else { 1 << 19 };
+    env_words("SERF_YOUNG_WORDS", dflt)
 }
 
 fn old_words() -> usize {
