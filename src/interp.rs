@@ -27,7 +27,6 @@ pub enum Unwind {
 
 pub struct Frame {
     scope: ObjRef,
-    stack: Vec<Value>,
     pc: usize,
     /// activations this frame tail-called away from. They have not returned --
     /// their continuation is now this frame's -- so a block returning
@@ -37,7 +36,7 @@ pub struct Frame {
 
 impl Frame {
     fn new(scope: ObjRef) -> Frame {
-        Frame { scope, stack: vec![], pc: 0, tail_of: vec![] }
+        Frame { scope, pc: 0, tail_of: vec![] }
     }
 
     /// This frame's activation and every one whose continuation it took over
@@ -51,12 +50,38 @@ impl Frame {
         }
     }
 
+    /// The operand stack lives in the activation, so pushing costs a store and
+    /// nothing else -- no `Vec`, and none of the 1,538,337 `malloc`s a test run
+    /// made when every frame brought its own.
+    fn push(&self, v: Value) {
+        crate::obj::act_push(self.scope, v)
+    }
+    fn pop(&self) -> Option<Value> {
+        (self.depth() > 0).then(|| crate::obj::act_pop(self.scope))
+    }
+    fn last(&self) -> Option<Value> {
+        crate::obj::act_peek(self.scope)
+    }
+    fn depth(&self) -> usize {
+        crate::obj::act_depth(self.scope)
+    }
+    /// The operand at depth `i`, for a send collecting its arguments in order.
+    fn at(&self, i: usize) -> Value {
+        crate::obj::act_stack_at(self.scope, i)
+    }
+    fn truncate(&self, n: usize) {
+        crate::obj::act_truncate(self.scope, n)
+    }
+
     fn is_home(&self, target: ObjRef) -> bool {
         self.scope == target || self.tail_of.iter().any(|s| *s == target)
     }
 }
 
 /// Everything a frame stack keeps alive, as slots the collector may rewrite.
+///
+/// The operand stack is not here any more: it is inside the activation, so
+/// tracing the activation traces it.
 ///
 /// `tail_of` is in here now, where it was not before: with a handle table an
 /// untraced reference was merely stale, but a direct pointer into a space that
@@ -66,9 +91,6 @@ impl Frame {
 pub fn frame_roots(fs: &mut [Frame], f: &mut dyn FnMut(&mut ObjRef)) {
     for fr in fs.iter_mut() {
         f(&mut fr.scope);
-        for v in fr.stack.iter_mut() {
-            crate::value::rewrite(v, f);
-        }
     }
 }
 
@@ -207,6 +229,7 @@ pub fn stack_for_send(vm: &mut Vm, recv: Value, sel: &str, args: Vec<Value>) -> 
         line: 0,
         source: Cell::new(None),
         sites: Default::default(),
+        max_stack: std::cell::Cell::new(u32::MAX),
     });
     let mut a = vec![recv.clone()];
     a.extend(args);
@@ -237,6 +260,7 @@ pub fn send(vm: &mut Vm, recv: Value, sel: &str, args: Vec<Value>) -> Result<Val
         line: 0,
         source: Cell::new(None),
         sites: Default::default(),
+        max_stack: std::cell::Cell::new(u32::MAX),
     });
     let mut a = vec![recv];
     a.extend(args);
@@ -354,11 +378,11 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
 
         if at_end {
             let f = frames.pop().unwrap();
-            let res = f.stack.last().cloned().unwrap_or_else(|| act_recv(f.scope));
+            let res = f.last().unwrap_or_else(|| act_recv(f.scope));
             f.retire();
             match frames.last_mut() {
                 None => return Ok(Outcome::Done(res)),
-                Some(c) => c.stack.push(res),
+                Some(c) => c.push(res),
             }
             continue;
         }
@@ -380,21 +404,21 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     p.kind() == PayKind::Block && p.block_scope().is_none()
                 });
                 let v = if is_proto { clone_block(&lit, f.scope) } else { lit };
-                frames.last_mut().unwrap().stack.push(v);
+                frames.last_mut().unwrap().push(v);
             }
 
             NO_OPERAND => match x {
                 SELF_C => {
                     let v = act_recv(frames.last().unwrap().scope);
-                    frames.last_mut().unwrap().stack.push(v);
+                    frames.last_mut().unwrap().push(v);
                 }
                 POP_C => {
-                    frames.last_mut().unwrap().stack.pop();
+                    frames.last_mut().unwrap().pop();
                 }
                 RESEND_C => resend = true,
                 NLR_C => {
                     let f = frames.last_mut().unwrap();
-                    let value = match f.stack.pop() {
+                    let value = match f.pop() {
                         Some(v) => v,
                         None => return Err(err(frames, "nothing to return".into())),
                     };
@@ -410,7 +434,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                             match frames.last_mut() {
                                 None => return Ok(Outcome::Done(value)),
                                 Some(c) => {
-                                    c.stack.push(value);
+                                    c.push(value);
                                     break;
                                 }
                             }
@@ -442,16 +466,16 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 }
                 if op == READ_LOCAL {
                     let v = act_local(sc, idx);
-                    frames.last_mut().unwrap().stack.push(v);
+                    frames.last_mut().unwrap().push(v);
                 } else {
                     let f = frames.last_mut().unwrap();
-                    let v = match f.stack.pop() {
+                    let v = match f.pop() {
                         Some(v) => v,
                         None => return Err(err(frames, "nothing to assign".into())),
                     };
                     act_set_local(sc, idx, v);
                     let me = act_recv(frames.last().unwrap().scope);
-                    frames.last_mut().unwrap().stack.push(me);
+                    frames.last_mut().unwrap().push(me);
                 }
             }
 
@@ -475,16 +499,16 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let argc = act_method(frames.last().unwrap().scope).site_nargs(idx, &sel);
                 let (mut cur_recv, mut cur_args) = {
                     let f = frames.last_mut().unwrap();
-                    if f.stack.len() < argc + normal as usize {
+                    if f.depth() < argc + normal as usize {
                         return Err(err(frames, format!("stack underflow sending '{}'", sel)));
                     }
-                    let n = f.stack.len();
+                    let n = f.depth();
                     let mut args = std::mem::take(&mut argbuf);
                     args.clear();
-                    args.extend_from_slice(&f.stack[n - argc..]);
-                    f.stack.truncate(n - argc);
+                    args.extend((n - argc..n).map(|i| f.at(i)));
+                    f.truncate(n - argc);
                     let recv = if normal {
-                        f.stack.pop().unwrap()
+                        f.pop().unwrap()
                     } else {
                         act_recv(f.scope)
                     };
@@ -509,7 +533,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     if &*cur_sel == "_Restart" || &*cur_sel == "_RestartIfFail:" {
                         let f = frames.last_mut().unwrap();
                         f.pc = 0;
-                        f.stack.clear();
+                        f.truncate(0);
                         break;
                     }
                     if cur_sel.starts_with('_') {
@@ -562,13 +586,13 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 None => return Err(err(frames, m)),
                             },
                             Ok(prims::P::Val(v)) => {
-                                frames.last_mut().unwrap().stack.push(v);
+                                frames.last_mut().unwrap().push(v);
                                 break;
                             }
                             Ok(prims::P::Yield(r, a)) => {
                                 // when the process is resumed, _Yield: answers nil
                                 let n = vm.nil_v();
-                                frames.last_mut().unwrap().stack.push(n);
+                                frames.last_mut().unwrap().push(n);
                                 return Ok(Outcome::Yielded { rcvr: r, arg: a });
                             }
                             Ok(prims::P::Activate(m, r)) => {
@@ -695,13 +719,13 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 return Err(err(frames, format!("assignment slot '{}' has no data slot", sname)));
                             }
                         }
-                        frames.last_mut().unwrap().stack.push(cur_recv);
+                        frames.last_mut().unwrap().push(cur_recv);
                         break;
                     }
 
                     let m = match val.method() {
                         None => {
-                            frames.last_mut().unwrap().stack.push(val);
+                            frames.last_mut().unwrap().push(val);
                             break;
                         }
                         Some(m) => m,
@@ -735,7 +759,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     // are simply retired.
                     let tail = {
                         let f = frames.last().unwrap();
-                        f.pc >= act_method(f.scope).code.len() && f.stack.is_empty()
+                        f.pc >= act_method(f.scope).code.len() && (f.depth() == 0)
                     };
                     let mut carried = vec![];
                     if tail {
@@ -786,7 +810,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let dest = match op {
                     BRANCH_INDEXED => {
                         let f = frames.last_mut().unwrap();
-                        let i = match f.stack.pop() {
+                        let i = match f.pop() {
                             Some(Value::Int(i)) if i >= 0 => i as usize,
                             _ => return Err(err(frames, "indexed branch needs an index".into())),
                         };
@@ -801,7 +825,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     BRANCH => target(&lit),
                     _ => {
                         let f = frames.last_mut().unwrap();
-                        let c = match f.stack.pop() {
+                        let c = match f.pop() {
                             Some(c) => c,
                             None => return Err(err(frames, "nothing to branch on".into())),
                         };

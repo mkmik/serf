@@ -500,6 +500,9 @@ pub struct Method {
     /// a GC root: an entry is only read at the generation it was filled at,
     /// and a collection bumps that.
     pub sites: RefCell<Vec<Site>>,
+    /// how much operand stack an activation of this method needs, worked out
+    /// on its first send. `u32::MAX` until then.
+    pub max_stack: Cell<u32>,
 }
 
 /// A send site's inline cache.
@@ -574,6 +577,37 @@ impl Method {
 
 // -------------------------------------------------------------- activations
 
+/// An upper bound on how deep this method's operand stack can get, computed
+/// once and remembered.
+///
+/// Every bytecode pushes at most one thing, so counting the ones that push at
+/// all bounds the depth. ponytail: an over-estimate -- a proper stack-effect
+/// walk would be tighter, and would matter if a long method were ever deeply
+/// recursive. `debug_assert` in `act_push` is what would say so.
+pub fn max_stack(m: &Method) -> usize {
+    let n = m.max_stack.get();
+    if n != u32::MAX {
+        return n as usize;
+    }
+    let d = m
+        .code
+        .iter()
+        .filter(|b| {
+            matches!(
+                *b >> 4,
+                crate::compile::LITERAL
+                    | crate::compile::READ_LOCAL
+                    | crate::compile::SEND
+                    | crate::compile::IMPLICIT_SEND
+                    | crate::compile::NO_OPERAND
+            )
+        })
+        .count()
+        + 1;
+    m.max_stack.set(d as u32);
+    d
+}
+
 /// An activation is a heap object now, so there is no `Rc` to hand back and no
 /// pool to hand it to: a frame that returns simply stops naming it, and the
 /// next scavenge forgets it. This is where 1.79M of the 1.86M mallocs a test
@@ -590,7 +624,7 @@ pub fn new_activation(
     // whole exercise is about not making
     let n = m.slot_inits.borrow().len();
     let home = lexical.map(home_of);
-    let a = obj::new_activation(m.clone(), n);
+    let a = obj::new_activation(m.clone(), n, max_stack(&m));
     obj::act_set(a, act::RECV, recv);
     obj::act_set(a, act::HOLDER, holder);
     obj::act_set_link(a, act::LEXICAL, lexical);
@@ -1309,5 +1343,6 @@ pub fn test_method() -> Rc<Method> {
         line: 0,
         source: Cell::new(None),
         sites: Default::default(),
+        max_stack: std::cell::Cell::new(u32::MAX),
     })
 }

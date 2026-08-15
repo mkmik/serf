@@ -264,6 +264,7 @@ impl<'a> C<'a> {
             line: mb.line,
             source: Cell::new(None),
             sites: Default::default(),
+            max_stack: std::cell::Cell::new(u32::MAX),
         }))
     }
 

@@ -581,6 +581,7 @@ impl<'a> Loader<'a> {
             line: smi(line).max(0) as u32,
             source: Cell::new(source),
             sites: Default::default(),
+            max_stack: std::cell::Cell::new(u32::MAX),
         });
         self.methods.insert(map_star, m.clone());
         Ok(m)

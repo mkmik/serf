@@ -502,14 +502,72 @@ pub mod act {
     pub const LEXICAL: usize = 3;
     pub const HOME: usize = 4;
     pub const DEAD: usize = 5;
-    pub const LOCALS: usize = 6;
+    /// how many locals, so the operand stack behind them can be found
+    pub const NLOCALS: usize = 6;
+    /// operand stack depth
+    pub const SP: usize = 7;
+    pub const LOCALS: usize = 8;
 }
 
-pub fn new_activation(m: Rc<Method>, nlocals: usize) -> Oop {
-    let a = heap::heap()
-        .alloc_or_tenure(Shape::indexable(Kind::Activation, 0, act::LOCALS + nlocals));
+/// Locals *and* the operand stack, in the object. The stack used to be a
+/// `Vec<Value>` on the `Frame`, which was one `malloc` per activation and, at
+/// 1,538,337 frames in a test run, most of what was left after the pools went.
+pub fn new_activation(m: Rc<Method>, nlocals: usize, nstack: usize) -> Oop {
+    let a = heap::heap().alloc_or_tenure(Shape::indexable(
+        Kind::Activation,
+        0,
+        act::LOCALS + nlocals + nstack,
+    ));
     heap::set_field(a, act::METHOD, Oop::int(intern_method(m) as i64));
+    heap::set_field(a, act::NLOCALS, Oop::int(nlocals as i64));
+    heap::set_field(a, act::SP, Oop::int(0));
     a
+}
+
+fn stack_base(a: Oop) -> usize {
+    act::LOCALS + heap::field(a, act::NLOCALS).as_int().unwrap_or(0) as usize
+}
+
+pub fn act_depth(a: Oop) -> usize {
+    heap::field(a, act::SP).as_int().unwrap_or(0) as usize
+}
+
+pub fn act_push(a: Oop, v: Val) {
+    let d = act_depth(a);
+    let at = stack_base(a) + d;
+    debug_assert!(
+        at < heap::oop_words(a),
+        "operand stack overflowed its activation: the compiler's depth bound is wrong"
+    );
+    let w = to_oop(v);
+    heap::set_field(a, at, w);
+    heap::set_field(a, act::SP, Oop::int(d as i64 + 1));
+    if w.is_obj() {
+        heap::heap().record(a);
+    }
+}
+
+pub fn act_pop(a: Oop) -> Val {
+    let d = act_depth(a);
+    debug_assert!(d > 0, "popped an empty operand stack");
+    heap::set_field(a, act::SP, Oop::int(d as i64 - 1));
+    from_oop(heap::field(a, stack_base(a) + d - 1))
+}
+
+pub fn act_peek(a: Oop) -> Option<Val> {
+    let d = act_depth(a);
+    (d > 0).then(|| from_oop(heap::field(a, stack_base(a) + d - 1)))
+}
+
+pub fn act_stack_at(a: Oop, i: usize) -> Val {
+    debug_assert!(i < act_depth(a), "operand {i} is above the stack");
+    from_oop(heap::field(a, stack_base(a) + i))
+}
+
+pub fn act_truncate(a: Oop, n: usize) {
+    if n < act_depth(a) {
+        heap::set_field(a, act::SP, Oop::int(n as i64));
+    }
 }
 
 pub fn act_method(a: Oop) -> Rc<Method> {
@@ -541,7 +599,7 @@ pub fn act_set_link(a: Oop, i: usize, v: Option<Oop>) {
 }
 
 pub fn act_locals(a: Oop) -> usize {
-    heap::oop_words(a) - act::LOCALS
+    heap::field(a, act::NLOCALS).as_int().unwrap_or(0) as usize
 }
 
 pub fn act_local(a: Oop, i: usize) -> Val {
@@ -637,7 +695,7 @@ mod tests {
     #[test]
     fn an_activation_holds_a_frame() {
         let m = crate::value::test_method();
-        let a = new_activation(m.clone(), 3);
+        let a = new_activation(m.clone(), 3, 4);
         assert!(Rc::ptr_eq(&act_method(a), &m));
         act_set(a, act::RECV, Val::Int(5));
         act_set_link(a, act::LEXICAL, None);
@@ -651,6 +709,20 @@ mod tests {
         act_set_dead(a, true);
         assert!(act_dead(a));
         assert!(act_local(a, 2).id_eq(&Val::Int(77)), "the dead flag hit a local");
+
+        // the operand stack lives behind the locals and must not tread on them
+        assert_eq!(act_depth(a), 0);
+        act_push(a, Val::Int(1));
+        act_push(a, Val::Int(2));
+        assert_eq!(act_depth(a), 2);
+        assert!(act_stack_at(a, 0).id_eq(&Val::Int(1)));
+        assert!(act_peek(a).unwrap().id_eq(&Val::Int(2)));
+        assert!(act_pop(a).id_eq(&Val::Int(2)));
+        assert_eq!(act_depth(a), 1);
+        act_truncate(a, 0);
+        assert_eq!(act_depth(a), 0);
+        assert!(act_local(a, 2).id_eq(&Val::Int(77)), "the stack ran into the locals");
+        assert!(act_get(a, act::RECV).id_eq(&Val::Int(5)), "the stack ran into the header");
     }
 
     /// Roots for the world below: a handful of registers the collector may
@@ -717,7 +789,7 @@ mod tests {
         );
         let m = crate::value::test_method();
         let meth = make(&[], Payload::Method(m.clone()), false);
-        let act = new_activation(m.clone(), 2);
+        let act = new_activation(m.clone(), 2, 4);
         act_set_local(act, 0, Val::Obj(greeting));
         let blk = make(&[], Payload::Block(m.clone(), Some(act)), false);
         let vec = make(
