@@ -249,11 +249,36 @@ fn env_words(name: &str, dflt: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
 }
 
+fn young_words() -> usize {
+    env_words("SERF_YOUNG_WORDS", 1 << 19)
+}
+
+fn old_words() -> usize {
+    env_words("SERF_OLD_WORDS", 1 << 21)
+}
+
 thread_local! {
     static REGION: Cell<Option<&'static Region>> = const { Cell::new(None) };
 }
 
-/// The heap, made on first use, one per thread, never replaced -- the same
+/// The collector, made on first use: one per thread, never replaced -- the
+/// arrangement `gc()` has. Sized from the environment so a big world can be
+/// given room without a rebuild.
+pub fn heap() -> &'static Heap {
+    thread_local! {
+        static H: Cell<Option<&'static Heap>> = const { Cell::new(None) };
+    }
+    H.with(|h| match h.get() {
+        Some(x) => x,
+        None => {
+            let x: &'static Heap = Box::leak(Box::new(Heap::new(young_words(), old_words())));
+            h.set(Some(x));
+            x
+        }
+    })
+}
+
+/// The region, made on first use, one per thread, never replaced -- the same
 /// arrangement `gc()` has.
 ///
 /// `alloc_zeroed` rather than a `Vec`: no `&mut [u64]` ever exists, so there is
@@ -266,7 +291,11 @@ fn region() -> &'static Region {
         None => {
             // ponytail: fixed at startup, no growth. The switch-over sizes it
             // for a real world; nothing stands on it yet.
-            let words = env_words("SERF_HEAP_WORDS", 1 << 18);
+            // big enough for the spaces `heap()` will carve, plus room for
+            // the ones tests make. Zeroed pages are faulted in as they are
+            // touched, so this reserves address space rather than memory.
+            let want = 2 * young_words() + old_words() + (1 << 18);
+            let words = env_words("SERF_HEAP_WORDS", want);
             assert!(words > 0, "the heap needs room for something");
             let p = unsafe { alloc_zeroed(Layout::from_size_align(words * 8, 8).unwrap()) };
             assert!(!p.is_null(), "out of memory for a {words}-word heap");

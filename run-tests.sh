@@ -7,6 +7,7 @@ cargo test --release --quiet
 # again in debug, so the `debug_assert`s the arena leans on actually run -- the
 # release build compiles out the check that a pointer lands in a live space
 cargo test --quiet heap:: >/dev/null
+cargo test --quiet obj:: >/dev/null
 
 # and under Miri, which is what says the `unsafe` in heap.rs is sound rather
 # than merely untested: strict provenance, no integer round trips, and a
@@ -17,6 +18,8 @@ MIRI=$(rustup which --toolchain nightly cargo-miri 2>/dev/null || true)
 if [ -n "$MIRI" ]; then
   PATH="$(dirname "$MIRI"):$PATH" MIRIFLAGS=-Zmiri-ignore-leaks \
     cargo miri test --quiet heap:: >/dev/null 2>&1 \
+    && PATH="$(dirname "$MIRI"):$PATH" MIRIFLAGS=-Zmiri-ignore-leaks \
+       cargo miri test --quiet obj:: >/dev/null 2>&1 \
     && echo "miri ok" || { echo "miri FAILED"; exit 1; }
 else
   echo "miri not installed, skipping: rustup toolchain install nightly --component miri"

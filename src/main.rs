@@ -2,6 +2,7 @@ mod compile;
 mod ffi;
 mod gc;
 mod heap;
+mod obj;
 mod glue_table;
 mod struct_table;
 mod image;

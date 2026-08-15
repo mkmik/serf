@@ -58,6 +58,15 @@ pub enum SlotKind {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Sym(u32);
 
+impl Sym {
+    pub fn id(self) -> u32 {
+        self.0
+    }
+    pub fn from_id(i: u32) -> Sym {
+        Sym(i)
+    }
+}
+
 /// Pre-interned, because interning hashes the name and this one is on the
 /// allocation path: every string and byte vector is born with a parent slot.
 pub const SYM_PARENT: Sym = Sym(0);
@@ -102,6 +111,28 @@ impl From<&str> for Sym {
     fn from(s: &str) -> Sym {
         sym(s)
     }
+}
+
+/// A method with nothing in it, for tests that need one to hang an object or
+/// an activation off.
+#[cfg(test)]
+pub fn test_method() -> Rc<Method> {
+    Rc::new(Method {
+        sel: "t".into(),
+        nargs: 0,
+        arg_slots: vec![],
+        slot_names: vec![],
+        slot_flags: vec![],
+        slot_inits: vec![],
+        code: vec![],
+        lits: vec![],
+        lit_strs: vec![],
+        is_block: false,
+        file: "t".into(),
+        line: 0,
+        source: None,
+        sites: Default::default(),
+    })
 }
 
 #[cfg(test)]
