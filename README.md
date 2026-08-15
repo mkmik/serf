@@ -164,6 +164,8 @@ serf_send_site_map_hits_total       ...of those, the ones that hit on the shape
 serf_send_site_misses_total
 ```
 
+Known problems that are reproducible and not fixed live in [OPEN.md](OPEN.md).
+
 ## Garbage collection
 
 Generation Scavenging, as in `memory/`: a young generation of two semispaces
