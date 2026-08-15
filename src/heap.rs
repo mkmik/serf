@@ -917,6 +917,18 @@ fn set_forwarded(o: Oop, to: Oop) {
 pub trait Roots {
     fn each(&mut self, f: &mut dyn FnMut(&mut Oop));
 
+    /// References that must not keep their object alive, handed over after the
+    /// collection has decided what lives. Answer `Some(where it went)` to keep
+    /// the reference, `None` to drop it.
+    ///
+    /// The interpreter's one use is the list of activations a tail call
+    /// displaced: it compares them for identity and never reads them, so an
+    /// entry nothing else holds is useless -- and with a handle table it was
+    /// merely useless, where a direct pointer into an abandoned space is not.
+    /// `Rc::strong_count` used to answer this question; the collector answers
+    /// it now.
+    fn weak(&mut self, _f: &mut dyn FnMut(Oop) -> Option<Oop>) {}
+
     /// An object the collection is about to forget. The heap itself needs no
     /// such hook -- abandoning a space is one store -- but anything holding
     /// Rust memory on an object's behalf does, and during the switch-over a
@@ -1111,6 +1123,11 @@ impl Heap {
         }
         let (k, oops, pay, ns, an) =
             (kind(o), oop_words(o), payload_words(o), slots(o), is_annotated(o));
+        debug_assert!(
+            oops <= pay && pay < 1 << 20,
+            "corrupt object at {:#x}: kind {:?} oops {} payload {} slots {}",
+            o.addr(), k, oops, pay, ns
+        );
         let a = age(o).saturating_add(1);
         // Ask the to-space only when the object is actually staying young: the
         // bump happens inside `alloc`, so testing the age afterwards would
@@ -1155,6 +1172,17 @@ impl Heap {
             if !v.is_obj() {
                 continue;
             }
+            debug_assert!(
+                !self.from_space().contains(v)
+                    || forwarded(v).is_some()
+                    || {
+                        let m = mark(v);
+                        let sz = (m & SIZE_MASK) as usize;
+                        sz >= HEADER_WORDS && oop_words(v) <= sz - HEADER_WORDS
+                    },
+                "scanning {:?} at {:#x} (oops {} slots {}): field {} holds {:#x}, which is not an object",
+                kind(o), o.addr(), oop_words(o), slots(o), i, v.addr()
+            );
             let n = self.evacuate(v, promoted);
             if n != v {
                 set_field(o, i, n);
@@ -1206,6 +1234,19 @@ impl Heap {
                 }
                 None => break,
             }
+        }
+
+        // weak references, now that what lives has been decided: an object
+        // still sitting in the from-space was never reached
+        {
+            let from = self.from_space();
+            roots.weak(&mut |o| {
+                if !o.is_obj() || !from.contains(o) {
+                    Some(o)
+                } else {
+                    forwarded(o)
+                }
+            });
         }
 
         // whatever is still in the from-space was never reached. Forgetting it
@@ -1311,15 +1352,60 @@ impl Heap {
         crate::metrics::switched();
     }
 
+    /// Walk every space and check that each object still describes itself.
+    /// A moving collector's failures are all of one shape -- a word that is
+    /// not what it says it is -- and the only useful place to notice is the
+    /// step *before* the one that trips over it.
+    pub fn verify(&self, when: &str) {
+        for (which, sp) in [("young", self.from_space()), ("old", &self.old)] {
+            let mut w = 0usize;
+            while w < sp.used() {
+                let o = Oop::obj(at(sp.start + w));
+                let m = mark(o);
+                let size = (m & SIZE_MASK) as usize;
+                let bad = m & FORWARDED != 0
+                    || size < HEADER_WORDS
+                    || w + size > sp.used()
+                    || oop_words(o) > size - HEADER_WORDS
+                    || slots(o) > oop_words(o);
+                assert!(
+                    !bad,
+                    "{when}: {which} space, word {w}: object at {:#x} says size {} oops {} slots {}",
+                    o.addr(),
+                    size,
+                    oop_words(o),
+                    slots(o)
+                );
+                w += size;
+            }
+        }
+    }
+
     /// Collect. `major` sweeps the old generation as well.
     pub fn collect(&self, roots: &mut dyn Roots, major: bool) {
+        if VERIFY.with(|v| *v) {
+            self.verify("before");
+        }
         if major {
             self.mark_all(roots);
+            // before the sweep, because a swept run goes on the free list and
+            // the scavenge's promotions may take it straight back
+            roots.weak(&mut |o| (!o.is_obj() || marked(o)).then_some(o));
             self.sweep_old(roots);
             self.majors.set(self.majors.get() + 1);
         }
         self.scavenge(roots);
+        if VERIFY.with(|v| *v) {
+            self.verify("after");
+        }
     }
+}
+
+thread_local! {
+    /// `SERF_HEAP_VERIFY=1`: walk every space before and after each collection.
+    /// Its own flag, not `SERF_GC_VERIFY`: this is O(heap) per collection, so
+    /// on a loaded world it is a debugging session rather than a test.
+    static VERIFY: bool = std::env::var_os("SERF_HEAP_VERIFY").is_some();
 }
 
 #[cfg(test)]

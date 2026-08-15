@@ -25,7 +25,7 @@ fn eval_source(vm: &mut Vm, src: &[u8], file: &str, echo: bool) -> Result<(), St
         let m = compile::compile_statement(vm, &e, file)?;
         // once an image is loaded, everything runs in its world
         let lobby = vm.image_roots.as_ref().map_or_else(|| vm.lobby.clone(), |r| r[0].clone());
-        let scope = interp::new_scope(m, lobby.clone(), lobby, vec![], None);
+        let scope = interp::new_scope(m, lobby, lobby, &[], None);
         match interp::run(vm, scope) {
             Ok(v) => {
                 if echo {
@@ -57,7 +57,7 @@ fn eval_in(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String>
 fn eval_in_rooted(vm: &mut Vm, src: &[u8], file: &str, me: Value) -> Result<(), String> {
     for e in parser::parse_program(src)? {
         let m = compile::compile_statement(vm, &e, file)?;
-        let scope = interp::new_scope(m, me.clone(), me.clone(), vec![], None);
+        let scope = interp::new_scope(m, me.clone(), me.clone(), &[], None);
         match interp::run(vm, scope) {
             Ok(v) => println!("{}", show(vm, &v)),
             Err(u) => return Err(interp::describe(vm, u)),
@@ -198,19 +198,15 @@ fn load_image(vm: &mut Vm, path: &str) -> Result<usize, String> {
     vm.canonical = canon;
     vm.image_roots = Some(roots);
     vm.image_strings = Some(vstr);
-    vm.anno_obj = std::mem::take(&mut ld.anno_obj);
-    vm.anno_slot = std::mem::take(&mut ld.anno_slot);
+
     // a load hands back young objects, so every annotation starts on the
     // barrier list; the first few scavenges prune it to nothing as they
     // promote them
-    vm.anno_young =
-        vm.anno_obj.values().chain(vm.anno_slot.values().flatten().map(|(_, v)| v)).cloned().collect();
-    vm.id_hash = std::mem::take(&mut ld.id_hash);
-    vm.obj_kind = std::mem::take(&mut ld.obj_kind);
-    for target in [vm.globals.clone(), lobby.clone()] {
-        if let Some(o) = target.as_obj() {
-            o.borrow_mut().put(value::slot("snapshotLobby", value::SlotKind::Data, lobby.clone()));
-        }
+    // each of these widens, which means each builds a new object and switches
+    // every pointer to it -- so re-read the target each time round
+    for which in 0..2 {
+        let target = if which == 0 { vm.globals } else { lobby };
+        vm.put_slot(target, value::slot("snapshotLobby", value::SlotKind::Data, lobby));
     }
     Ok(n)
 }
@@ -342,9 +338,9 @@ fn world_stats(vm: &Vm) -> String {
             }
         }
         objs += 1;
-        let key = image_obj::value_key(&v);
-        if vm.anno_obj.contains_key(&key) { annos += 1; }
-        let o = v.as_obj().unwrap().borrow();
+        let at = v.as_obj().unwrap();
+        if value::obj_anno(at).is_some() { annos += 1; }
+        let o = at.borrow();
         shapes.insert(o.map());
         for sl in &o.slots {
             slots += 1;
@@ -353,35 +349,39 @@ fn world_stats(vm: &Vm) -> String {
                 value::SlotKind::Assign => assigns += 1,
                 _ => {}
             }
-            if vm.anno_slot.get(&key).is_some_and(|m| m.contains_key(&sl.name)) { annos += 1; }
+            if value::slot_anno(at, slots - 1).is_some() { annos += 1; }
             if sl.kind == value::SlotKind::Parent {
-                let k = match &o.payload {
-                    value::Payload::Bytes(_) => "bytes", value::Payload::Vector(_) => "vector",
-                    value::Payload::Method(_) => "method", value::Payload::Block(..) => "block",
-                    value::Payload::Mirror(_) => "mirror",
-                    value::Payload::Proxy(_) => "proxy",
-                    value::Payload::None => "plain",
+                let k = match o.payload.kind() {
+                    value::PayKind::Bytes => "bytes", value::PayKind::Vector => "vector",
+                    value::PayKind::Method => "method", value::PayKind::Block => "block",
+                    value::PayKind::Mirror => "mirror",
+                    value::PayKind::Proxy => "proxy",
+                    _ => "plain",
                 };
                 *bykind.entry(k).or_insert(0usize) += 1;
             }
             work.push(sl.value);
         }
-        match &o.payload {
-            value::Payload::Bytes(b) => { strs += 1; strbytes += b.len() }
-            value::Payload::Vector(x) => { vecs += 1; vecelems += x.len(); work.extend(x.iter().cloned()) }
-            value::Payload::Method(m) => {
-                meths += 1; code += m.code.len(); lits += m.lits.len();
-                work.extend(m.lits.iter().cloned());
-                work.extend(m.slot_inits.iter().cloned());
+        match o.payload.kind() {
+            value::PayKind::Bytes => { strs += 1; strbytes += o.payload.byte_len() }
+            value::PayKind::Vector => {
+                let x = o.payload.vector().unwrap();
+                vecs += 1; vecelems += x.len(); work.extend(x);
             }
-            value::Payload::Block(m, _) => {
+            value::PayKind::Method => {
+                let m = o.payload.method().unwrap();
+                meths += 1; code += m.code.len(); lits += m.lits.borrow().len();
+                work.extend(m.lits.borrow().iter().cloned());
+                work.extend(m.slot_inits.borrow().iter().cloned());
+            }
+            value::PayKind::Block => {
+                let m = o.payload.method().unwrap();
                 blocks += 1;
-                work.extend(m.lits.iter().cloned());
-                work.extend(m.slot_inits.iter().cloned());
+                work.extend(m.lits.borrow().iter().cloned());
+                work.extend(m.slot_inits.borrow().iter().cloned());
             }
-            value::Payload::Mirror(r) => work.push(r.clone()),
-            value::Payload::Proxy(_) => {}
-            value::Payload::None => {}
+            value::PayKind::Mirror => work.push(o.payload.mirror().unwrap()),
+            _ => {}
         }
     }
     format!(
@@ -469,17 +469,18 @@ fn main() {
                     if !seen.insert(o.id()) { continue }
                     let b = o.borrow();
                     for sl in &b.slots { work.push(sl.value) }
-                    match &b.payload {
-                        value::Payload::Vector(x) => work.extend(x.iter().cloned()),
-                        value::Payload::Method(m) | value::Payload::Block(m, _) => {
+                    match b.payload.kind() {
+                        value::PayKind::Vector => work.extend(b.payload.vector().unwrap()),
+                        value::PayKind::Method | value::PayKind::Block => {
+                            let m = b.payload.method().unwrap();
                             for (k, l) in m.lit_strs.iter().enumerate() {
                                 if let Some(t) = l {
                                     if t.starts_with('_') { *n.entry(t.to_string()).or_insert(0) += 1 }
                                 }
                                 let _ = k;
                             }
-                            work.extend(m.lits.iter().cloned());
-                            work.extend(m.slot_inits.iter().cloned());
+                            work.extend(m.lits.borrow().iter().cloned());
+                            work.extend(m.slot_inits.borrow().iter().cloned());
                         }
                         _ => {}
                     }

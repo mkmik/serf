@@ -179,6 +179,34 @@ pub fn make(slots: &[Slot], payload: Payload, anno: bool) -> Oop {
     o
 }
 
+/// An object of a shape decided in advance, with nothing in it yet. The image
+/// reader needs this: the graph is cyclic, so an object must be published
+/// before its contents can be read.
+pub fn make_shape(kind: Kind, slots: usize, len: usize, anno: bool) -> Oop {
+    let mut sh = match kind {
+        Kind::Proxy => Shape::new(Kind::Proxy, slots).with_raw(2),
+        Kind::Float => Shape::new(Kind::Float, slots).with_raw(1),
+        Kind::Method | Kind::Mirror => Shape::indexable(kind, slots, 1),
+        Kind::Block => Shape::indexable(Kind::Block, slots, 2),
+        k => Shape::indexable(k, slots, len),
+    };
+    if anno {
+        sh = sh.annotated();
+    }
+    heap::heap().alloc_or_tenure(sh)
+}
+
+/// Write an object's contents into a shape that was decided in advance. The
+/// image reader needs this: the graph is cyclic, so an object has to be
+/// published before its contents can be read, and an arena object's shape is
+/// fixed when it is allocated.
+pub fn fill(o: Oop, slots: &[Slot], payload: Payload) {
+    debug_assert_eq!(slots.len(), slot_count(o), "filling a shape that does not fit");
+    write_slots(o, slots);
+    payload.fill(o);
+    heap::heap().record(o);
+}
+
 fn write_slots(o: Oop, slots: &[Slot]) {
     for (i, s) in slots.iter().enumerate() {
         heap::set_slot_desc(o, i, s.name.id(), s.kind.to_byte());
@@ -284,6 +312,30 @@ pub fn set_block_scope(o: Oop, s: Option<Oop>) {
 /// Self kills a proxy by stamping its type seal, not by nulling its pointer.
 pub fn kill_proxy(o: Oop) {
     heap::set_aux_word(o, 1, 0);
+}
+
+/// The same object with room for annotations. Self keeps these in the map;
+/// serf keeps them in the object, and an object that has never had one has no
+/// room -- so giving it one reshapes it, exactly as adding a slot does.
+pub fn annotate(o: Oop) -> Oop {
+    if heap::is_annotated(o) {
+        return o;
+    }
+    let slots: Vec<Slot> = (0..slot_count(o)).map(|i| read_slot(o, i)).collect();
+    let h = heap::heap();
+    let mut shape = shape_like(o, slots.len());
+    shape = shape.annotated();
+    let n = h.alloc_or_tenure(shape);
+    write_slots(n, &slots);
+    copy_payload_across(o, n);
+    heap::set_hash(n, heap::hash(o));
+    heap::set_aux(n, heap::aux(o));
+    n
+}
+
+pub fn set_proxy(o: Oop, p: Option<u64>) {
+    heap::set_aux_word(o, 0, p.unwrap_or(0));
+    heap::set_aux_word(o, 1, p.is_some() as u64);
 }
 
 // ------------------------------------------------------------------ accessors
@@ -416,6 +468,24 @@ pub fn on_dying(o: Oop) {
     }
 }
 
+/// Every `Value` a live method holds, as a slot the collector may rewrite.
+pub fn each_method_value(f: &mut dyn FnMut(&mut Oop)) {
+    METHODS.with(|t| {
+        for m in t.borrow().0.iter().flatten() {
+            for v in m.lits.borrow_mut().iter_mut() {
+                crate::value::rewrite(v, f);
+            }
+            for v in m.slot_inits.borrow_mut().iter_mut() {
+                crate::value::rewrite(v, f);
+            }
+            if let Some((mut s, a, b)) = m.source.get() {
+                crate::value::rewrite(&mut s, f);
+                m.source.set(Some((s, a, b)));
+            }
+        }
+    });
+}
+
 pub fn live_methods() -> usize {
     METHODS.with(|t| t.borrow().0.iter().filter(|m| m.is_some()).count())
 }
@@ -495,8 +565,8 @@ mod tests {
     use super::*;
     use crate::value::sym;
 
-    fn s(name: &str, kind: SlotKind, v: Val) -> (Sym, SlotKind, Val) {
-        (sym(name), kind, v)
+    fn s(name: &str, kind: SlotKind, v: Val) -> Slot {
+        Slot { name: sym(name), kind, value: v }
     }
 
     #[test]

@@ -7,12 +7,15 @@
 //! slots are an object word plus a constant `x:` slot holding an assignment
 //! object -- exactly serf's `SlotKind::Assign`.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::image::*;
+use crate::heap::Kind as HKind;
 use crate::value::*;
 
+#[allow(dead_code)]
 pub fn value_key(v: &Value) -> usize {
     match v {
         Value::Obj(o) => o.id(),
@@ -288,10 +291,6 @@ pub struct Loader<'a> {
     methods: HashMap<u32, Rc<Method>>,
     nil: Value,
     block_traits: u32,
-    pub anno_obj: HashMap<usize, Value>,
-    pub anno_slot: HashMap<usize, HashMap<Sym, Value>>,
-    pub id_hash: HashMap<usize, i64>,
-    pub obj_kind: HashMap<usize, u8>,
 }
 
 impl<'a> Loader<'a> {
@@ -302,10 +301,6 @@ impl<'a> Loader<'a> {
             methods: HashMap::new(),
             nil: vm.nil.clone(),
             block_traits: snap.vm_oops[8],
-            anno_obj: HashMap::new(),
-            anno_slot: HashMap::new(),
-            id_hash: HashMap::new(),
-            obj_kind: HashMap::new(),
         }
     }
 
@@ -333,6 +328,46 @@ impl<'a> Loader<'a> {
         }
     }
 
+    /// How big the object will be, from its map alone -- no recursion, which
+    /// is what lets it be allocated before its contents are read.
+    ///
+    /// Counting the slots twice, here and in the loop that fills them, is the
+    /// price of a cyclic graph in a heap where shape is fixed at allocation.
+    /// ponytail: the two counts must agree; `obj::fill` asserts they do.
+    fn shape_of(&mut self, m: &MapInfo, addr: u32) -> Result<(HKind, usize, usize, bool), String> {
+        let mut n = 0usize;
+        if m.kind == MapType::Block {
+            n += 2; // parent, and the `value...` selector
+        }
+        let mut annotated = m.annotation & TAG_MASK == MEM_TAG;
+        for s in &m.slots {
+            if s.class == SlotClass::Arg {
+                continue;
+            }
+            if self.heap.string_at(s.name).is_err() {
+                continue;
+            }
+            n += 1;
+            if s.class == SlotClass::Obj {
+                n += 1; // the derived `x:`
+            }
+            annotated |= s.anno & TAG_MASK == MEM_TAG;
+        }
+        let ilen = |me: &mut Self| -> Result<usize, String> {
+            Ok(smi(me.heap.word(addr + 8)?).max(0) as usize)
+        };
+        let (k, len) = match m.kind {
+            MapType::StringM | MapType::ByteVector => (HKind::Bytes, ilen(self)?),
+            MapType::ObjVector => (HKind::ObjVector, ilen(self)?),
+            MapType::Mirror => (HKind::Mirror, 0),
+            MapType::Proxy | MapType::FctProxy => (HKind::Proxy, 0),
+            MapType::OuterMethod | MapType::BlockMethod => (HKind::Method, 0),
+            MapType::Block => (HKind::Block, 0),
+            _ => (HKind::Slots, 0),
+        };
+        Ok((k, n, len, annotated))
+    }
+
     pub fn object(&mut self, addr: u32) -> Result<Value, String> {
         if let Some(v) = self.done.get(&addr) {
             return Ok(v.clone());
@@ -340,17 +375,25 @@ impl<'a> Loader<'a> {
         let map_star = self.heap.map_star_of(addr)?;
         let m = self.heap.read_map(map_star)?;
 
-        // publish a placeholder first: the object graph is cyclic
-        let shell = Value::obj([], Payload::None);
-        self.done.insert(addr, shell.clone());
+        // The object graph is cyclic, so something has to be published before
+        // its contents are read. An arena object's shape is fixed when it is
+        // allocated, though, so a placeholder cannot be filled in later -- and
+        // it does not have to be: the map says how many slots and how long the
+        // indexable part is, and reading *that* needs no recursion at all.
+        let (k, ns, ilen, anno) = self.shape_of(&m, addr)?;
+        let shell = Value::Obj(crate::obj::make_shape(k, ns, ilen, anno));
+        self.done.insert(addr, shell);
 
         // mark word is `marked<1> age<7> hash<22> tag<2>` (markOop.hh); a
-        // hash of 0 is `no_hash`, meaning the VM never assigned one
-        let hash = ((self.heap.word(addr)? >> 2) & 0x3f_ffff) as i64;
+        // hash of 0 is `no_hash`, meaning the VM never assigned one. serf keeps
+        // it in its own mark word, where the C++ VM keeps it -- a Rust-side
+        // table keyed on identity cannot survive the identity moving.
+        let hash = ((self.heap.word(addr)? >> 2) & 0x3f_ffff) as u32;
         if hash != 0 {
-            self.id_hash.insert(value_key(&shell), hash);
+            crate::heap::set_hash(shell.as_obj().unwrap(), hash);
         }
 
+        let at = shell.as_obj().unwrap();
         let payload = match m.kind {
             MapType::StringM | MapType::ByteVector => {
                 let len = smi(self.heap.word(addr + 8)?).max(0) as usize;
@@ -390,6 +433,7 @@ impl<'a> Loader<'a> {
         };
 
         let mut slots = vec![];
+        let mut slot_annos: Vec<(usize, Value)> = vec![];
         if let Payload::Block(bm, _) = &payload {
             let bm = bm.clone();
             // the blockMap carries the real selector; deriving it from the
@@ -429,7 +473,7 @@ impl<'a> Loader<'a> {
             let value = self.value(raw)?;
             if s.anno & TAG_MASK == MEM_TAG {
                 let a = self.value(s.anno)?;
-                self.anno_slot.entry(value_key(&shell)).or_default().insert(sym(&name), a);
+                slot_annos.push((slots.len(), a));
             }
             slots.push(Slot { name: name.as_str().into(), kind, value });
             // Self stores only the data slot; `x:` is derived from it being an
@@ -443,19 +487,20 @@ impl<'a> Loader<'a> {
             }
         }
 
-        {
-            let o = shell.as_obj().unwrap();
-            let mut b = o.borrow_mut();
-            b.slots = slots.into();
-            b.payload = payload;
+        // the shape was right, so the contents just go in
+        crate::obj::fill(at, &slots, payload);
+        for (i, a) in slot_annos {
+            crate::heap::set_slot_anno(at, i, crate::obj::to_oop(a));
         }
         if m.annotation & TAG_MASK == MEM_TAG {
             let a = self.value(m.annotation)?;
-            self.anno_obj.insert(value_key(&shell), a);
+            crate::heap::set_obj_anno(at, crate::obj::to_oop(a));
         }
+        crate::heap::heap().record(at);
         // mirrors, proxies, processes and vframes are ordinary slot objects to
-        // serf; remember their map kind so writing does not demote them
-        self.obj_kind.insert(value_key(&shell), m.kind as u8);
+        // serf; remember their map kind so writing does not demote them --
+        // in the object, because an address is not a key across a collection
+        crate::heap::set_aux(at, m.kind as u8);
         Ok(shell)
     }
 
@@ -527,14 +572,14 @@ impl<'a> Loader<'a> {
             arg_slots: arg_slots.iter().map(|&(_, i)| i).collect(),
             slot_names: names,
             slot_flags: flags,
-            slot_inits: inits,
+            slot_inits: RefCell::new(inits),
             code,
-            lits,
+            lits: RefCell::new(lits),
             lit_strs,
             is_block: mi.kind == MapType::BlockMethod,
             file: self.heap.string_at(file).unwrap_or_default().as_str().into(),
             line: smi(line).max(0) as u32,
-            source,
+            source: Cell::new(source),
             sites: Default::default(),
         });
         self.methods.insert(map_star, m.clone());
@@ -612,7 +657,8 @@ pub struct Builder<'a> {
 /// class it came from; an serf-native one is a string if its parent is
 /// `traits string`.
 fn is_str(vm: &Vm, v: &Value, o: &ObjRef) -> bool {
-    match vm.obj_kind.get(&value_key(v)).copied().and_then(|k| MapType::from_index(k as usize)) {
+    let _ = v;
+    match MapType::from_index(crate::heap::aux(*o) as usize) {
         Some(MapType::StringM) => return true,
         Some(MapType::ByteVector) => return false,
         _ => {}
@@ -690,21 +736,22 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            let (k, e) = match &b.payload {
-                Payload::Bytes(x) => (if is_str(self.vm, v, &o) { Kind::Str } else { Kind::ByteVec }, x.len()),
-                Payload::Vector(x) => (Kind::Vector, x.len()),
-                Payload::Method(_) => (Kind::Method, 0),
-                Payload::Block(_, s) => {
-                    if s.is_some() {
+            let (k, e) = match b.payload.kind() {
+                PayKind::Bytes => (
+                    if is_str(self.vm, v, &o) { Kind::Str } else { Kind::ByteVec },
+                    b.payload.byte_len(),
+                ),
+                PayKind::Vector => (Kind::Vector, b.payload.vector_len()),
+                PayKind::Method => (Kind::Method, 0),
+                PayKind::Block => {
+                    if b.payload.block_scope().is_some() {
                         return Err("cannot write a live block: its home activation is not part of the heap".into());
                     }
                     (Kind::Block, 0)
                 }
-                // a mirror is a slots object with one extra fixed word
-                Payload::Mirror(_) => (Kind::Slots, 0),
-                // a dead proxy on the way out: the pointer is not portable
-                Payload::Proxy(_) => (Kind::Slots, 0),
-                Payload::None => (Kind::Slots, 0),
+                // a mirror is a slots object with one extra fixed word; a dead
+                // proxy on the way out, because the pointer is not portable
+                _ => (Kind::Slots, 0),
             };
             (a, k, e)
         };
@@ -713,7 +760,7 @@ impl<'a> Builder<'a> {
             let text = v.bytes().unwrap();
             // a string that came from an image keeps its own identity; only
             // serf-native strings are canonicalised by content here
-            if self.vm.obj_kind.contains_key(&o.id()) {
+            if crate::heap::aux(o) != 0 {
                 let i = self.add(v.clone(), Kind::Str, vec![], 4);
                 let off = self.bytes.len() as u32;
                 self.bytes.extend_from_slice(&text);
@@ -731,13 +778,13 @@ impl<'a> Builder<'a> {
 
         // only obj slots take a word: constants live in the map and arg slots
         // hold an index into the activation's argument list
-        let nmslots = match &o.borrow().payload {
-            Payload::Method(m) => (0..m.slot_names.len())
+        let nmslots = match o.borrow().payload.method() {
+            Some(m) if o.borrow().payload.kind() == PayKind::Method => (0..m.slot_names.len())
                 .filter(|&k| (m.slot_flags.get(k).copied().unwrap_or(0) >> 2) & 3 == 0)
                 .count(),
             _ => 0,
         };
-        let is_mirror = matches!(o.borrow().payload, Payload::Mirror(_));
+        let is_mirror = o.borrow().payload.kind() == PayKind::Mirror;
         let words = match kind {
             Kind::Method => 2 + nmslots,
             Kind::Slots => 2 + assignable.len() + is_mirror as usize,
@@ -762,23 +809,25 @@ impl<'a> Builder<'a> {
             let b = o.borrow();
             let mut kids: Vec<Value> = vec![];
             let mut ms: Vec<Rc<Method>> = vec![];
-            match &b.payload {
-                Payload::Mirror(r) => kids.push(r.clone()),
-                Payload::Vector(x) => kids.extend(x.iter().cloned()),
-                Payload::Method(m) => ms.push(m.clone()),
-                Payload::Block(m, _) => ms.push(m.clone()),
+            match b.payload.kind() {
+                PayKind::Mirror => kids.push(b.payload.mirror().unwrap()),
+                PayKind::Vector => kids.extend(b.payload.vector().unwrap()),
+                PayKind::Method | PayKind::Block => ms.push(b.payload.method().unwrap()),
                 _ => {}
             }
-            (b.slots.clone(), kids, ms)
+            let slots: Vec<Slot> = b.slots.iter().collect();
+            (slots, kids, ms)
         };
         for s in &slots {
             self.string(sym_str(s.name).as_bytes());
             self.visit(&s.value)?;
-            if let Some(a) = self.vm.anno_slot.get(&value_key(v)).and_then(|m| m.get(&s.name)).cloned() {
+        }
+        for i in 0..slots.len() {
+            if let Some(a) = crate::value::slot_anno(o, i) {
                 self.visit(&a)?;
             }
         }
-        if let Some(a) = self.vm.anno_obj.get(&value_key(v)).cloned() {
+        if let Some(a) = crate::value::obj_anno(o) {
             self.visit(&a)?;
         }
         for k in payload_kids {
@@ -801,16 +850,16 @@ impl<'a> Builder<'a> {
         for n in &m.slot_names {
             self.string(n.as_bytes());
         }
-        for v in &m.slot_inits {
+        for v in m.slot_inits.borrow().iter() {
             self.visit(v)?;
         }
-        for l in &m.lits {
+        for l in m.lits.borrow().iter() {
             self.visit(l)?;
         }
-        let lv = self.vm.vector(m.lits.clone());
+        let lv = self.vm.vector(m.lits.borrow().clone());
         let lits = self.visit(&lv)?.unwrap();
-        let source = match &m.source {
-            Some((s, _, _)) => self.visit(s)?.unwrap(),
+        let source = match m.source.get() {
+            Some((s, _, _)) => self.visit(&s)?.unwrap(),
             None => self.string(b""),
         };
         self.mparts.insert(key, (lits, code, file, source));
@@ -971,10 +1020,7 @@ impl<'a> Builder<'a> {
             e.put(addr, mark_word(h));
 
             let mut descs: Vec<u32> = vec![];
-            let reflectee = match &v.as_obj().unwrap().borrow().payload {
-                Payload::Mirror(r) => Some(r.clone()),
-                _ => None,
-            };
+            let reflectee = v.as_obj().unwrap().borrow().payload.mirror();
             let mut next_obj_word = match kind {
                 Kind::Str | Kind::ByteVec => 4,
                 Kind::Vector => 3,
@@ -988,7 +1034,7 @@ impl<'a> Builder<'a> {
                 // only the kinds that are ordinary slot objects with a
                 // different map class; everything else is decided by payload
                 Kind::Slots if reflectee.is_some() => MapType::Mirror,
-                Kind::Slots => match self.vm.obj_kind.get(&value_key(&v)).copied().and_then(|k| MapType::from_index(k as usize)) {
+                Kind::Slots => match MapType::from_index(crate::heap::aux(v.as_obj().unwrap()) as usize) {
                     Some(k) if matches!(k, MapType::Mirror | MapType::Proxy | MapType::FctProxy
                         | MapType::Process | MapType::Profiler | MapType::Ovframe
                         | MapType::Bvframe | MapType::Assignment) => k,
@@ -998,10 +1044,7 @@ impl<'a> Builder<'a> {
                 Kind::ByteVec => MapType::ByteVector,
                 Kind::Vector => MapType::ObjVector,
                 Kind::Method => {
-                    let blk = match &v.as_obj().unwrap().borrow().payload {
-                        Payload::Method(m) => m.is_block,
-                        _ => false,
-                    };
+                    let blk = v.as_obj().unwrap().borrow().payload.method().is_some_and(|m| m.is_block);
                     if blk { MapType::BlockMethod } else { MapType::OuterMethod }
                 }
                 Kind::Block => MapType::Block,
@@ -1014,15 +1057,9 @@ impl<'a> Builder<'a> {
                     e.put(addr + 12, bytes_bottom + self.byte_off[&i]);
                 }
                 Kind::Vector => {
-                    let n = match &v.as_obj().unwrap().borrow().payload {
-                        Payload::Vector(x) => x.len(),
-                        _ => 0,
-                    };
-                    e.put(addr + 8, as_smi(n as i32));
-                    let items: Vec<Value> = match &v.as_obj().unwrap().borrow().payload {
-                        Payload::Vector(x) => x.clone(),
-                        _ => vec![],
-                    };
+                    let items: Vec<Value> =
+                        v.as_obj().unwrap().borrow().payload.vector().unwrap_or_default();
+                    e.put(addr + 8, as_smi(items.len() as i32));
                     let base = addr + 4 * (words - items.len()) as u32;
                     for (k, x) in items.iter().enumerate() {
                         let t = self.tagged(x)?;
@@ -1034,8 +1071,8 @@ impl<'a> Builder<'a> {
 
             let mut method_fields: Option<Vec<u32>> = None;
             if kind == Kind::Method {
-                let m = match &v.as_obj().unwrap().borrow().payload {
-                    Payload::Method(m) => m.clone(),
+                let m = match v.as_obj().unwrap().borrow().payload.method() {
+                    Some(m) => m,
                     _ => unreachable!(),
                 };
                 let (lits, code, file, source) = self.mparts[&(Rc::as_ptr(&m) as *const u8 as usize)];
@@ -1049,7 +1086,7 @@ impl<'a> Builder<'a> {
                     ];
                     if m.is_block {
                         // blockMethodMap adds _sourceOffset and _sourceLen
-                        let (o, l) = m.source.as_ref().map_or((0, 0), |&(_, o, l)| (o, l));
+                        let (o, l) = m.source.get().as_ref().map_or((0, 0), |&(_, o, l)| (o, l));
                         mf.push(as_smi(o as i32));
                         mf.push(as_smi(l as i32));
                     }
@@ -1058,7 +1095,7 @@ impl<'a> Builder<'a> {
                         let ni = self.string(name.as_bytes());
                         let nm = self.items[ni].addr | MEM_TAG;
                         let t = m.slot_flags.get(k).copied().unwrap_or(0);
-                        let init = self.tagged(&m.slot_inits[k])?;
+                        let init = self.tagged(&m.slot_inits.borrow()[k])?;
                         if (t >> 2) & 3 == 2 {
                             // an arg slot's data is its position in the arglist
                             let ai = m.arg_slots.iter().position(|&x| x == k).unwrap_or(0);
@@ -1076,11 +1113,12 @@ impl<'a> Builder<'a> {
             }
 
             if kind != Kind::Method && kind != Kind::Block {
-                let slots = v.as_obj().unwrap().borrow().slots.clone();
-                for s in &slots {
+                let at = v.as_obj().unwrap();
+                let slots: Vec<Slot> = at.borrow().slots.iter().collect();
+                for (si, s) in slots.iter().enumerate() {
                     let ni = self.string(sym_str(s.name).as_bytes());
                     let nm = self.items[ni].addr | MEM_TAG;
-                    let sa = match self.vm.anno_slot.get(&value_key(&v)).and_then(|m| m.get(&s.name)).cloned() {
+                    let sa = match crate::value::slot_anno(at, si) {
                         Some(a) => self.tagged(&a)?,
                         None => nil,
                     };
@@ -1111,8 +1149,8 @@ impl<'a> Builder<'a> {
 
             let nslots = descs.len() / 4;
             let body: Vec<u32> = if kind == Kind::Block {
-                let m = match &v.as_obj().unwrap().borrow().payload {
-                    Payload::Block(m, _) => m.clone(),
+                let m = match v.as_obj().unwrap().borrow().payload.method() {
+                    Some(m) => m,
                     _ => unreachable!(),
                 };
                 let vsel = crate::compile::block_selector(m.nargs);
@@ -1132,7 +1170,7 @@ impl<'a> Builder<'a> {
                 e.put(addr + 8, as_smi(0)); // scopeHomeFr: no live home
                 vec![VTBL_SENTINEL + MapType::Block as u32 * 4, as_smi(0), vname, vmeth]
             } else {
-                let anno = match self.vm.anno_obj.get(&value_key(&v)).cloned() {
+                let anno = match crate::value::obj_anno(v.as_obj().unwrap()) {
                     Some(a) => self.tagged(&a)?,
                     None => nil,
                 };
@@ -1236,8 +1274,8 @@ impl<'a> Builder<'a> {
 }
 
 fn vec_len(v: &Value) -> usize {
-    match v.as_obj().map(|o| match &o.borrow().payload {
-        Payload::Vector(x) => x.len(),
+    match v.as_obj().map(|o| match o.borrow().payload.kind() {
+        PayKind::Vector => o.borrow().payload.vector_len(),
         _ => 0,
     }) {
         Some(n) => n,

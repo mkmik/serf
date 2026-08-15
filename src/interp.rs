@@ -66,12 +66,26 @@ impl Frame {
 pub fn frame_roots(fs: &mut [Frame], f: &mut dyn FnMut(&mut ObjRef)) {
     for fr in fs.iter_mut() {
         f(&mut fr.scope);
-        for s in fr.tail_of.iter_mut() {
-            f(s);
-        }
         for v in fr.stack.iter_mut() {
             crate::value::rewrite(v, f);
         }
+    }
+}
+
+/// `tail_of` is weak, and has to be. It holds activations this frame took the
+/// continuation of, purely so a non-local return can recognise one -- nothing
+/// ever reads their slots through it. An entry no block still holds can never
+/// be the target of anything, so keeping it alive would be keeping every
+/// activation a loop ever made: `whileTrue:` is recursive in Self, its
+/// recursive call is in tail position, and the block that carries it captures
+/// the activation each time round.
+///
+/// `Rc::strong_count` used to answer "does anything else hold this?". The
+/// collector answers it now, which is the same question asked at the only
+/// moment it can be answered honestly.
+pub fn frame_weak(fs: &mut [Frame], f: &mut dyn FnMut(ObjRef) -> Option<ObjRef>) {
+    for fr in fs.iter_mut() {
+        fr.tail_of = fr.tail_of.iter().filter_map(|s| f(*s)).collect();
     }
 }
 
@@ -101,10 +115,10 @@ pub fn new_scope(
     m: Rc<Method>,
     recv: Value,
     holder: Value,
-    args: Vec<Value>,
+    args: &[Value],
     lexical: Option<ObjRef>,
 ) -> ObjRef {
-    crate::value::new_activation(m, recv, holder, &args, lexical)
+    crate::value::new_activation(m, recv, holder, args, lexical)
 }
 
 /// The error the current process is suspending for, if any. The world's own
@@ -184,19 +198,19 @@ pub fn stack_for_send(vm: &mut Vm, recv: Value, sel: &str, args: Vec<Value>) -> 
         arg_slots: (0..=n).collect(),
         slot_names: (0..=n).map(|i| -> Rc<str> { format!("a{}", i).as_str().into() }).collect(),
         slot_flags: vec![2 << 2; n + 1],
-        slot_inits: vec![vm.nil_v(); n + 1],
+        slot_inits: RefCell::new(vec![vm.nil_v(); n + 1]),
         code,
-        lits: vec![vm.string(sel)],
+        lits: RefCell::new(vec![vm.string(sel)]),
         lit_strs: vec![Some(sel.into())],
         is_block: false,
         file: "<process>".into(),
         line: 0,
-        source: None,
+        source: Cell::new(None),
         sites: Default::default(),
     });
     let mut a = vec![recv.clone()];
     a.extend(args);
-    let scope = new_scope(m, recv.clone(), recv, a, None);
+    let scope = new_scope(m, recv, recv, &a, None);
     vec![Frame::new(scope)]
 }
 
@@ -214,20 +228,20 @@ pub fn send(vm: &mut Vm, recv: Value, sel: &str, args: Vec<Value>) -> Result<Val
         arg_slots: (0..=n).collect(),
         slot_names: (0..=n).map(|i| -> Rc<str> { format!("a{}", i).as_str().into() }).collect(),
         slot_flags: vec![2 << 2; n + 1],
-        slot_inits: vec![vm.nil.clone(); n + 1],
+        slot_inits: RefCell::new(vec![vm.nil.clone(); n + 1]),
         code,
-        lits: vec![vm.string(sel)],
+        lits: RefCell::new(vec![vm.string(sel)]),
         lit_strs: vec![Some(sel.into())],
         is_block: false,
         file: "<vm>".into(),
         line: 0,
-        source: None,
+        source: Cell::new(None),
         sites: Default::default(),
     });
     let mut a = vec![recv];
     a.extend(args);
     let lobby = vm.lobby.clone();
-    let scope = new_scope(m, lobby.clone(), lobby, a, None);
+    let scope = new_scope(m, lobby, lobby, &a, None);
     run(vm, scope)
 }
 
@@ -260,22 +274,19 @@ fn err(frames: &[Frame], msg: String) -> Unwind {
     Unwind::Err(SelfErr { msg, trace })
 }
 
-fn nth_lexical(s: &Rc<Scope>, n: usize) -> Option<Rc<Scope>> {
-    let mut cur = s.clone();
+fn nth_lexical(s: ObjRef, n: usize) -> Option<ObjRef> {
+    let mut cur = s;
     for _ in 0..n {
-        cur = cur.lexical.clone()?;
+        cur = act_lexical(cur)?;
     }
     Some(cur)
 }
 
-fn clone_block(proto: &Value, scope: &Rc<Scope>) -> Value {
+fn clone_block(proto: &Value, scope: ObjRef) -> Value {
     let o = proto.as_obj().unwrap();
-    let b = o.borrow();
-    let m = match &b.payload {
-        Payload::Block(m, _) => m.clone(),
-        _ => unreachable!(),
-    };
-    Value::obj(b.slots.clone(), Payload::Block(m, Some(scope.clone())))
+    let m = o.borrow().payload.method().expect("a block prototype without a method");
+    let slots: Vec<Slot> = o.borrow().slots.iter().collect();
+    Value::obj(slots, Payload::Block(m, Some(scope)))
 }
 
 /// Run to completion, standing in for the Self scheduler when the code
@@ -283,7 +294,7 @@ fn clone_block(proto: &Value, scope: &Rc<Scope>) -> Value {
 /// handler does -- sends the action `doAction` -- and then resumes. Enough of
 /// a scheduler for code that yields for a service; a real one would pick the
 /// next process off the ready queue.
-pub fn run(vm: &mut Vm, scope: Rc<Scope>) -> Result<Value, Unwind> {
+pub fn run(vm: &mut Vm, scope: ObjRef) -> Result<Value, Unwind> {
     let mut frames = vec![Frame::new(scope)];
     loop {
         match run_stack(vm, &mut frames)? {
@@ -311,8 +322,10 @@ pub fn run(vm: &mut Vm, scope: Rc<Scope>) -> Result<Value, Unwind> {
 /// A frame stack is a Self process's stack: run it until it finishes or
 /// yields, leaving it resumable either way.
 pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind> {
-    let heap = crate::gc::gc();
     // interbytecode state, per the C++ abstract_interpreter
+    // one argument buffer for the whole run: a send fills it, `new_scope`
+    // copies out of it into the activation, and it comes straight back
+    let mut argbuf: Vec<Value> = Vec::new();
     let mut index: usize = 0;
     let mut lex_level: usize = 0;
     let mut delegatee: Option<Rc<str>> = None;
@@ -324,7 +337,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
         // are the ones `Vm::each_root` walks. The C++ VM arranges the same
         // thing by poisoning the stack limit so the next method prologue traps
         // (universe.hh:148).
-        if heap.wanted() {
+        if crate::gc::wanted() {
             lending(vm, frames, crate::gc::collect_if_wanted);
         }
 
@@ -358,20 +371,21 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let idx = (index << 4) | x;
                 index = 0;
                 let f = frames.last().unwrap();
-                let lit = match act_method(f.scope).lits.get(idx) {
+                let lit = match act_method(f.scope).lits.borrow().get(idx) {
                     Some(l) => l.clone(),
                     None => return Err(err(frames, "literal index out of range".into())),
                 };
-                let is_proto = lit
-                    .as_obj()
-                    .map_or(false, |o| matches!(&o.borrow().payload, Payload::Block(_, None)));
-                let v = if is_proto { clone_block(&lit, &f.scope) } else { lit };
+                let is_proto = lit.as_obj().is_some_and(|o| {
+                    let p = o.borrow().payload;
+                    p.kind() == PayKind::Block && p.block_scope().is_none()
+                });
+                let v = if is_proto { clone_block(&lit, f.scope) } else { lit };
                 frames.last_mut().unwrap().stack.push(v);
             }
 
             NO_OPERAND => match x {
                 SELF_C => {
-                    let v = frames.last().unwrap().scope.recv.clone();
+                    let v = act_recv(frames.last().unwrap().scope);
                     frames.last_mut().unwrap().stack.push(v);
                 }
                 POP_C => {
@@ -384,13 +398,13 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         Some(v) => v,
                         None => return Err(err(frames, "nothing to return".into())),
                     };
-                    let target = Scope::home_of(&frames.last().unwrap().scope);
-                    if target.dead.get() {
+                    let target = home_of(frames.last().unwrap().scope);
+                    if act_dead(target) {
                         return Err(err(frames, "non-local return to an activation that already returned".into()));
                     }
                     loop {
                         let f = frames.pop().unwrap();
-                        let hit = f.is_home(&target);
+                        let hit = f.is_home(target);
                         f.retire();
                         if hit {
                             match frames.last_mut() {
@@ -419,15 +433,15 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 index = 0;
                 let lvl = lex_level;
                 lex_level = 0;
-                let sc = match nth_lexical(&frames.last().unwrap().scope, lvl) {
+                let sc = match nth_lexical(frames.last().unwrap().scope, lvl) {
                     Some(s) => s,
                     None => return Err(err(frames, "no such lexical scope".into())),
                 };
-                if idx >= sc.slots.borrow().len() {
+                if idx >= act_locals(sc) {
                     return Err(err(frames, "local slot index out of range".into()));
                 }
                 if op == READ_LOCAL {
-                    let v = sc.slots.borrow()[idx].clone();
+                    let v = act_local(sc, idx);
                     frames.last_mut().unwrap().stack.push(v);
                 } else {
                     let f = frames.last_mut().unwrap();
@@ -435,8 +449,8 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         Some(v) => v,
                         None => return Err(err(frames, "nothing to assign".into())),
                     };
-                    sc.slots.borrow_mut()[idx] = v;
-                    let me = frames.last().unwrap().scope.recv.clone();
+                    act_set_local(sc, idx, v);
+                    let me = act_recv(frames.last().unwrap().scope);
                     frames.last_mut().unwrap().stack.push(me);
                 }
             }
@@ -444,7 +458,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
             DELEGATEE => {
                 let idx = (index << 4) | x;
                 index = 0;
-                delegatee = frames.last().unwrap().scope.method.lit_strs.get(idx).cloned().flatten();
+                delegatee = act_method(frames.last().unwrap().scope).lit_strs.get(idx).cloned().flatten();
                 if delegatee.is_none() {
                     return Err(err(frames, "delegatee must be a name".into()));
                 }
@@ -454,18 +468,19 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let idx = (index << 4) | x;
                 index = 0;
                 let normal = op == SEND;
-                let sel = match frames.last().unwrap().scope.method.lit_strs.get(idx).cloned().flatten() {
+                let sel = match act_method(frames.last().unwrap().scope).lit_strs.get(idx).cloned().flatten() {
                     Some(s) => s,
                     None => return Err(err(frames, "selector must be a string".into())),
                 };
-                let argc = frames.last().unwrap().scope.method.site_nargs(idx, &sel);
+                let argc = act_method(frames.last().unwrap().scope).site_nargs(idx, &sel);
                 let (mut cur_recv, mut cur_args) = {
                     let f = frames.last_mut().unwrap();
                     if f.stack.len() < argc + normal as usize {
                         return Err(err(frames, format!("stack underflow sending '{}'", sel)));
                     }
                     let n = f.stack.len();
-                    let mut args = take_vals();
+                    let mut args = std::mem::take(&mut argbuf);
+                    args.clear();
                     args.extend_from_slice(&f.stack[n - argc..]);
                     f.stack.truncate(n - argc);
                     let recv = if normal {
@@ -557,7 +572,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 return Ok(Outcome::Yielded { rcvr: r, arg: a });
                             }
                             Ok(prims::P::Activate(m, r)) => {
-                                let ns = new_scope(m, r.clone(), r, vec![], None);
+                                let ns = new_scope(m, r, r, &[], None);
                                 frames.push(Frame::new(ns));
                                 break;
                             }
@@ -572,9 +587,9 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         }
                     }
 
-                    let holder = frames.last().unwrap().scope.holder.clone();
+                    let holder = act_holder(frames.last().unwrap().scope).clone();
                     let found = if let Some(s) = site.take() {
-                        let m = &frames.last().unwrap().scope.method;
+                        let m = &act_method(frames.last().unwrap().scope);
                         let start = vm.lookup_key(&cur_recv);
                         // the same receiver again answers without reading it;
                         // only a new one pays a deref to find out its shape
@@ -673,15 +688,13 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
 
                     if kind == SlotKind::Assign {
                         let target = sym_str(sname).trim_end_matches(':').to_string();
-                        let mut b = hit.holder.borrow_mut();
+                        let b = hit.holder.borrow_mut();
                         match b.find(&target) {
                             Some(i) => b.assign(i, cur_args[0].clone()),
                             None => {
-                                drop(b);
                                 return Err(err(frames, format!("assignment slot '{}' has no data slot", sname)));
                             }
                         }
-                        drop(b);
                         frames.last_mut().unwrap().stack.push(cur_recv);
                         break;
                     }
@@ -698,12 +711,9 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     }
 
                     let (nrecv, nholder, lexical) = if m.is_block {
-                        let lex = cur_recv.as_obj().and_then(|o| match &o.borrow().payload {
-                            Payload::Block(_, Some(s)) => Some(s.clone()),
-                            _ => None,
-                        });
+                        let lex = cur_recv.as_obj().and_then(|o| o.borrow().payload.block_scope());
                         match lex {
-                            Some(l) => (l.recv.clone(), l.holder.clone(), Some(l)),
+                            Some(l) => (act_recv(l), act_holder(l), Some(l)),
                             None => {
                                 return Err(err(frames, "block code activated outside of a block".into()))
                             }
@@ -712,7 +722,9 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         (cur_recv.clone(), Value::Obj(hit.holder.clone()), None)
                     };
 
-                    let ns = new_scope(m, nrecv, nholder, cur_args, lexical);
+                    let ns = new_scope(m, nrecv, nholder, &cur_args, lexical);
+                    // the buffer goes back for the next send rather than to `free`
+                    argbuf = cur_args;
 
                     // A send in tail position takes over our frame: there is
                     // nothing left for us to do with the answer but hand it on.
@@ -727,26 +739,14 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     };
                     let mut carried = vec![];
                     if tail {
-                        let mut old = frames.pop().unwrap();
-                        give_vals(std::mem::take(&mut old.stack));
+                        let old = frames.pop().unwrap();
                         carried = old.tail_of;
-                        if Rc::strong_count(&old.scope) > 1 {
-                            carried.push(old.scope);
-                        } else {
-                            old.scope.dead.set(true);
-                            // Self's loops are recursive with the recursive call
-                            // in tail position, so this -- not `retire` -- is
-                            // where most activations end. Offer it here too, or
-                            // every iteration of a `whileTrue:` allocates one.
-                            give_scope(old.scope);
-                        }
-                        // Blocks die with a collection, not with the send they
-                        // were passed to, so the list holds on to activations
-                        // that nothing can reach any more. Weeding it out on
-                        // every power of two keeps that amortised.
-                        if carried.len() >= 64 && carried.len().is_power_of_two() {
-                            carried.retain(|s| Rc::strong_count(s) > 1);
-                        }
+                        // it has not returned -- its continuation is now the
+                        // callee's -- so it is carried, not retired. The list
+                        // is weak, so a collection drops the entries no block
+                        // still holds, which is what keeps a `whileTrue:` from
+                        // accumulating one per iteration.
+                        carried.push(old.scope);
                     }
                     if frames.len() >= vm.max_frames {
                         let mut h: std::collections::HashMap<String, usize> = Default::default();
@@ -775,7 +775,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
             BRANCH | BRANCH_TRUE | BRANCH_FALSE | BRANCH_INDEXED => {
                 let idx = (index << 4) | x;
                 index = 0;
-                let lit = match frames.last().unwrap().scope.method.lits.get(idx) {
+                let lit = match act_method(frames.last().unwrap().scope).lits.borrow().get(idx) {
                     Some(l) => l.clone(),
                     None => return Err(err(frames, "branch literal out of range".into())),
                 };
@@ -790,9 +790,9 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                             Some(Value::Int(i)) if i >= 0 => i as usize,
                             _ => return Err(err(frames, "indexed branch needs an index".into())),
                         };
-                        match lit.as_obj().and_then(|o| match &o.borrow().payload {
-                            Payload::Vector(v) => v.get(i).and_then(|t| target(t)),
-                            _ => None,
+                        match lit.as_obj().and_then(|o| {
+                            let p = o.borrow().payload;
+                            (i < p.vector_len()).then(|| p.element(i)).and_then(|t| target(&t))
                         }) {
                             Some(d) => Some(d),
                             None => return Err(err(frames, "bad indexed branch table".into())),

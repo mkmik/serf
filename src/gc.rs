@@ -17,7 +17,6 @@
 
 use std::cell::Cell;
 
-pub use crate::heap::Oop as ObjRef;
 use crate::heap;
 use crate::value::{lookup_gen_bump, Vm, VmRoots};
 
@@ -164,6 +163,7 @@ pub fn young_used() -> usize {
     heap::heap().young_used()
 }
 
+#[allow(dead_code)]
 pub fn young_capacity() -> usize {
     heap::heap().young_capacity()
 }

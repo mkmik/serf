@@ -280,6 +280,9 @@ impl PayRef {
     pub fn kill_proxy(&self) {
         obj::kill_proxy(self.0)
     }
+    pub fn set_proxy(&self, p: Option<u64>) {
+        obj::set_proxy(self.0, p)
+    }
 }
 
 // ------------------------------------------------------------- the object
@@ -448,9 +451,9 @@ pub struct Method {
     /// raw Self slotType bits per slot (class, parent, vm), so a loaded
     /// method's descriptors survive being written back out
     pub slot_flags: Vec<u32>,
-    pub slot_inits: Vec<Value>,
+    pub slot_inits: RefCell<Vec<Value>>,
     pub code: Vec<u8>,
-    pub lits: Vec<Value>,
+    pub lits: RefCell<Vec<Value>>,
     /// selector literals pre-decoded, so sends don't rebuild a String each time
     pub lit_strs: Vec<Option<Rc<str>>>,
     pub is_block: bool,
@@ -460,7 +463,7 @@ pub struct Method {
     /// (`_sourceOffset`/`_sourceLen`, non-zero only for a block, whose source
     /// string is its enclosing method's). Only a loaded method has one: serf's
     /// parser does not record source spans.
-    pub source: Option<(Value, i64, i64)>,
+    pub source: Cell<Option<(Value, i64, i64)>>,
     /// Inline caches, one per literal; sized on the method's first send. Not
     /// a GC root: an entry is only read at the generation it was filled at,
     /// and a collection bumps that.
@@ -489,8 +492,9 @@ impl Default for Site {
 impl Method {
     fn sites(&self) -> std::cell::RefMut<'_, Vec<Site>> {
         let mut s = self.sites.borrow_mut();
-        if s.len() < self.lits.len() {
-            s.resize(self.lits.len(), Site::default());
+        let n = self.lits.borrow().len();
+        if s.len() < n {
+            s.resize(n, Site::default());
         }
         s
     }
@@ -549,20 +553,22 @@ pub fn new_activation(
     args: &[Value],
     lexical: Option<ObjRef>,
 ) -> ObjRef {
-    let inits = m.slot_inits.clone();
-    let arg_slots = m.arg_slots.clone();
+    // no clones: a send happens millions of times, and cloning the method's
+    // initialiser list and argument map on each one is two `malloc`s that the
+    // whole exercise is about not making
+    let n = m.slot_inits.borrow().len();
     let home = lexical.map(home_of);
-    let a = obj::new_activation(m, inits.len());
+    let a = obj::new_activation(m.clone(), n);
     obj::act_set(a, act::RECV, recv);
     obj::act_set(a, act::HOLDER, holder);
     obj::act_set_link(a, act::LEXICAL, lexical);
     obj::act_set_link(a, act::HOME, home);
     obj::act_set_dead(a, false);
-    for (i, v) in inits.iter().enumerate() {
+    for (i, v) in m.slot_inits.borrow().iter().enumerate() {
         obj::act_set_local(a, i, *v);
     }
     for (i, v) in args.iter().enumerate() {
-        obj::act_set_local(a, arg_slots[i], *v);
+        obj::act_set_local(a, m.arg_slots[i], *v);
     }
     a
 }
@@ -593,6 +599,10 @@ pub fn act_dead(a: ObjRef) -> bool {
 
 pub fn act_set_dead(a: ObjRef, d: bool) {
     obj::act_set_dead(a, d)
+}
+
+pub fn act_locals(a: ObjRef) -> usize {
+    obj::act_locals(a)
 }
 
 pub fn act_local(a: ObjRef, i: usize) -> Value {
@@ -631,6 +641,47 @@ impl Value {
     }
     pub fn as_str(&self) -> Option<String> {
         self.bytes().map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+}
+
+// ------------------------------------------------------------- annotations
+
+/// Self keeps an object's annotations in its map. serf keeps them in the
+/// object, which is what lets the collector see them -- a Rust-side table
+/// keyed on an address cannot survive the address moving, and that is what
+/// `Vm::anno_obj` and `Vm::anno_slot` were.
+pub fn obj_anno(o: ObjRef) -> Option<Value> {
+    let a = heap::obj_anno(o);
+    (!a.is_null()).then(|| obj::from_oop(a))
+}
+
+pub fn slot_anno(o: ObjRef, i: usize) -> Option<Value> {
+    let a = heap::slot_anno(o, i);
+    (!a.is_null()).then(|| obj::from_oop(a))
+}
+
+impl Vm {
+    /// Give an object an annotation. An object that has never had one has no
+    /// room for it, so this reshapes it -- which means every pointer to it
+    /// moves, exactly as adding a slot does.
+    pub fn set_obj_anno(&mut self, o: Value, a: Value) {
+        let Some(at) = o.as_obj() else { return };
+        let wide = obj::annotate(at);
+        if wide != at {
+            self.switch(at, wide);
+        }
+        heap::set_obj_anno(wide, obj::to_oop(a));
+        heap::heap().record(wide);
+    }
+
+    pub fn set_slot_anno(&mut self, o: Value, i: usize, a: Value) {
+        let Some(at) = o.as_obj() else { return };
+        let wide = obj::annotate(at);
+        if wide != at {
+            self.switch(at, wide);
+        }
+        heap::set_slot_anno(wide, i, obj::to_oop(a));
+        heap::heap().record(wide);
     }
 }
 
@@ -822,6 +873,8 @@ impl Vm {
         ] {
             let g = vm.globals;
             vm.put_slot(g, slot(n, SlotKind::Data, v));
+            // globals just widened, and `vm.globals` is a root, so the switch
+            // has already moved it; nothing to re-fetch
         }
         vm
     }
@@ -831,24 +884,31 @@ impl Vm {
     /// `universe::switch_pointers` (memory/universe.cpp:315), which is the bill
     /// direct pointers come with and is affordable because this happens while a
     /// world is being programmed, not while it runs.
-    pub fn put_slot(&mut self, o: Value, s: Slot) {
+    /// Answers where the object ended up. It has to: widening builds a new
+    /// object and switches every pointer in the heap and every root to it, but
+    /// a `Value` in a Rust local is neither, so the caller's is stale the
+    /// moment this returns.
+    pub fn put_slot(&mut self, o: Value, s: Slot) -> Value {
         lookup_gen_bump();
-        let Some(at) = o.as_obj() else { return };
+        let Some(at) = o.as_obj() else { return o };
         if let Some(i) = obj::find(at, s.name) {
             forget_map(at);
             heap::set_slot_desc(at, i, s.name.id(), s.kind as u8);
             obj::assign(at, i, s.value);
-            return;
+            return o;
         }
         let wide = obj::grow(at, &[s]);
         self.switch(at, wide);
+        Value::Obj(wide)
     }
 
     /// Drop the slots a name owns -- the data slot and its assignment slot.
-    /// Answers whether anything went.
-    pub fn remove_slot(&mut self, o: Value, name: &str) -> bool {
+    /// Answers where the object went, or `None` if there was no such slot.
+    /// It has to answer, for the same reason `put_slot` does: the caller's
+    /// `Value` is a Rust local, and the switch does not reach those.
+    pub fn remove_slot(&mut self, o: Value, name: &str) -> Option<Value> {
         lookup_gen_bump();
-        let Some(at) = o.as_obj() else { return false };
+        let at = o.as_obj()?;
         let colon = format!("{}:", name);
         let keep: Vec<Slot> = at
             .borrow()
@@ -857,14 +917,14 @@ impl Vm {
             .filter(|s| sym_str(s.name) != name && sym_str(s.name) != colon)
             .collect();
         if keep.len() == obj::slot_count(at) {
-            return false;
+            return None;
         }
         let narrow = obj::reshape(at, &keep);
         self.switch(at, narrow);
-        true
+        Some(Value::Obj(narrow))
     }
 
-    fn switch(&mut self, from: ObjRef, to: ObjRef) {
+    pub(crate) fn switch(&mut self, from: ObjRef, to: ObjRef) {
         let mut r = VmRoots { vm: self };
         heap::heap().switch_pointers(&mut r, from, to);
     }
@@ -907,6 +967,22 @@ impl Vm {
             [Slot { name: SYM_PARENT, kind: SlotKind::Parent, value: self.t_vector }],
             Payload::Vector(v),
         )
+    }
+
+    /// A parked process stack, by the process object. A list, not a map: the
+    /// key is an object and an object's address is not a key across a
+    /// collection, so this compares identity instead of hashing it. There are
+    /// a handful of processes, so the scan is shorter than the hash would be.
+    pub fn take_proc(&mut self, p: &Value) -> Option<Vec<crate::interp::Frame>> {
+        let i = self.procs.iter().position(|(k, _)| k.id_eq(p))?;
+        Some(self.procs.remove(i).1)
+    }
+
+    pub fn put_proc(&mut self, p: Value, fs: Vec<crate::interp::Frame>) {
+        match self.procs.iter().position(|(k, _)| k.id_eq(&p)) {
+            Some(i) => self.procs[i].1 = fs,
+            None => self.procs.push((p, fs)),
+        }
     }
 
     /// The receiver object whose slots are searched first. Immediates have
@@ -1047,11 +1123,15 @@ pub struct VmRoots<'a> {
     pub vm: &'a mut Vm,
 }
 
+/// Hand one root to the collector, if it is one.
+///
+/// It must not go through `to_oop`: that *boxes a float*, and boxing allocates
+/// -- during a collection, into the space being abandoned, moving the bump
+/// pointer the scan is walking towards. A `Value::Float` in a Rust local was
+/// never a heap object anyway; only storing one into the heap makes it one.
 pub fn rewrite(v: &mut Value, f: &mut dyn FnMut(&mut Oop)) {
-    let mut w = obj::to_oop(*v);
-    if w.is_obj() {
-        f(&mut w);
-        *v = obj::from_oop(w);
+    if let Value::Obj(o) = v {
+        f(o);
     }
 }
 
@@ -1095,6 +1175,22 @@ impl heap::Roots for VmRoots<'_> {
         }
         for fs in vm.stacks.iter_mut() {
             crate::interp::frame_roots(fs, f);
+        }
+        // A method's literals -- strings, block prototypes, slot initialisers
+        // -- are reachable only through the method table, which is Rust-side.
+        // `gc.rs` used to walk them through `Payload::Method`; nothing does now
+        // unless this does, and a literal the collector never sees is a
+        // pointer into a space it has just abandoned.
+        obj::each_method_value(f);
+    }
+
+    fn weak(&mut self, f: &mut dyn FnMut(Oop) -> Option<Oop>) {
+        let vm = &mut *self.vm;
+        for (_, fs) in vm.procs.iter_mut() {
+            crate::interp::frame_weak(fs, f);
+        }
+        for fs in vm.stacks.iter_mut() {
+            crate::interp::frame_weak(fs, f);
         }
     }
 
@@ -1172,14 +1268,14 @@ pub fn test_method() -> Rc<Method> {
         arg_slots: vec![],
         slot_names: vec![],
         slot_flags: vec![],
-        slot_inits: vec![],
+        slot_inits: RefCell::new(vec![]),
         code: vec![],
-        lits: vec![],
+        lits: RefCell::new(vec![]),
         lit_strs: vec![],
         is_block: false,
         file: "t".into(),
         line: 0,
-        source: None,
+        source: Cell::new(None),
         sites: Default::default(),
     })
 }
