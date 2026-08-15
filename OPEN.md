@@ -2,99 +2,40 @@
 
 Known, reproducible, not fixed. One section each; delete a section when it goes.
 
-## A scavenge costs 1.9ms with nothing to collect
+## The interpreter is ~1.3x slower than the cell heap
 
-`SERF_GC_STRESS=1` on a *loaded world* is around a hundred times slower than it
-should be. The answers are right; the wait is not.
+Measured against the last pre-flip commit (2411e7f), built as its own binary:
 
-```sh
-# 100.9s.  Answers 1, correctly.
-SERF_GC_STRESS=1 ./target/release/serf --load core.snap \
-  --run "[|:x. q| 5 timesRepeat: [ q: ('a' , 'b') ]. 1] value: 0"
-```
+| | cells | arena |
+|---|---|---|
+| 1M-iteration integer loop | 0.95s | 1.23s |
+| 200k clone-and-send loop | 0.29s | 0.35s |
+| `self/test.self` | 0.18s | 0.24s |
+| `--load core.snap --save` | 0.24s | **0.18s** |
+| stress, 5 iterations on a loaded world | -- | 7.1s, was 100.9s |
 
-It is why `run-tests.sh` no longer runs its annotation checks under stress.
+Image work is faster and the collector itself is about four times faster per
+object (`cargo test --release -- --ignored heap::bench`). What is left is a
+consistent ~1.3x on interpreter loops, and it is worth closing, because the
+whole point of direct pointers was that an interpreter should not pay for the
+indirection a handle table charged.
 
-### What is actually happening
+Where it probably is, in the order a profile last put them:
 
-Not the loop, and not the image load:
+* **`heap::heap()` is a thread-local.** `LocalKey::with` on every allocation and
+  every write barrier. Removing it from field reads and from the barrier is what
+  took this from 32x to 1.3x, and it is still on `alloc_or_tenure`. The fix is
+  to hand the interpreter the `&'static Heap` once per `run_stack` rather than
+  fetching it per operation, which means threading it through `obj.rs`.
+* **`obj::from_oop` reads the object's header** on every `Value` read that is
+  not an immediate, only to ask whether it is a boxed float. Objects are
+  8-aligned and bits 1 and 2 of an `Oop` are still spare: tagging a boxed float
+  would make that a bit test. The collector would have to mask the tag when
+  following a reference, which is a real cost on its own hot path -- measure
+  before assuming it wins.
+* **`Value` converting at the boundary at all.** The enum exists so that 180
+  call sites kept compiling. Moving the hot paths to `Oop` directly would remove
+  the conversion rather than make it cheaper.
 
-| | |
-|---|---|
-| `--run "1"` | 1.35s |
-| the block above, 5 iterations | 100.9s |
-| the same, 10 iterations | 102.7s |
-
-Five iterations and ten cost the same, so it is a fixed cost, not a per-iteration
-one. `SERF_GC_STATS=1` says where it is:
-
-```
-61,701 collections, ~1.9ms each  ->  ~117s
-[gc] minor 1918us young 0->0 words old 108916->108916 objects remembered 0
-```
-
-Stress collects after every allocation, so 61,701 collections is expected and
-fine. **1.9ms for a collection with an empty young space and an empty remembered
-set is not.** The scavenge has nothing to copy and nothing to scan, and still
-takes two milliseconds. Worst seen: 25ms.
-
-So the cost is in the root scan, and it is paid whether or not there is anything
-to collect.
-
-### The likely cause, and how to check it
-
-`VmRoots::each` walks every root on every collection, and two of them are large
-on a loaded world:
-
-* `vm.canonical` — the canonicalised string table.
-* `vm.image_strings` — the string table read out of the image.
-
-`core.snap` has 14,922 byte objects, and the two tables between them hold most
-of that. Each root goes through `rewrite`, which calls `obj::from_oop`, which
-reads the object's header to see whether it is a boxed float -- a cache miss per
-root. Thirty thousand of those is about 1.5ms, which is the number.
-
-To confirm, time a collection with the two tables skipped, or just count: put a
-counter in `rewrite` and divide.
-
-### What the fix probably is
-
-The old cell heap had this exact problem with annotations, and solved it the way
-this wants solving. `Vm::each_root` took a `major` flag and walked the
-annotation tables only on a major collection, because an old object neither
-moves nor dies outside one; a scavenge took a small list of *young* annotations
-instead, kept by a write barrier (`Vm::note_anno`). The commit that did it took
-a morphic scavenge from 5.8ms to 3.9ms.
-
-`VmRoots` dropped that distinction in the switch-over and walks everything every
-time. The same shape applies: a scavenge should see only the canonical strings
-that might be young, and a major should see them all. `heap::Roots::each` would
-need to know which kind of collection it is being asked about, which it
-currently does not.
-
-Two things to be careful of, and they are why this is not a five-minute change:
-
-* With direct pointers a root that is skipped is not merely untraced -- if the
-  object *is* young, it is a pointer into a space that has been abandoned. The
-  young-list barrier has to be exactly right, and `SERF_GC_STRESS` on serf's own
-  world is what would say so.
-* `vm.string()` inserts into `canonical` at runtime, and that string is young.
-  That is the barrier's whole job.
-
-### Why it has been left
-
-It is a debug mode, and the mode still works -- 100s is slow, not wrong. Normal
-runs do not pay it: a scavenge only happens when the young space fills, so the
-fixed cost is amortised over tens of thousands of allocations instead of one.
-
-But it is worth fixing rather than tolerating, because it is the same number
-that decides how often a *normal* collection can afford to happen. A scavenge
-that costs 1.9ms before it does any work is a scavenge you cannot run often, and
-that constrains the young space size for every world serf loads.
-
-### A correction to the record
-
-An earlier note said the collector had been ruled out, on the strength of 12µs
-pauses. Those were measured before the image was loaded -- 85 objects in the old
-generation, not 108,916 -- so they said nothing about the case in question. The
-real pauses are 1.9ms and the collector is exactly where the time goes.
+`sample` on a 20M-iteration loop is how the above was found; it has been
+reliable where reasoning about it was not.

@@ -367,6 +367,10 @@ pub fn heap_carved() -> usize {
 /// young semispace, or the old space. A view on the heap, not an allocation of
 /// its own -- see the module note on why that matters.
 pub struct Space {
+    /// the heap's base, cached: `is_young` and every allocation ask where this
+    /// space is, and going through `region()` for it put a thread-local lookup
+    /// on the hottest paths in the VM
+    base: *mut u64,
     start: usize,
     words: usize,
     bump: Cell<usize>,
@@ -458,7 +462,7 @@ impl Space {
         assert!(start + words <= r.words, "heap exhausted: {words} more words wanted");
         r.carved.set(start + words);
         r.spaces.borrow_mut().push((start, words));
-        Space { start, words, bump: Cell::new(0) }
+        Space { base: r.base, start, words, bump: Cell::new(0) }
     }
 
     pub fn capacity(&self) -> usize {
@@ -515,7 +519,7 @@ impl Space {
             return None;
         }
         self.bump.set(a + size);
-        let p = at(self.start + a);
+        let p = unsafe { self.base.add(self.start + a) };
         init_object(p, size, kind, oops, slots, anno);
         Some(Oop::obj(p))
     }
@@ -523,11 +527,8 @@ impl Space {
     pub fn contains(&self, o: Oop) -> bool {
         match o.ptr() {
             Some(p) => {
-                if !heap_holds(p.addr()) {
-                    return false;
-                }
-                let w = (p.addr() - region().base.addr()) / 8;
-                w >= self.start && w < self.start + self.words
+                let lo = self.base.addr() + self.start * 8;
+                p.addr() >= lo && p.addr() < lo + self.words * 8
             }
             None => false,
         }
@@ -542,7 +543,7 @@ impl Space {
             if a >= self.bump.get() {
                 return None;
             }
-            let o = Oop::obj(at(self.start + a));
+            let o = Oop::obj(unsafe { self.base.add(self.start + a) });
             let n = walk_size(o);
             debug_assert!(n >= HEADER_WORDS, "object with no header at word {a}");
             a += n;
@@ -553,7 +554,7 @@ impl Space {
     /// The object starting at word `a` of this space, for a Cheney scan that
     /// has to walk objects appearing behind it as it goes.
     fn object_at(&self, a: usize) -> Oop {
-        Oop::obj(at(self.start + a))
+        Oop::obj(unsafe { self.base.add(self.start + a) })
     }
 }
 
@@ -696,6 +697,13 @@ pub fn set_hash(o: Oop, h: u32) {
     set_mark(o, m | ((h as u64 & HASH_MASK) << HASH_SHIFT));
 }
 
+/// Old enough to need the write barrier. Nothing young ever reaches
+/// `PROMOTE_AGE`: it is tenured at that point, and anything born old is
+/// stamped with it.
+pub fn is_old(o: Oop) -> bool {
+    age(o) >= PROMOTE_AGE
+}
+
 pub fn age(o: Oop) -> u8 {
     (mark(o) >> AGE_SHIFT) as u8
 }
@@ -744,8 +752,13 @@ fn word_at(o: Oop, i: usize) -> *mut u64 {
     unsafe { p.add(HEADER_WORDS + i) }
 }
 
+/// Reading a reference must not touch a thread-local. The heap is one
+/// allocation, so the word's own pointer carries the provenance that covers
+/// whatever it points at -- `from_addr` would go through `region()`, and a
+/// `LocalKey::with` on every field read cost more than the collector did.
 pub fn field(o: Oop, i: usize) -> Oop {
-    Oop(from_addr(unsafe { word_at(o, i).read() } as usize))
+    let p = word_at(o, i);
+    Oop(p.with_addr(unsafe { p.read() } as usize))
 }
 
 pub fn set_field(o: Oop, i: usize, v: Oop) {
@@ -910,7 +923,7 @@ pub fn forwarded(o: Oop) -> Option<Oop> {
     if m & FORWARDED == 0 {
         return None;
     }
-    Some(Oop(from_addr((m & !FORWARDED) as usize)))
+    Some(Oop(words_of(o).with_addr((m & !FORWARDED) as usize)))
 }
 
 fn set_forwarded(o: Oop, to: Oop) {
@@ -945,6 +958,12 @@ pub trait Roots {
     /// method still does. Called once per dead object, before its space is
     /// reused, and it must not allocate.
     fn dying(&mut self, _o: Oop) {}
+
+    /// References an object owns that are not in its words. During the
+    /// switch-over a method object is one: its literals are still in a Rust
+    /// `Method` behind an index, and the collector reaches them through the
+    /// object that names it rather than by walking every method there is.
+    fn extra(&mut self, _o: Oop, _f: &mut dyn FnMut(&mut Oop)) {}
 }
 
 /// Survive this many scavenges and you are tenured, as in `gc.rs`.
@@ -1068,14 +1087,20 @@ impl Heap {
     ) -> Oop {
         let size = HEADER_WORDS + payload;
         self.old_live.set(self.old_live.get() + 1);
-        if let Some(a) = self.old_free.borrow_mut().get_mut(&size).and_then(|v| v.pop()) {
+        let o = if let Some(a) = self.old_free.borrow_mut().get_mut(&size).and_then(|v| v.pop()) {
             let p = from_addr(a);
             init_object(p, size, kind, oops, slots, anno);
-            return Oop::obj(p);
-        }
-        self.old
-            .alloc_words(kind, oops, slots, payload, anno)
-            .expect("old generation exhausted -- raise SERF_OLD_WORDS")
+            Oop::obj(p)
+        } else {
+            self.old
+                .alloc_words(kind, oops, slots, payload, anno)
+                .expect("old generation exhausted -- raise SERF_OLD_WORDS")
+        };
+        // Born old, so it reads as old. The write barrier asks the age rather
+        // than the heap: a store already has the object's header in cache, and
+        // asking the heap means a thread-local on every store in the VM.
+        set_age(o, PROMOTE_AGE);
+        o
     }
 
     /// A clone: the same shape, the same contents, its own identity. `_Clone`.
@@ -1161,7 +1186,11 @@ impl Heap {
         let tenured = !self.is_young(dst);
         copy_payload(o, dst);
         set_hash(dst, hash(o));
-        set_age(dst, a);
+        // An object tenured because the to-space filled up is old with an age
+        // that has not reached `PROMOTE_AGE`, and the write barrier asks the
+        // age -- so it would be old and not know it, and a young reference
+        // stored into it would go unremembered. Stamp it.
+        set_age(dst, if self.is_young(dst) { a } else { a.max(PROMOTE_AGE) });
         set_forwarded(o, dst);
         if tenured {
             // a promoted object has not been scanned yet, and the Cheney loop
@@ -1175,7 +1204,7 @@ impl Heap {
     /// them. Answers whether it still points at anything young, which is what
     /// decides membership of the remembered set -- the self-cleaning card of
     /// `rSet.cpp:131`, decided per object rather than per card.
-    fn scan(&self, o: Oop, promoted: &mut Vec<Oop>) -> bool {
+    fn scan(&self, o: Oop, promoted: &mut Vec<Oop>, roots: &mut dyn Roots) -> bool {
         let mut young = false;
         for i in 0..oop_words(o) {
             let v = field(o, i);
@@ -1199,6 +1228,16 @@ impl Heap {
             }
             young |= self.is_young(n);
         }
+        // whatever the VM holds on this object's behalf
+        roots.extra(o, &mut |slot| {
+            if slot.is_obj() {
+                let n = self.evacuate(*slot, promoted);
+                if n != *slot {
+                    *slot = n;
+                }
+                young |= self.is_young(n);
+            }
+        });
         young
     }
 
@@ -1220,7 +1259,7 @@ impl Heap {
             }
         });
         for o in rs {
-            if self.scan(o, &mut promoted) {
+            if self.scan(o, &mut promoted, roots) {
                 self.record(o);
             }
         }
@@ -1233,12 +1272,12 @@ impl Heap {
             if cursor < to.used() {
                 let o = to.object_at(cursor);
                 cursor += size_words(o);
-                self.scan(o, &mut promoted);
+                self.scan(o, &mut promoted, roots);
                 continue;
             }
             match promoted.pop() {
                 Some(o) => {
-                    if self.scan(o, &mut promoted) {
+                    if self.scan(o, &mut promoted, roots) {
                         self.record(o);
                     }
                 }
@@ -1294,6 +1333,11 @@ impl Heap {
                 let v = field(o, i);
                 self.mark_from(v, &mut work);
             }
+            roots.extra(o, &mut |slot| {
+                if slot.is_obj() && set_marked(*slot) {
+                    work.push(*slot);
+                }
+            });
         }
     }
 

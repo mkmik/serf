@@ -27,6 +27,10 @@ pub enum Unwind {
 
 pub struct Frame {
     scope: ObjRef,
+    /// the activation's method, held here rather than fetched from it.
+    /// `act_method` is a thread-local, a `RefCell` borrow and an `Rc` clone,
+    /// and the interpreter asks for the method on almost every bytecode.
+    method: Rc<Method>,
     pc: usize,
     /// activations this frame tail-called away from. They have not returned --
     /// their continuation is now this frame's -- so a block returning
@@ -36,7 +40,7 @@ pub struct Frame {
 
 impl Frame {
     fn new(scope: ObjRef) -> Frame {
-        Frame { scope, pc: 0, tail_of: vec![] }
+        Frame { method: act_method(scope), scope, pc: 0, tail_of: vec![] }
     }
 
     /// This frame's activation and every one whose continuation it took over
@@ -291,7 +295,7 @@ fn err(frames: &[Frame], msg: String) -> Unwind {
         .map(|f| {
             format!(
                 "  at {} ({}:{})",
-                act_method(f.scope).sel, act_method(f.scope).file, act_method(f.scope).line
+                f.method.sel, f.method.file, f.method.line
             )
         })
         .collect();
@@ -367,7 +371,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
 
         let (at_end, op, x) = {
             let f = frames.last().unwrap();
-            let code = &act_method(f.scope).code;
+            let code = &f.method.code;
             if f.pc >= code.len() {
                 (true, 0u8, 0usize)
             } else {
@@ -395,7 +399,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let idx = (index << 4) | x;
                 index = 0;
                 let f = frames.last().unwrap();
-                let lit = match act_method(f.scope).lits.borrow().get(idx) {
+                let lit = match f.method.lits.borrow().get(idx) {
                     Some(l) => l.clone(),
                     None => return Err(err(frames, "literal index out of range".into())),
                 };
@@ -759,7 +763,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     // are simply retired.
                     let tail = {
                         let f = frames.last().unwrap();
-                        f.pc >= act_method(f.scope).code.len() && (f.depth() == 0)
+                        f.pc >= f.method.code.len() && (f.depth() == 0)
                     };
                     let mut carried = vec![];
                     if tail {
@@ -775,7 +779,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     if frames.len() >= vm.max_frames {
                         let mut h: std::collections::HashMap<String, usize> = Default::default();
                         for f in frames.iter() {
-                            *h.entry(format!("{} ({}:{})", act_method(f.scope).sel, act_method(f.scope).file, act_method(f.scope).line))
+                            *h.entry(format!("{} ({}:{})", f.method.sel, f.method.file, f.method.line))
                                 .or_insert(0) += 1;
                         }
                         let mut v: Vec<_> = h.into_iter().collect();
@@ -836,7 +840,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 match dest {
                     Some(d) => {
                         let f = frames.last_mut().unwrap();
-                        if d > act_method(f.scope).code.len() {
+                        if d > f.method.code.len() {
                             return Err(err(frames, "branch target out of range".into()));
                         }
                         f.pc = d;

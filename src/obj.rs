@@ -149,6 +149,16 @@ impl Payload {
     }
 }
 
+/// The write barrier, asked of the object rather than of the heap. An old
+/// object that may now hold a young reference has to be scanned by the next
+/// scavenge; a young one needs nothing, and that is the overwhelmingly common
+/// case, so it must not cost a thread-local lookup to find out.
+pub fn record_if_old(o: Oop) {
+    if heap::is_old(o) {
+        heap::heap().record(o);
+    }
+}
+
 /// A field past the named slots, by index within the kind's own fields.
 fn field(o: Oop, i: usize) -> Oop {
     heap::field(o, heap::slots(o) + anno_span(o) + i)
@@ -204,7 +214,7 @@ pub fn fill(o: Oop, slots: &[Slot], payload: Payload) {
     debug_assert_eq!(slots.len(), slot_count(o), "filling a shape that does not fit");
     write_slots(o, slots);
     payload.fill(o);
-    heap::heap().record(o);
+    record_if_old(o);
 }
 
 fn write_slots(o: Oop, slots: &[Slot]) {
@@ -276,7 +286,7 @@ fn copy_payload_across(from: Oop, to: Oop) {
         Kind::Float => heap::set_aux_word(to, 0, heap::aux_word(from, 0)),
         _ => {}
     }
-    heap::heap().record(to);
+    record_if_old(to);
 }
 
 fn read_slot(o: Oop, i: usize) -> Slot {
@@ -298,14 +308,14 @@ pub fn set_mirror(o: Oop, v: Val) {
     let w = to_oop(v);
     set_field(o, F_MIRROR, w);
     if w.is_obj() {
-        heap::heap().record(o);
+        record_if_old(o);
     }
 }
 
 pub fn set_block_scope(o: Oop, s: Option<Oop>) {
     set_field(o, F_BLOCK_SCOPE, s.unwrap_or_else(Oop::null));
     if s.is_some() {
-        heap::heap().record(o);
+        record_if_old(o);
     }
 }
 
@@ -371,7 +381,7 @@ pub fn assign(o: Oop, i: usize, v: Val) {
     let w = to_oop(v);
     heap::set_slot_value(o, i, w);
     if w.is_obj() {
-        heap::heap().record(o);
+        record_if_old(o);
     }
 }
 
@@ -469,9 +479,19 @@ pub fn on_dying(o: Oop) {
 }
 
 /// Every `Value` a live method holds, as a slot the collector may rewrite.
-pub fn each_method_value(f: &mut dyn FnMut(&mut Oop)) {
+/// The values a *particular* method object's method holds.
+/// An *activation* counts too, and forgetting it is a bug that only a frequent
+/// collection finds: a running method's literals are reached through the
+/// activation, which holds an index rather than the method object, so nothing
+/// else in the heap names them. `act::METHOD` and `F_METHOD` are both field 0,
+/// and an activation has no named slots, so one read serves all three kinds.
+pub fn each_method_value_of(o: Oop, f: &mut dyn FnMut(&mut Oop)) {
+    if !matches!(heap::kind(o), Kind::Method | Kind::Block | Kind::Activation) {
+        return;
+    }
+    let Some(i) = field(o, F_METHOD).as_int() else { return };
     METHODS.with(|t| {
-        for m in t.borrow().0.iter().flatten() {
+        for m in t.borrow().0.get(i as usize).into_iter().flatten() {
             for v in m.lits.borrow_mut().iter_mut() {
                 crate::value::rewrite(v, f);
             }
@@ -543,7 +563,7 @@ pub fn act_push(a: Oop, v: Val) {
     heap::set_field(a, at, w);
     heap::set_field(a, act::SP, Oop::int(d as i64 + 1));
     if w.is_obj() {
-        heap::heap().record(a);
+        record_if_old(a);
     }
 }
 
@@ -582,7 +602,7 @@ pub fn act_set(a: Oop, i: usize, v: Val) {
     let w = to_oop(v);
     heap::set_field(a, i, w);
     if w.is_obj() {
-        heap::heap().record(a);
+        record_if_old(a);
     }
 }
 
@@ -594,7 +614,7 @@ pub fn act_link(a: Oop, i: usize) -> Option<Oop> {
 pub fn act_set_link(a: Oop, i: usize, v: Option<Oop>) {
     heap::set_field(a, i, v.unwrap_or_else(Oop::null));
     if v.is_some() {
-        heap::heap().record(a);
+        record_if_old(a);
     }
 }
 

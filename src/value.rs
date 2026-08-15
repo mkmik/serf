@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::heap::{self, Kind, Oop};
-use crate::obj;
+use crate::obj::{self, record_if_old};
 pub use crate::obj::{act, Payload, SlotKind};
 
 /// An object's address. Stable only between collections.
@@ -363,7 +363,7 @@ impl ObjRef {
     /// Conservative -- it fires for reads dressed as writes -- which is the
     /// trade the C++ VM's unconditional card store makes.
     pub fn borrow_mut(self) -> Obj {
-        heap::heap().record(self);
+        record_if_old(self);
         self.borrow()
     }
     /// Identity, for a table that lives no longer than a collection. An object
@@ -737,7 +737,7 @@ impl Vm {
             self.switch(at, wide);
         }
         heap::set_obj_anno(wide, obj::to_oop(a));
-        heap::heap().record(wide);
+        record_if_old(wide);
     }
 
     /// Annotating an object that has no room for annotations widens it, and a
@@ -752,7 +752,7 @@ impl Vm {
             self.switch(at, wide);
         }
         heap::set_slot_anno(wide, i, obj::to_oop(a));
-        heap::heap().record(wide);
+        record_if_old(wide);
         Value::Obj(wide)
     }
 }
@@ -1253,7 +1253,6 @@ impl heap::Roots for VmRoots<'_> {
         // `gc.rs` used to walk them through `Payload::Method`; nothing does now
         // unless this does, and a literal the collector never sees is a
         // pointer into a space it has just abandoned.
-        obj::each_method_value(f);
     }
 
     fn weak(&mut self, f: &mut dyn FnMut(Oop) -> Option<Oop>) {
@@ -1268,6 +1267,15 @@ impl heap::Roots for VmRoots<'_> {
 
     fn dying(&mut self, o: Oop) {
         obj::on_dying(o);
+    }
+
+    /// A method object's literals, initialisers and source are still in a Rust
+    /// `Method` behind an index, so the collector cannot see them in the
+    /// object's words. Reaching them through the object rather than by walking
+    /// the whole method table is the difference between O(live methods reached)
+    /// and O(every method ever compiled) on every single scavenge.
+    fn extra(&mut self, o: Oop, f: &mut dyn FnMut(&mut Oop)) {
+        obj::each_method_value_of(o, f);
     }
 }
 
