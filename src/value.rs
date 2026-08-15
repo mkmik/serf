@@ -174,16 +174,48 @@ impl SlotsRef {
             value: obj::slot_value(self.0, i),
         }
     }
-    pub fn iter(&self) -> impl Iterator<Item = Slot> + '_ {
-        (0..self.len()).map(|i| self.get(i))
+    pub fn iter(&self) -> SlotsIter {
+        SlotsIter { o: self.0, i: 0, n: self.len() }
     }
 }
 
+/// Reading slots must not allocate. An earlier draft collected into a `Vec` to
+/// satisfy `IntoIterator`, which put a `malloc` behind every `for s in &slots`
+/// in the VM -- one of the two reasons the malloc count went *up* across the
+/// switch-over before this.
+pub struct SlotsIter {
+    o: ObjRef,
+    i: usize,
+    n: usize,
+}
+
+impl Iterator for SlotsIter {
+    type Item = Slot;
+    fn next(&mut self) -> Option<Slot> {
+        if self.i >= self.n {
+            return None;
+        }
+        let s = Slot {
+            name: obj::slot_name(self.o, self.i),
+            kind: obj::slot_kind(self.o, self.i),
+            value: obj::slot_value(self.o, self.i),
+        };
+        self.i += 1;
+        Some(s)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.n - self.i;
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for SlotsIter {}
+
 impl IntoIterator for &SlotsRef {
     type Item = Slot;
-    type IntoIter = std::vec::IntoIter<Slot>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter().collect::<Vec<_>>().into_iter()
+    type IntoIter = SlotsIter;
+    fn into_iter(self) -> SlotsIter {
+        self.iter()
     }
 }
 
