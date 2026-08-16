@@ -219,13 +219,14 @@ fn verify_image(path: &str) -> Result<String, String> {
     let snap = image::Snapshot::read(p)?;
     // a page-aligned image is padded to 8K boundaries and carries no section
     // delimiters; serf always writes the compact form, so only compare bytes
-    // when the source was compact too
-    let again = snap.to_bytes()?;
-    if !snap.page_aligned && orig != again {
-        let at = orig.iter().zip(&again).position(|(a, b)| a != b);
+    // when the source was compact too. Compression is framing, so compare the
+    // binary sections with both sides decompressed.
+    let (was, again) = (image::tail(&orig)?, snap.binary_section()?);
+    if !snap.page_aligned && was != again {
+        let at = was.iter().zip(&again).position(|(a, b)| a != b);
         return Err(format!(
             "re-serialised image differs (len {} vs {}, first difference at {:?})",
-            orig.len(), again.len(), at
+            was.len(), again.len(), at
         ));
     }
     let heap = image_obj::Heap::new(&snap);
@@ -238,6 +239,7 @@ fn verify_image(path: &str) -> Result<String, String> {
          {} canonical strings; version {}, code {}, {}{}",
         path,
         if snap.page_aligned { format!("{} (page aligned, byte compare skipped)", orig.len()) }
+        else if snap.compressed { format!("{} compressed, {} round-trip identical", orig.len(), was.len()) }
         else { format!("{} round-trip identical", orig.len()) },
         objs, snap.old.len(),
         snap.string_table.iter().map(|b| b.len()).sum::<usize>(),
@@ -439,6 +441,19 @@ fn main() {
                 match image_obj::build(&vm).and_then(|s| s.write(std::path::Path::new(&f))) {
                     Ok(()) => eprintln!("wrote {}", f),
                     Err(e) => { eprintln!("save failed: {}", e); std::process::exit(1); }
+                }
+            }
+            // rewrite any snapshot in serf's own form -- compact and gzipped --
+            // without booting it, so no unreachable object is lost on the way
+            "--recompress" => {
+                let src = args.get(i + 1).cloned().unwrap_or_default();
+                let dst = args.get(i + 2).cloned().unwrap_or_default();
+                i += 2;
+                let go = image::Snapshot::read(std::path::Path::new(&src))
+                    .and_then(|s| s.write(std::path::Path::new(&dst)));
+                match go {
+                    Ok(()) => eprintln!("wrote {}", dst),
+                    Err(e) => { eprintln!("recompress failed: {}", e); std::process::exit(1); }
                 }
             }
             "--dump-image" => {

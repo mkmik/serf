@@ -64,6 +64,7 @@ Reading, writing and inspecting images:
 ./target/release/serf world.self --save w.snap        # write a snapshot
 ./target/release/serf --load core.snap --save w.snap  # round-trip a real one
 ./target/release/serf --verify-image w.snap           # bytes + structural walk
+./target/release/serf --recompress in.snap out.snap   # gzip one without booting it
 ./target/release/serf --dump-image w.snap             # header, spaces, object walk
 ./target/release/serf --load w.snap --stats           # summary of the reachable graph
 ./target/release/serf --load w.snap --prims           # primitives the image calls
@@ -286,8 +287,11 @@ That world found nine bugs that the synthetic tests could not:
 * Each block minted a duplicate copy of its value method object.
 
 Verification, given the C++ VM is 32-bit i386 and cannot run here:
-`--verify-image` re-serialises a snapshot and requires the bytes to come back
-identical, then walks every space linearly the way the C++ enumeration does,
+`--verify-image` re-serialises a snapshot and requires the binary section to
+come back byte for byte -- gzip framing aside, so the shipped compressed images
+are held to serf's writer as well: `Clean-4.4.snap`, written by the C++ VM,
+re-serialises to the same 18,608,852 bytes. It then walks every space linearly
+the way the C++ enumeration does,
 computing each object's size from its map -- the objects must tile the region
 exactly. (That check earned its keep: it found a map word being written over
 the shared assignment object.) `run-tests.sh` additionally saves a world with
@@ -298,7 +302,10 @@ Caveats worth knowing before pointing this at a real Self 4 world:
 * Integers must fit Self's 30-bit `smi` and floats its 30-bit float; `--save`
   errors rather than truncating.
 * Live blocks cannot be written -- their home activation is not a heap object.
-* Compressed images and `Snapshot code: y` images are refused on read.
+* A compressed image is piped through the decompression filter its header names
+  (from a short allowlist); `Snapshot code: y` images are refused on read.
+* Everything serf writes is gzipped and compact, the shipped snapshots' own
+  form, so saving needs `gzip` on the path.
 * A loaded world runs only as far as the primitives it calls exist here; the
   Self 4 world wants hundreds, plus processes and the `IfFail:` protocol.
 * An image written from serf's own small world is well-formed but has nothing
@@ -336,7 +343,8 @@ middle of Self backtraces.
 
 ### Running the Morphic GUI
 
-`morphic.snap` is 16.5 MB, 316,021 objects, 151,636 reachable from the lobby.
+`morphic.snap` is 3.9 MB gzipped (16.7 MB of heap), 316,021 objects, 151,636
+reachable from the lobby.
 It boots to the world's own console, and the world's Morphic desktop draws on
 a real X server.
 

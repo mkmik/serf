@@ -1255,6 +1255,7 @@ impl<'a> Builder<'a> {
             vm_date: "serf".into(),
             sizes: [EDEN as i32, SURV as i32, old_size as i32, 1024 * 1024, 512 * 1024, 512 * 1024, 512 * 1024],
             page_aligned: false,
+            compressed: true, // Snapshot::write gzips
             maps_canonical: true,
             vm_oops,
             tenuring_threshold: as_smi(8),
