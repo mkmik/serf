@@ -1,17 +1,17 @@
 mod compile;
 mod ffi;
 mod gc;
-mod heap;
-mod obj;
 mod glue_table;
-mod struct_table;
+mod heap;
 mod image;
 mod image_obj;
 mod interp;
 mod lexer;
 mod metrics;
+mod obj;
 mod parser;
 mod prims;
+mod struct_table;
 mod value;
 
 use std::io::{BufRead, Write};
@@ -226,7 +226,9 @@ fn verify_image(path: &str) -> Result<String, String> {
         let at = was.iter().zip(&again).position(|(a, b)| a != b);
         return Err(format!(
             "re-serialised image differs (len {} vs {}, first difference at {:?})",
-            was.len(), again.len(), at
+            was.len(),
+            again.len(),
+            at
         ));
     }
     let heap = image_obj::Heap::new(&snap);
@@ -238,10 +240,15 @@ fn verify_image(path: &str) -> Result<String, String> {
         "{}: {} bytes, {} objects tile {} old space(s) exactly; \
          {} canonical strings; version {}, code {}, {}{}",
         path,
-        if snap.page_aligned { format!("{} (page aligned, byte compare skipped)", orig.len()) }
-        else if snap.compressed { format!("{} compressed, {} round-trip identical", orig.len(), was.len()) }
-        else { format!("{} round-trip identical", orig.len()) },
-        objs, snap.old.len(),
+        if snap.page_aligned {
+            format!("{} (page aligned, byte compare skipped)", orig.len())
+        } else if snap.compressed {
+            format!("{} compressed, {} round-trip identical", orig.len(), was.len())
+        } else {
+            format!("{} round-trip identical", orig.len())
+        },
+        objs,
+        snap.old.len(),
         snap.string_table.iter().map(|b| b.len()).sum::<usize>(),
         snap.version,
         if snap.snapshot_code { "yes" } else { "no" },
@@ -252,13 +259,28 @@ fn verify_image(path: &str) -> Result<String, String> {
 
 fn dump_image(path: &str) -> Result<(), String> {
     let snap = image::Snapshot::read(std::path::Path::new(path))?;
-    println!("version {}.{}.{} timestamp {} code {} page_aligned {} swapped {}",
-        snap.major, snap.minor, snap.version, snap.timestamp,
-        snap.snapshot_code, snap.page_aligned, snap.was_swapped);
+    println!(
+        "version {}.{}.{} timestamp {} code {} page_aligned {} swapped {}",
+        snap.major,
+        snap.minor,
+        snap.version,
+        snap.timestamp,
+        snap.snapshot_code,
+        snap.page_aligned,
+        snap.was_swapped
+    );
     println!("sizes {:?}", snap.sizes);
     for (n, s) in snap.new_gen.iter().chain(snap.old.iter()).enumerate() {
-        println!("space {}: objs {:#x}..{:#x} ({} words)  bytes {:#x}..{:#x} ({} bytes)",
-            n, s.objs_bottom, s.objs_top, s.objs.len(), s.bytes_bottom, s.bytes_top, s.bytes.len());
+        println!(
+            "space {}: objs {:#x}..{:#x} ({} words)  bytes {:#x}..{:#x} ({} bytes)",
+            n,
+            s.objs_bottom,
+            s.objs_top,
+            s.objs.len(),
+            s.bytes_bottom,
+            s.bytes_top,
+            s.bytes.len()
+        );
     }
     println!("vm_maps {:x?}", snap.vm_maps);
     println!("vtbls {:x?}", snap.vtbls);
@@ -269,46 +291,87 @@ fn dump_image(path: &str) -> Result<(), String> {
     let mut hist: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut annotated = 0usize;
     for (n, s) in snap.new_gen.iter().chain(snap.old.iter()).enumerate() {
-        if s.objs.is_empty() { continue; }
+        if s.objs.is_empty() {
+            continue;
+        }
         let mut a = s.objs_bottom;
         let mut count = 0usize;
         let mut recent: Vec<String> = vec![];
         while a < s.objs_top {
-            let mark = match heap.word(a) { Ok(w) => w, Err(e) => { println!("space {}: {}", n, e); break } };
+            let mark = match heap.word(a) {
+                Ok(w) => w,
+                Err(e) => {
+                    println!("space {}: {}", n, e);
+                    break;
+                }
+            };
             let info = heap.map_star_of(a).and_then(|m| heap.read_map(m));
             let (kindname, size) = match &info {
                 Ok(m) => (m.kind.name().to_string(), heap.object_size(a, m)),
                 Err(e) => (format!("<{}>", e), Ok(0)),
             };
-            let size = match size { Ok(s) if s >= 2 => s, _ => {
-                for r in &recent { println!("  ...{}", r); }
-                println!("space {} object {} at {:#x}: bad size, kind {}", n, count, a, kindname);
-                let start = a - 64;
-                for k in 0..32u32 {
-                    let w = heap.word(start + 4 * k).unwrap_or(0);
-                    println!("    {:#x}: {:#010x} tag {} smi {}", start + 4 * k, w, w & 3, image_obj::smi(w));
+            let size = match size {
+                Ok(s) if s >= 2 => s,
+                _ => {
+                    for r in &recent {
+                        println!("  ...{}", r);
+                    }
+                    println!(
+                        "space {} object {} at {:#x}: bad size, kind {}",
+                        n, count, a, kindname
+                    );
+                    let start = a - 64;
+                    for k in 0..32u32 {
+                        let w = heap.word(start + 4 * k).unwrap_or(0);
+                        println!(
+                            "    {:#x}: {:#010x} tag {} smi {}",
+                            start + 4 * k,
+                            w,
+                            w & 3,
+                            image_obj::smi(w)
+                        );
+                    }
+                    break;
                 }
-                break } };
-            let line = format!("space {} obj {:5} at {:#x} mark {:#x} kind {:<14} size {}", n, count, a, mark, kindname, size);
+            };
+            let line = format!(
+                "space {} obj {:5} at {:#x} mark {:#x} kind {:<14} size {}",
+                n, count, a, mark, kindname, size
+            );
             recent.push(line);
-            if recent.len() > 8 { recent.remove(0); }
+            if recent.len() > 8 {
+                recent.remove(0);
+            }
             if mark & 3 != 3 {
-                for r in &recent { println!("  ...{}", r); }
+                for r in &recent {
+                    println!("  ...{}", r);
+                }
             }
             if mark & 3 != 3 || count < 12 || info.is_err() {
-                println!("space {} obj {:5} at {:#x} mark {:#x} kind {:<14} size {}",
-                    n, count, a, mark, kindname, size);
+                println!(
+                    "space {} obj {:5} at {:#x} mark {:#x} kind {:<14} size {}",
+                    n, count, a, mark, kindname, size
+                );
             }
-            if mark & 3 != 3 { break; }
+            if mark & 3 != 3 {
+                break;
+            }
             if let Ok(m) = &info {
                 *hist.entry(m.kind.name().to_string()).or_insert(0) += 1;
-                if m.annotation & 3 == 1 { annotated += 1; }
-                if m.slots.iter().any(|sd| sd.anno & 3 == 1) { annotated += 1; }
+                if m.annotation & 3 == 1 {
+                    annotated += 1;
+                }
+                if m.slots.iter().any(|sd| sd.anno & 3 == 1) {
+                    annotated += 1;
+                }
             }
             a += 4 * size as u32;
             count += 1;
         }
-        println!("space {}: walked {} objects, stopped at {:#x} (top {:#x})", n, count, a, s.objs_top);
+        println!(
+            "space {}: walked {} objects, stopped at {:#x} (top {:#x})",
+            n, count, a, s.objs_top
+        );
     }
     println!("map kinds: {:?}", hist);
     println!("maps with a non-nil annotation (object or slot): {}", annotated);
@@ -333,15 +396,26 @@ fn world_stats(vm: &Vm) -> String {
     let mut work: Vec<value::Value> = root;
     while let Some(v) = work.pop() {
         match &v {
-            value::Value::Int(i) => { ints = ints.wrapping_add(*i); continue }
-            value::Value::Float(f) => { floats += 1; ints = ints.wrapping_add(f.to_bits() as i64); continue }
+            value::Value::Int(i) => {
+                ints = ints.wrapping_add(*i);
+                continue;
+            }
+            value::Value::Float(f) => {
+                floats += 1;
+                ints = ints.wrapping_add(f.to_bits() as i64);
+                continue;
+            }
             value::Value::Obj(o) => {
-                if !seen.insert(o.id()) { continue }
+                if !seen.insert(o.id()) {
+                    continue;
+                }
             }
         }
         objs += 1;
         let at = v.as_obj().unwrap();
-        if value::obj_anno(at).is_some() { annos += 1; }
+        if value::obj_anno(at).is_some() {
+            annos += 1;
+        }
         let o = at.borrow();
         shapes.insert(o.map());
         for sl in &o.slots {
@@ -351,11 +425,15 @@ fn world_stats(vm: &Vm) -> String {
                 value::SlotKind::Assign => assigns += 1,
                 _ => {}
             }
-            if value::slot_anno(at, slots - 1).is_some() { annos += 1; }
+            if value::slot_anno(at, slots - 1).is_some() {
+                annos += 1;
+            }
             if sl.kind == value::SlotKind::Parent {
                 let k = match o.payload.kind() {
-                    value::PayKind::Bytes => "bytes", value::PayKind::Vector => "vector",
-                    value::PayKind::Method => "method", value::PayKind::Block => "block",
+                    value::PayKind::Bytes => "bytes",
+                    value::PayKind::Vector => "vector",
+                    value::PayKind::Method => "method",
+                    value::PayKind::Block => "block",
                     value::PayKind::Mirror => "mirror",
                     value::PayKind::Proxy => "proxy",
                     _ => "plain",
@@ -365,14 +443,21 @@ fn world_stats(vm: &Vm) -> String {
             work.push(sl.value);
         }
         match o.payload.kind() {
-            value::PayKind::Bytes => { strs += 1; strbytes += o.payload.byte_len() }
+            value::PayKind::Bytes => {
+                strs += 1;
+                strbytes += o.payload.byte_len()
+            }
             value::PayKind::Vector => {
                 let x = o.payload.vector().unwrap();
-                vecs += 1; vecelems += x.len(); work.extend(x);
+                vecs += 1;
+                vecelems += x.len();
+                work.extend(x);
             }
             value::PayKind::Method => {
                 let m = o.payload.method().unwrap();
-                meths += 1; code += m.code.len(); lits += m.lits.borrow().len();
+                meths += 1;
+                code += m.code.len();
+                lits += m.lits.borrow().len();
                 work.extend(m.lits.borrow().iter().cloned());
                 work.extend(m.slot_inits.borrow().iter().cloned());
             }
@@ -393,10 +478,27 @@ fn world_stats(vm: &Vm) -> String {
          parents by payload {:?}\n\
          maps {} (one per {:.1} objects)\n\
          heap {} objects (young {} old {})",
-        objs, slots, parents, assigns, annos, strs, strbytes, vecs, vecelems,
-        meths, code, lits, blocks, floats, ints, bykind,
-        shapes.len(), objs as f64 / shapes.len().max(1) as f64,
-        (gc::young_used() + gc::old_used()), gc::young_used(), gc::old_used()
+        objs,
+        slots,
+        parents,
+        assigns,
+        annos,
+        strs,
+        strbytes,
+        vecs,
+        vecelems,
+        meths,
+        code,
+        lits,
+        blocks,
+        floats,
+        ints,
+        bykind,
+        shapes.len(),
+        objs as f64 / shapes.len().max(1) as f64,
+        (gc::young_used() + gc::old_used()),
+        gc::young_used(),
+        gc::old_used()
     )
 }
 
@@ -440,7 +542,10 @@ fn main() {
                 let f = args.get(i).cloned().unwrap_or_default();
                 match image_obj::build(&vm).and_then(|s| s.write(std::path::Path::new(&f))) {
                     Ok(()) => eprintln!("wrote {}", f),
-                    Err(e) => { eprintln!("save failed: {}", e); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("save failed: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
             // rewrite any snapshot in serf's own form -- compact and gzipped --
@@ -453,7 +558,10 @@ fn main() {
                     .and_then(|s| s.write(std::path::Path::new(&dst)));
                 match go {
                     Ok(()) => eprintln!("wrote {}", dst),
-                    Err(e) => { eprintln!("recompress failed: {}", e); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("recompress failed: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
             "--dump-image" => {
@@ -472,7 +580,10 @@ fn main() {
                 let f = args.get(i).cloned().unwrap_or_default();
                 match verify_image(&f) {
                     Ok(m) => println!("{}", m),
-                    Err(e) => { eprintln!("verify failed: {}", e); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("verify failed: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
             "--prims" => {
@@ -480,17 +591,26 @@ fn main() {
                 let mut seen = std::collections::HashSet::new();
                 let mut work: Vec<value::Value> = vm.image_roots.clone().unwrap_or_default();
                 while let Some(v) = work.pop() {
-                    let o = match v.as_obj() { Some(o) => o.clone(), None => continue };
-                    if !seen.insert(o.id()) { continue }
+                    let o = match v.as_obj() {
+                        Some(o) => o.clone(),
+                        None => continue,
+                    };
+                    if !seen.insert(o.id()) {
+                        continue;
+                    }
                     let b = o.borrow();
-                    for sl in &b.slots { work.push(sl.value) }
+                    for sl in &b.slots {
+                        work.push(sl.value)
+                    }
                     match b.payload.kind() {
                         value::PayKind::Vector => work.extend(b.payload.vector().unwrap()),
                         value::PayKind::Method | value::PayKind::Block => {
                             let m = b.payload.method().unwrap();
                             for (k, l) in m.lit_strs.iter().enumerate() {
                                 if let Some(t) = l {
-                                    if t.starts_with('_') { *n.entry(t.to_string()).or_insert(0) += 1 }
+                                    if t.starts_with('_') {
+                                        *n.entry(t.to_string()).or_insert(0) += 1
+                                    }
                                 }
                                 let _ = k;
                             }
@@ -503,14 +623,19 @@ fn main() {
                 let mut v: Vec<_> = n.into_iter().collect();
                 v.sort_by(|a, b| b.1.cmp(&a.1));
                 println!("{} distinct primitives", v.len());
-                for (k, c) in &v { println!("{:6} {}", c, k) }
+                for (k, c) in &v {
+                    println!("{:6} {}", c, k)
+                }
             }
             "--run" => {
                 i += 1;
                 let src = args.get(i).cloned().unwrap_or_default();
                 let lobby = match &vm.image_roots {
                     Some(r) => r[0].clone(),
-                    None => { eprintln!("--run needs an image; use --load first"); std::process::exit(1) }
+                    None => {
+                        eprintln!("--run needs an image; use --load first");
+                        std::process::exit(1)
+                    }
                 };
                 if let Err(e) = eval_in(&mut vm, src.as_bytes(), "<--run>", lobby) {
                     eprintln!("{}", e);
@@ -522,7 +647,10 @@ fn main() {
                 let f = args.get(i).cloned().unwrap_or_default();
                 match load_image(&mut vm, &f) {
                     Ok(n) => eprintln!("loaded {} ({} objects reachable from the lobby)", f, n),
-                    Err(e) => { eprintln!("load failed: {}", e); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("load failed: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
             "-e" => {
@@ -539,8 +667,13 @@ fn main() {
                     // the way the C++ VM does with `Self -s snapshot`
                     if src.starts_with(b"exec Self") {
                         match load_image(&mut vm, f) {
-                            Ok(n) => eprintln!("loaded {} ({} objects reachable from the lobby)", f, n),
-                            Err(e) => { eprintln!("load failed: {}", e); std::process::exit(1) }
+                            Ok(n) => {
+                                eprintln!("loaded {} ({} objects reachable from the lobby)", f, n)
+                            }
+                            Err(e) => {
+                                eprintln!("load failed: {}", e);
+                                std::process::exit(1)
+                            }
                         }
                         boot(&mut vm);
                         // booting a snapshot lands you at a prompt, unless the

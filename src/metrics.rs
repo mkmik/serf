@@ -57,21 +57,13 @@ pub fn trace_mem(tag: &str) {
         return;
     }
     let (m, f, b) = (MALLOCS.load(Relaxed), FREES.load(Relaxed), MALLOC_BYTES.load(Relaxed));
-    eprintln!(
-        "[mem] {}: mallocs {} frees {} live {} bytes {}",
-        tag,
-        m,
-        f,
-        m.saturating_sub(f),
-        b
-    );
+    eprintln!("[mem] {}: mallocs {} frees {} live {} bytes {}", tag, m, f, m.saturating_sub(f), b);
 }
 
 /// Upper bounds in seconds. A scavenge of a small young generation is tens of
 /// microseconds; a major collection of a loaded world is tens of milliseconds.
-const BUCKETS: [f64; 11] = [
-    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
-];
+const BUCKETS: [f64; 11] =
+    [0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25];
 
 const YOUNG: usize = 0;
 const OLD: usize = 1;

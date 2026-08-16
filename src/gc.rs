@@ -89,9 +89,7 @@ pub fn wanted() -> bool {
     if OFF.with(|o| *o) || disabled() {
         return false;
     }
-    WANT.with(|w| w.get())
-        || STRESS.with(|s| *s)
-        || heap::heap().wants_collection()
+    WANT.with(|w| w.get()) || STRESS.with(|s| *s) || heap::heap().wants_collection()
 }
 
 /// Collect. `major` sweeps the old generation as well.

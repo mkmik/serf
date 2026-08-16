@@ -33,40 +33,121 @@ pub const DECOMPRESSION_FILTER: &str = "zcat";
 
 /// `APPLY_TO_VM_OOPS`, in order.
 pub const VM_OOP_NAMES: [&str; 40] = [
-    "lobbyObj", "nilObj", "trueObj", "falseObj", "stringObj", "assignmentObj",
-    "objVectorObj", "byteVectorObj", "blockTraitsObj", "deadBlockObj", "processObj",
-    "profilerObj", "outerActivationObj", "blockActivationObj", "proxyObj", "fctProxyObj",
-    "literalsObj", "slotAnnotationObj", "objectAnnotationObj", "errorObj",
-    "assignmentMirrorObj", "blockMirrorObj", "byteVectorMirrorObj", "outerMethodMirrorObj",
-    "blockMethodMirrorObj", "floatMirrorObj", "objVectorMirrorObj", "slotsMirrorObj",
-    "smiMirrorObj", "stringMirrorObj", "processMirrorObj", "outerActivationMirrorObj",
-    "blockActivationMirrorObj", "proxyMirrorObj", "fctProxyMirrorObj", "profilerMirrorObj",
-    "mirrorMirrorObj", "objectIDArray", "BugHuntNames", "CompileWithSICNames",
+    "lobbyObj",
+    "nilObj",
+    "trueObj",
+    "falseObj",
+    "stringObj",
+    "assignmentObj",
+    "objVectorObj",
+    "byteVectorObj",
+    "blockTraitsObj",
+    "deadBlockObj",
+    "processObj",
+    "profilerObj",
+    "outerActivationObj",
+    "blockActivationObj",
+    "proxyObj",
+    "fctProxyObj",
+    "literalsObj",
+    "slotAnnotationObj",
+    "objectAnnotationObj",
+    "errorObj",
+    "assignmentMirrorObj",
+    "blockMirrorObj",
+    "byteVectorMirrorObj",
+    "outerMethodMirrorObj",
+    "blockMethodMirrorObj",
+    "floatMirrorObj",
+    "objVectorMirrorObj",
+    "slotsMirrorObj",
+    "smiMirrorObj",
+    "stringMirrorObj",
+    "processMirrorObj",
+    "outerActivationMirrorObj",
+    "blockActivationMirrorObj",
+    "proxyMirrorObj",
+    "fctProxyMirrorObj",
+    "profilerMirrorObj",
+    "mirrorMirrorObj",
+    "objectIDArray",
+    "BugHuntNames",
+    "CompileWithSICNames",
 ];
 
 /// `FOR_ALL_MAP_TYPES`, in order: the index into the snapshot's vtbl table.
 pub const MAP_TYPE_NAMES: [&str; 20] = [
-    "slotsMap", "slotsMapDeps", "smiMap", "floatMap", "stringMap", "blockMap",
-    "outerMethodMap", "blockMethodMap", "byteVectorMap", "objVectorMap", "mapMap",
-    "markMap", "proxyMap", "fctProxyMap", "mirrorMap", "ovframeMap", "bvframeMap",
-    "processMap", "profilerMap", "assignmentMap",
+    "slotsMap",
+    "slotsMapDeps",
+    "smiMap",
+    "floatMap",
+    "stringMap",
+    "blockMap",
+    "outerMethodMap",
+    "blockMethodMap",
+    "byteVectorMap",
+    "objVectorMap",
+    "mapMap",
+    "markMap",
+    "proxyMap",
+    "fctProxyMap",
+    "mirrorMap",
+    "ovframeMap",
+    "bvframeMap",
+    "processMap",
+    "profilerMap",
+    "assignmentMap",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub enum MapType {
-    Slots = 0, SlotsDeps, Smi, Float, StringM, Block, OuterMethod, BlockMethod,
-    ByteVector, ObjVector, MapM, Mark, Proxy, FctProxy, Mirror, Ovframe, Bvframe,
-    Process, Profiler, Assignment,
+    Slots = 0,
+    SlotsDeps,
+    Smi,
+    Float,
+    StringM,
+    Block,
+    OuterMethod,
+    BlockMethod,
+    ByteVector,
+    ObjVector,
+    MapM,
+    Mark,
+    Proxy,
+    FctProxy,
+    Mirror,
+    Ovframe,
+    Bvframe,
+    Process,
+    Profiler,
+    Assignment,
 }
 
 impl MapType {
     pub fn from_index(i: usize) -> Option<MapType> {
         use MapType::*;
         const ALL: [MapType; 20] = [
-            Slots, SlotsDeps, Smi, Float, StringM, Block, OuterMethod, BlockMethod,
-            ByteVector, ObjVector, MapM, Mark, Proxy, FctProxy, Mirror, Ovframe,
-            Bvframe, Process, Profiler, Assignment,
+            Slots,
+            SlotsDeps,
+            Smi,
+            Float,
+            StringM,
+            Block,
+            OuterMethod,
+            BlockMethod,
+            ByteVector,
+            ObjVector,
+            MapM,
+            Mark,
+            Proxy,
+            FctProxy,
+            Mirror,
+            Ovframe,
+            Bvframe,
+            Process,
+            Profiler,
+            Assignment,
         ];
         ALL.get(i).copied()
     }
@@ -75,9 +156,8 @@ impl MapType {
     }
 }
 
-pub const SPACE_SIZE_NAMES: [&str; 7] = [
-    "eden_size", "surv_size", "old_size", "code_size", "pic_size", "deps_size", "debug_size",
-];
+pub const SPACE_SIZE_NAMES: [&str; 7] =
+    ["eden_size", "surv_size", "old_size", "code_size", "pic_size", "deps_size", "debug_size"];
 
 fn delim_bytes(name: &str) -> String {
     format!("\n\x0c\n{}\n\x0c\n!", name)
@@ -85,41 +165,188 @@ fn delim_bytes(name: &str) -> String {
 
 /// The 182 canonical strings the VM keeps direct handles on, in `VMString[]` order.
 pub const VM_STRINGS: [&str; NUM_VM_STRINGS] = [
-    "primitiveNotDefinedError", "primitiveFailedError", "badTypeError", "badTypeSealError",
-    "divisionByZeroError", "overflowError", "badSignError", "alignmentError", "badIndexError",
-    "badSizeError", "reflectTypeError", "outOfMemoryError", "stackOverflowError",
-    "slotNameError", "slotNameError", "argumentCountError", "parentError",
-    "unassignableSlotError", "lonelyAssignmentSlotError", "parallelTWAINSError",
-    "noProcessError", "noActivationError", "noReceiverError", "noParentError", "noSenderError",
-    "deadProxyError", "liveProxyError", "wrongNoOfArgsError", "nullPointerError",
-    "nullCharError", "noDynamicLinkerError", "enumerationTargetError", "noProfilingInfoError",
-    "badBranchError", "parent", "codes", "literals", "file", "line", "source", "methodPointer",
-    "self", "lexical parent", "value", "value:", "value:With:", "value:With:With:",
-    "value:With:With:With:", "_BlockClone", "reflectee", "<top level expr>",
-    "primitiveFailedError:Name:", "+", "-", "*", "/", "%", "<", "<=", "=", "!=", ">=", ">",
-    "||", "&&", "^^", "min:", "max:", "not", "successor", "succ", "predecessor", "pred",
-    "absoluteValue", "inverse", "negate", "complement", "do:", "to:Do:", "to:By:Do:",
-    "to:ByPositive:Do:", "to:ByNegative:Do:", "upTo:Do:", "upTo:By:Do:", "downTo:Do:",
-    "downTo:By:Do:", "compare:IfLess:Equal:Greater:", "asFloat", "whileTrue:", "whileFalse:",
-    "untilTrue:", "untilFalse:", "ifTrue:", "ifFalse:", "ifTrue:False:", "ifFalse:True:",
-    "at:", "at:Put:", "size", "_Clone", "_Clone:Filler:", "_Clone0", "_Clone1", "_Clone2",
-    "_Clone3", "_Clone4", "_Clone5", "_Clone6", "_Clone7", "_Clone8", "_Clone9", "_IntEQ:",
-    "_IntNE:", "_IntLT:", "_IntLE:", "_IntGE:", "_IntGT:", "_IntAdd:", "_IntSub:", "_IntMul:",
-    "_IntDiv:", "_IntMod:", "_IntAnd:", "_IntOr:", "_IntXor:", "_IntArithmeticShiftLeft:",
-    "_IntLogicalShiftLeft:", "_IntArithmeticShiftRight:", "_IntLogicalShiftRight:", "_Eq:",
-    "_At:", "_At:Put:", "_Size", "_ByteAt:", "_ByteAt:Put:", "_ByteSize", "_Restart",
-    "_RestartIfFail:", "__DefineLabel:Before:", "__DefineLabel:After:", "<not a string>",
+    "primitiveNotDefinedError",
+    "primitiveFailedError",
+    "badTypeError",
+    "badTypeSealError",
+    "divisionByZeroError",
+    "overflowError",
+    "badSignError",
+    "alignmentError",
+    "badIndexError",
+    "badSizeError",
+    "reflectTypeError",
+    "outOfMemoryError",
+    "stackOverflowError",
+    "slotNameError",
+    "slotNameError",
+    "argumentCountError",
+    "parentError",
+    "unassignableSlotError",
+    "lonelyAssignmentSlotError",
+    "parallelTWAINSError",
+    "noProcessError",
+    "noActivationError",
+    "noReceiverError",
+    "noParentError",
+    "noSenderError",
+    "deadProxyError",
+    "liveProxyError",
+    "wrongNoOfArgsError",
+    "nullPointerError",
+    "nullCharError",
+    "noDynamicLinkerError",
+    "enumerationTargetError",
+    "noProfilingInfoError",
+    "badBranchError",
+    "parent",
+    "codes",
+    "literals",
+    "file",
+    "line",
+    "source",
+    "methodPointer",
+    "self",
+    "lexical parent",
+    "value",
+    "value:",
+    "value:With:",
+    "value:With:With:",
+    "value:With:With:With:",
+    "_BlockClone",
+    "reflectee",
+    "<top level expr>",
+    "primitiveFailedError:Name:",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "<",
+    "<=",
+    "=",
+    "!=",
+    ">=",
+    ">",
+    "||",
+    "&&",
+    "^^",
+    "min:",
+    "max:",
+    "not",
+    "successor",
+    "succ",
+    "predecessor",
+    "pred",
+    "absoluteValue",
+    "inverse",
+    "negate",
+    "complement",
+    "do:",
+    "to:Do:",
+    "to:By:Do:",
+    "to:ByPositive:Do:",
+    "to:ByNegative:Do:",
+    "upTo:Do:",
+    "upTo:By:Do:",
+    "downTo:Do:",
+    "downTo:By:Do:",
+    "compare:IfLess:Equal:Greater:",
+    "asFloat",
+    "whileTrue:",
+    "whileFalse:",
+    "untilTrue:",
+    "untilFalse:",
+    "ifTrue:",
+    "ifFalse:",
+    "ifTrue:False:",
+    "ifFalse:True:",
+    "at:",
+    "at:Put:",
+    "size",
+    "_Clone",
+    "_Clone:Filler:",
+    "_Clone0",
+    "_Clone1",
+    "_Clone2",
+    "_Clone3",
+    "_Clone4",
+    "_Clone5",
+    "_Clone6",
+    "_Clone7",
+    "_Clone8",
+    "_Clone9",
+    "_IntEQ:",
+    "_IntNE:",
+    "_IntLT:",
+    "_IntLE:",
+    "_IntGE:",
+    "_IntGT:",
+    "_IntAdd:",
+    "_IntSub:",
+    "_IntMul:",
+    "_IntDiv:",
+    "_IntMod:",
+    "_IntAnd:",
+    "_IntOr:",
+    "_IntXor:",
+    "_IntArithmeticShiftLeft:",
+    "_IntLogicalShiftLeft:",
+    "_IntArithmeticShiftRight:",
+    "_IntLogicalShiftRight:",
+    "_Eq:",
+    "_At:",
+    "_At:Put:",
+    "_Size",
+    "_ByteAt:",
+    "_ByteAt:Put:",
+    "_ByteSize",
+    "_Restart",
+    "_RestartIfFail:",
+    "__DefineLabel:Before:",
+    "__DefineLabel:After:",
+    "<not a string>",
     "undefinedSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:",
     "ambiguousSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:",
     "missingParentSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:",
     "mismatchedArgumentCountSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:",
-    "performTypeErrorSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:", "normal",
-    "implicitSelf", "undirectedResend", "directedResend", "delegated", "terminated", "aborted",
-    "stackOverflow", "_InterruptCheck", "nonLifoBlock", "singleStepped", "finishedActivation",
-    "yielded", "signal", "lowOnSpace", "couldntAllocateStack", "sigint", "sigquit", "sigio",
-    "siguser1", "siguser2", "sigpipe", "sigterm", "sigurg", "sigchild", "sighup", "sigwinch",
-    "sigrealtimer", "sigcputimer", "sigunknown", "nic", "sic", "none", "version",
-    "pointerDescriptors", "asSmallInteger",
+    "performTypeErrorSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:",
+    "normal",
+    "implicitSelf",
+    "undirectedResend",
+    "directedResend",
+    "delegated",
+    "terminated",
+    "aborted",
+    "stackOverflow",
+    "_InterruptCheck",
+    "nonLifoBlock",
+    "singleStepped",
+    "finishedActivation",
+    "yielded",
+    "signal",
+    "lowOnSpace",
+    "couldntAllocateStack",
+    "sigint",
+    "sigquit",
+    "sigio",
+    "siguser1",
+    "siguser2",
+    "sigpipe",
+    "sigterm",
+    "sigurg",
+    "sigchild",
+    "sighup",
+    "sigwinch",
+    "sigrealtimer",
+    "sigcputimer",
+    "sigunknown",
+    "nic",
+    "sic",
+    "none",
+    "version",
+    "pointerDescriptors",
+    "asSmallInteger",
 ];
 
 #[derive(Clone, Default)]
@@ -210,7 +437,12 @@ impl<'a> Rd<'a> {
     }
     fn u32(&mut self) -> Result<u32, String> {
         self.need(4)?;
-        let v = u32::from_le_bytes([self.b[self.i], self.b[self.i + 1], self.b[self.i + 2], self.b[self.i + 3]]);
+        let v = u32::from_le_bytes([
+            self.b[self.i],
+            self.b[self.i + 1],
+            self.b[self.i + 2],
+            self.b[self.i + 3],
+        ]);
         self.i += 4;
         Ok(if self.swap { v.swap_bytes() } else { v })
     }
@@ -232,7 +464,10 @@ impl<'a> Rd<'a> {
         let n = want.len();
         self.need(n)?;
         if &self.b[self.i..self.i + n] != want.as_bytes() {
-            return Err(format!("snapshot corrupt: expected the '{}' delimiter at offset {}", name, self.i));
+            return Err(format!(
+                "snapshot corrupt: expected the '{}' delimiter at offset {}",
+                name, self.i
+            ));
         }
         self.i += n;
         Ok(())
@@ -299,7 +534,10 @@ pub fn tail(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn ascii_field<'a>(lines: &mut std::slice::Iter<'a, &'a str>, key: &str) -> Result<&'a str, String> {
+fn ascii_field<'a>(
+    lines: &mut std::slice::Iter<'a, &'a str>,
+    key: &str,
+) -> Result<&'a str, String> {
     let l = lines.next().ok_or_else(|| format!("snapshot header ended before '{}'", key))?;
     l.strip_prefix(&format!("{}: ", key))
         .ok_or_else(|| format!("snapshot header line {:?} is not '{}: ...'", l, key))
@@ -333,12 +571,16 @@ impl Snapshot {
         if vs.len() != 3 {
             return Err(format!("bad Version line {:?}", v));
         }
-        let timestamp: i32 = ascii_field(&mut lines, "Timestamp")?.trim().parse().map_err(|_| "bad Timestamp")?;
+        let timestamp: i32 =
+            ascii_field(&mut lines, "Timestamp")?.trim().parse().map_err(|_| "bad Timestamp")?;
         let snapshot_code = ascii_field(&mut lines, "Snapshot code")?.trim() == "y";
         let vm_date = ascii_field(&mut lines, "VM date")?.to_string();
         let mut sizes = [0i32; 7];
         for (i, name) in SPACE_SIZE_NAMES.iter().enumerate() {
-            sizes[i] = ascii_field(&mut lines, name)?.trim().parse().map_err(|_| format!("bad {}", name))?;
+            sizes[i] = ascii_field(&mut lines, name)?
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad {}", name))?;
         }
         let compressed = ascii_field(&mut lines, "Compressed")?.trim() == "y";
         // the filter's output replaces the compressed tail, so the binary data
@@ -362,7 +604,9 @@ impl Snapshot {
             ));
         }
         if snapshot_code {
-            return Err("this snapshot contains compiled code; re-save it with 'Snapshot code: n'".into());
+            return Err(
+                "this snapshot contains compiled code; re-save it with 'Snapshot code: n'".into()
+            );
         }
 
         let mut r = Rd { b: data, i: bin_at, swap: false };
@@ -486,7 +730,9 @@ impl Snapshot {
     fn header(&self) -> Vec<u8> {
         let mut o: Vec<u8> = vec![];
         o.extend_from_slice(HEADER_LINE.as_bytes());
-        o.extend_from_slice(format!("Version: {}.{}.{}\n", self.major, self.minor, self.version).as_bytes());
+        o.extend_from_slice(
+            format!("Version: {}.{}.{}\n", self.major, self.minor, self.version).as_bytes(),
+        );
         o.extend_from_slice(format!("Timestamp: {}\n", self.timestamp).as_bytes());
         o.extend_from_slice(b"Snapshot code: n\n");
         o.extend_from_slice(format!("VM date: {}\n", self.vm_date).as_bytes());
@@ -634,7 +880,11 @@ fn words(b: &[u8], swap: bool) -> Vec<u32> {
     b.chunks_exact(4)
         .map(|c| {
             let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            if swap { v.swap_bytes() } else { v }
+            if swap {
+                v.swap_bytes()
+            } else {
+                v
+            }
         })
         .collect()
 }

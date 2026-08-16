@@ -33,20 +33,19 @@ macro_rules! call_arity {
         }
     };
 }
-macro_rules! cast { ($i:literal) => { u64 } }
+macro_rules! cast {
+    ($i:literal) => {
+        u64
+    };
+}
 
 /// C functions whose arguments past the given count are variadic, and how many
 /// come before the `...`. AArch64 passes variadic arguments on the stack, not
 /// in registers, so calling one through a plain prototype hands it whatever
 /// happened to be there: `fcntl(fd, F_SETOWN, pid)` answered ESRCH, and the
 /// world fell back to busy-polling stdin instead of waiting for SIGIO.
-const VARIADIC: &[(&str, usize)] = &[
-    ("fcntl", 2),
-    ("ioctl", 2),
-    ("open", 2),
-    ("openat", 3),
-    ("syscall", 1),
-];
+const VARIADIC: &[(&str, usize)] =
+    &[("fcntl", 2), ("ioctl", 2), ("open", 2), ("openat", 3), ("syscall", 1)];
 
 pub fn variadic_fixed(name: &str) -> Option<usize> {
     VARIADIC.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
@@ -120,7 +119,11 @@ impl Ffi {
         }
         // also try the process's own symbols
         let p = unsafe { dlsym(std::ptr::null_mut(), c.as_ptr()) };
-        if p.is_null() { None } else { Some(p) }
+        if p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
     }
 
     pub fn sym(&mut self, name: &str) -> Option<*mut c_void> {
@@ -180,15 +183,12 @@ impl Ffi {
                 g(a[0], a[1], a[2])
             }
             (3, 4) => {
-                let g: extern "C" fn(u64, u64, u64, ...) -> u64 =
-                    unsafe { std::mem::transmute(f) };
+                let g: extern "C" fn(u64, u64, u64, ...) -> u64 = unsafe { std::mem::transmute(f) };
                 g(a[0], a[1], a[2], a[3])
             }
             // nothing variadic to pass: the plain prototype is right
             (n, k) if k <= n => return Self::call(f, a),
-            (n, k) => {
-                return Err(format!("variadic call with {} fixed and {} arguments", n, k))
-            }
+            (n, k) => return Err(format!("variadic call with {} fixed and {} arguments", n, k)),
         })
     }
 

@@ -100,7 +100,12 @@ pub fn compile_statement(vm: &mut Vm, e: &Expr, file: &str) -> Result<Rc<Method>
     c.push_method(&o, "<top level>", false)
 }
 
-pub fn compile_method(vm: &mut Vm, o: &ObjLit, sel: &str, file: &Rc<str>) -> Result<Rc<Method>, String> {
+pub fn compile_method(
+    vm: &mut Vm,
+    o: &ObjLit,
+    sel: &str,
+    file: &Rc<str>,
+) -> Result<Rc<Method>, String> {
     let _g = crate::gc::NoGc::new();
     let mut c = C { vm, mbs: vec![], file: file.clone() };
     c.push_method(o, sel, false)
@@ -253,7 +258,9 @@ impl<'a> C<'a> {
             sel: mb.sel,
             nargs: mb.nargs,
             arg_slots: (0..mb.nargs).collect(),
-            slot_flags: (0..mb.names.len()).map(|i| if i < mb.nargs { 2 << 2 } else { 0 }).collect(),
+            slot_flags: (0..mb.names.len())
+                .map(|i| if i < mb.nargs { 2 << 2 } else { 0 })
+                .collect(),
             slot_names: mb.names,
             slot_inits: RefCell::new(mb.inits),
             code: mb.code,

@@ -15,6 +15,8 @@ pub const ALLOC: &[(&str, &str, usize)] = &[
 ];
 
 /// (primitive, struct, field, offset, field size, declared type)
+// ponytail: generated table, one line per entry beats rustfmt exploding the long ones
+#[rustfmt::skip]
 pub const FIELD: &[(&str, &str, &str, usize, usize, &str)] = &[
     ("XButtonEvent_buttonbutton", "XButtonEvent", "button", 84, 4, "unsigned_int"),
     ("XButtonEvent_statestate", "XButtonEvent", "state", 80, 4, "unsigned_int"),

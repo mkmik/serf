@@ -1315,8 +1315,13 @@ pub fn default_print_string(vm: &Vm, v: &Value) -> String {
                     format!("'{}'", String::from_utf8_lossy(&b.payload.bytes().unwrap()))
                 }
                 PayKind::Vector => {
-                    let parts: Vec<String> =
-                        b.payload.vector().unwrap().iter().map(|i| default_print_string(vm, i)).collect();
+                    let parts: Vec<String> = b
+                        .payload
+                        .vector()
+                        .unwrap()
+                        .iter()
+                        .map(|i| default_print_string(vm, i))
+                        .collect();
                     format!("({}. )", parts.join(". "))
                 }
                 PayKind::Method => format!("<method {}>", b.payload.method().unwrap().sel),
@@ -1333,7 +1338,11 @@ pub fn default_print_string(vm: &Vm, v: &Value) -> String {
                         .slots
                         .iter()
                         .map(|s| {
-                            format!("{}{}", s.name, if s.kind == SlotKind::Parent { "*" } else { "" })
+                            format!(
+                                "{}{}",
+                                s.name,
+                                if s.kind == SlotKind::Parent { "*" } else { "" }
+                            )
                         })
                         .collect();
                     format!("(| {} |)", names.join(". "))
