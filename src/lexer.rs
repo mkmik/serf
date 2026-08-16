@@ -39,8 +39,29 @@ fn is_id(c: u8) -> bool {
 }
 /// Everything printable that is neither an identifier char nor structural.
 fn is_punct(c: u8) -> bool {
-    matches!(c, b'!' | b'@' | b'#' | b'$' | b'%' | b'^' | b'&' | b'*' | b'-'
-        | b'+' | b'=' | b'~' | b'/' | b'?' | b'<' | b'>' | b',' | b';' | b'|' | b'\\' | b'`')
+    matches!(
+        c,
+        b'!' | b'@'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'^'
+            | b'&'
+            | b'*'
+            | b'-'
+            | b'+'
+            | b'='
+            | b'~'
+            | b'/'
+            | b'?'
+            | b'<'
+            | b'>'
+            | b','
+            | b';'
+            | b'|'
+            | b'\\'
+            | b'`'
+    )
 }
 
 pub struct Lexer<'a> {
@@ -74,8 +95,13 @@ impl<'a> Lexer<'a> {
     fn prev_ends_expr(&self) -> bool {
         matches!(
             self.out.last().map(|s| &s.tok),
-            Some(Tok::Int(_)) | Some(Tok::Float(_)) | Some(Tok::Str(_)) | Some(Tok::Name(_))
-                | Some(Tok::SelfKw) | Some(Tok::RParen) | Some(Tok::RBrack)
+            Some(Tok::Int(_))
+                | Some(Tok::Float(_))
+                | Some(Tok::Str(_))
+                | Some(Tok::Name(_))
+                | Some(Tok::SelfKw)
+                | Some(Tok::RParen)
+                | Some(Tok::RBrack)
         )
     }
 
@@ -117,17 +143,32 @@ impl<'a> Lexer<'a> {
             }
             let c = self.at(0);
             match c {
-                b'(' => { self.i += 1; self.push(Tok::LParen); }
-                b')' => { self.i += 1; self.push(Tok::RParen); }
-                b'[' => { self.i += 1; self.push(Tok::LBrack); }
-                b']' => { self.i += 1; self.push(Tok::RBrack); }
+                b'(' => {
+                    self.i += 1;
+                    self.push(Tok::LParen);
+                }
+                b')' => {
+                    self.i += 1;
+                    self.push(Tok::RParen);
+                }
+                b'[' => {
+                    self.i += 1;
+                    self.push(Tok::LBrack);
+                }
+                b']' => {
+                    self.i += 1;
+                    self.push(Tok::RBrack);
+                }
                 b'{' | b'}' => return Err(self.err("annotations are not supported")),
                 b'\'' => self.read_string()?,
                 b'.' => {
                     // `p.sel` delegates; `p. sel` separates statements
                     let delegating = !had_space
                         && is_id_start(self.at(1))
-                        && matches!(self.out.last().map(|s| &s.tok), Some(Tok::Name(_)) | Some(Tok::Resend));
+                        && matches!(
+                            self.out.last().map(|s| &s.tok),
+                            Some(Tok::Name(_)) | Some(Tok::Resend)
+                        );
                     self.i += 1;
                     self.push(if delegating { Tok::Delegate } else { Tok::Dot });
                 }

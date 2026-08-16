@@ -1077,14 +1077,7 @@ impl Heap {
 
     /// Allocate straight into the old generation: what a promotion does, and
     /// what pretenuring does.
-    fn alloc_old(
-        &self,
-        kind: Kind,
-        oops: usize,
-        slots: usize,
-        payload: usize,
-        anno: bool,
-    ) -> Oop {
+    fn alloc_old(&self, kind: Kind, oops: usize, slots: usize, payload: usize, anno: bool) -> Oop {
         let size = HEADER_WORDS + payload;
         self.old_live.set(self.old_live.get() + 1);
         let o = if let Some(a) = self.old_free.borrow_mut().get_mut(&size).and_then(|v| v.pop()) {
@@ -1161,7 +1154,11 @@ impl Heap {
         debug_assert!(
             oops <= pay && pay < 1 << 20,
             "corrupt object at {:#x}: kind {:?} oops {} payload {} slots {}",
-            o.addr(), k, oops, pay, ns
+            o.addr(),
+            k,
+            oops,
+            pay,
+            ns
         );
         let a = age(o).saturating_add(1);
         // Ask the to-space only when the object is actually staying young: the
@@ -1571,7 +1568,8 @@ mod tests {
     fn the_space_walks_itself() {
         let s = Space::new(256);
         let sizes = [0usize, 1, 4, 2, 9];
-        let made: Vec<Oop> = sizes.iter().map(|n| s.alloc(Shape::new(Kind::Slots, *n)).unwrap()).collect();
+        let made: Vec<Oop> =
+            sizes.iter().map(|n| s.alloc(Shape::new(Kind::Slots, *n)).unwrap()).collect();
         let seen: Vec<Oop> = s.walk().collect();
         assert_eq!(seen, made, "the walk did not find the objects in order");
         assert_eq!(s.used(), sizes.iter().map(|n| 2 * n + HEADER_WORDS).sum::<usize>());
@@ -2438,8 +2436,8 @@ mod tests {
 
 #[cfg(test)]
 mod bench {
-    use super::*;
     use super::tests::Vars;
+    use super::*;
 
     /// Not a check -- a number. `cargo test --release -- --ignored --nocapture
     /// heap::bench`. The cell heap it replaces scavenges ~50k young objects in

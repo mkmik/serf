@@ -11,8 +11,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::image::*;
 use crate::heap::Kind as HKind;
+use crate::image::*;
 use crate::value::*;
 
 #[allow(dead_code)]
@@ -191,7 +191,11 @@ impl<'a> Heap<'a> {
             MapType::Smi | MapType::Float => (0, 1, 0),
             MapType::Mark | MapType::MapM => (0, 0, 0),
             MapType::Block => (3, 0, 0),
-            _ => (smi(self.word(map_star + 4)?), smi(self.word(map_star + 8)?) as usize, self.word(map_star + 12)?),
+            _ => (
+                smi(self.word(map_star + 4)?),
+                smi(self.word(map_star + 8)?) as usize,
+                self.word(map_star + 12)?,
+            ),
         };
         if slots_len > 100_000 {
             return Err(format!("map at {:#x} claims {} slots", map_star, slots_len));
@@ -239,7 +243,9 @@ impl<'a> Heap<'a> {
                 2 + map_word_size(inner.kind, inner.slots.len())
             }
             MapType::Block => 3,
-            MapType::ObjVector => m.object_length as usize + smi(self.word(addr + 8)?).max(0) as usize,
+            MapType::ObjVector => {
+                m.object_length as usize + smi(self.word(addr + 8)?).max(0) as usize
+            }
             _ => m.object_length.max(2) as usize,
         })
     }
@@ -253,7 +259,10 @@ impl<'a> Heap<'a> {
         while a < s.objs_top {
             let mark = self.word(a)?;
             if mark & TAG_MASK != MARK_TAG {
-                return Err(format!("object at {:#x} does not start with a mark word ({:#x})", a, mark));
+                return Err(format!(
+                    "object at {:#x} does not start with a mark word ({:#x})",
+                    a, mark
+                ));
             }
             let m = self.read_map(self.map_star_of(a)?)?;
             let size = self.object_size(a, &m)?;
@@ -264,7 +273,10 @@ impl<'a> Heap<'a> {
             n += 1;
         }
         if a != s.objs_top {
-            return Err(format!("objects overrun the space: ended at {:#x}, top is {:#x}", a, s.objs_top));
+            return Err(format!(
+                "objects overrun the space: ended at {:#x}, top is {:#x}",
+                a, s.objs_top
+            ));
         }
         Ok(n)
     }
@@ -446,7 +458,10 @@ impl<'a> Loader<'a> {
             if std::env::var_os("SERF_TRACE_BLOCKS").is_some() {
                 let derived = crate::compile::block_selector(bm.nargs);
                 if derived != sel {
-                    eprintln!("block: map says {:?} but arity {} implies {:?}", sel, bm.nargs, derived);
+                    eprintln!(
+                        "block: map says {:?} but arity {} implies {:?}",
+                        sel, bm.nargs, derived
+                    );
                 }
             }
             let mv = match m.block.map(|b| b[2]).filter(|w| w & TAG_MASK == MEM_TAG) {
@@ -538,7 +553,8 @@ impl<'a> Loader<'a> {
             let base = a + 4 * lm.object_length.max(2) as u32;
             for i in 0..len {
                 let w = self.heap.word(base + 4 * i as u32)?;
-                lit_strs.push(self.heap.string_at(w).ok().map(|s| -> Rc<str> { s.as_str().into() }));
+                lit_strs
+                    .push(self.heap.string_at(w).ok().map(|s| -> Rc<str> { s.as_str().into() }));
                 lits.push(self.value(w)?);
             }
         }
@@ -589,7 +605,6 @@ impl<'a> Loader<'a> {
 }
 
 // --------------------------------------------------------- serf -> snapshot
-
 
 // --------------------------------------------------------- serf -> snapshot
 
@@ -664,10 +679,7 @@ fn is_str(vm: &Vm, v: &Value, o: &ObjRef) -> bool {
         Some(MapType::ByteVector) => return false,
         _ => {}
     }
-    o.borrow()
-        .slots
-        .iter()
-        .any(|s| s.kind == SlotKind::Parent && s.value.id_eq(&vm.t_string))
+    o.borrow().slots.iter().any(|s| s.kind == SlotKind::Parent && s.value.id_eq(&vm.t_string))
 }
 
 impl<'a> Builder<'a> {
@@ -707,7 +719,10 @@ impl<'a> Builder<'a> {
     }
 
     fn add(&mut self, v: Value, kind: Kind, obj_slots: Vec<Sym>, words: usize) -> usize {
-        let key = match &v { Value::Obj(o) => o.id(), _ => 0 };
+        let key = match &v {
+            Value::Obj(o) => o.id(),
+            _ => 0,
+        };
         let i = self.items.len();
         if key != 0 {
             self.index.insert(key, i);
@@ -732,7 +747,9 @@ impl<'a> Builder<'a> {
             for s in &b.slots {
                 if s.kind == SlotKind::Assign {
                     let t = sym_str(s.name).trim_end_matches(':');
-                    if let Some(d) = b.slots.iter().find(|x| sym_str(x.name) == t && x.kind != SlotKind::Assign) {
+                    if let Some(d) =
+                        b.slots.iter().find(|x| sym_str(x.name) == t && x.kind != SlotKind::Assign)
+                    {
                         a.push(d.name);
                     }
                 }
@@ -898,10 +915,7 @@ impl<'a> Builder<'a> {
             }
             Value::Float(f) => as_float(*f as f32),
             Value::Obj(o) => {
-                let i = *self
-                    .index
-                    .get(&o.id())
-                    .ok_or("object was not visited")?;
+                let i = *self.index.get(&o.id()).ok_or("object was not visited")?;
                 self.items[i].addr | MEM_TAG
             }
         })
@@ -917,11 +931,8 @@ impl<'a> Builder<'a> {
         }
         let obj_words = w;
         // upper bound: every object gets its own map, 9 header words + 4/slot
-        let map_bound: usize = self
-            .items
-            .iter()
-            .map(|i| 11 + 4 * (i.obj_slots.len() + slot_count(&i.v) + 8))
-            .sum();
+        let map_bound: usize =
+            self.items.iter().map(|i| 11 + 4 * (i.obj_slots.len() + slot_count(&i.v) + 8)).sum();
         let byte_len = self.bytes.len() as u32;
         let old_size = round_page((obj_words + map_bound) as u32 * 4 + byte_len + 64 * 1024);
         let bytes_top = OLD_BASE + old_size;
@@ -930,10 +941,21 @@ impl<'a> Builder<'a> {
         if std::env::var("SERF_DUMP_ITEMS").is_ok() {
             for (n, it) in self.items.iter().enumerate() {
                 let k = match it.kind {
-                    Kind::Slots => "slots", Kind::Str => "str", Kind::ByteVec => "bytevec",
-                    Kind::Vector => "vector", Kind::Method => "method", Kind::Block => "block",
+                    Kind::Slots => "slots",
+                    Kind::Str => "str",
+                    Kind::ByteVec => "bytevec",
+                    Kind::Vector => "vector",
+                    Kind::Method => "method",
+                    Kind::Block => "block",
                 };
-                eprintln!("item {:6} addr {:#x} words {:3} kind {} objslots {}", n, it.addr, it.words, k, it.obj_slots.len());
+                eprintln!(
+                    "item {:6} addr {:#x} words {:3} kind {} objslots {}",
+                    n,
+                    it.addr,
+                    it.words,
+                    k,
+                    it.obj_slots.len()
+                );
             }
         }
         let frozen = self.items.len();
@@ -947,23 +969,35 @@ impl<'a> Builder<'a> {
 
         // the shared assignment object, its map, and map_map come first so
         // their addresses are stable
-        let intern = |body: Vec<u32>, maps: &mut HashMap<Vec<u32>, u32>, mw: &mut Vec<u32>, h: u32| -> u32 {
-            if let Some(&a) = maps.get(&body) {
-                return a | MEM_TAG;
-            }
-            let a = map_base + 4 * mw.len() as u32;
-            mw.push(mark_word(h));
-            mw.push(0); // patched to map_map below
-            mw.extend_from_slice(&body);
-            maps.insert(body, a);
-            a | MEM_TAG
-        };
+        let intern =
+            |body: Vec<u32>, maps: &mut HashMap<Vec<u32>, u32>, mw: &mut Vec<u32>, h: u32| -> u32 {
+                if let Some(&a) = maps.get(&body) {
+                    return a | MEM_TAG;
+                }
+                let a = map_base + 4 * mw.len() as u32;
+                mw.push(mark_word(h));
+                mw.push(0); // patched to map_map below
+                mw.extend_from_slice(&body);
+                maps.insert(body, a);
+                a | MEM_TAG
+            };
 
         let h1 = self.hash();
-        let map_map = intern(vec![VTBL_SENTINEL + MapType::MapM as u32 * 4], &mut maps, &mut map_words, h1);
+        let map_map =
+            intern(vec![VTBL_SENTINEL + MapType::MapM as u32 * 4], &mut maps, &mut map_words, h1);
         let h2 = self.hash();
         let assign_map = intern(
-            vec![VTBL_SENTINEL + MapType::Assignment as u32 * 4, as_smi(2), as_smi(0), nil, 0, 0, 0, 0, 0],
+            vec![
+                VTBL_SENTINEL + MapType::Assignment as u32 * 4,
+                as_smi(2),
+                as_smi(0),
+                nil,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
             &mut maps,
             &mut map_words,
             h2,
@@ -1008,7 +1042,8 @@ impl<'a> Builder<'a> {
             h4,
         );
         let h5 = self.hash();
-        let mark_map = intern(vec![VTBL_SENTINEL + MapType::Mark as u32 * 4], &mut maps, &mut map_words, h5);
+        let mark_map =
+            intern(vec![VTBL_SENTINEL + MapType::Mark as u32 * 4], &mut maps, &mut map_words, h5);
 
         // 2. every object: header, payload words, and its map
         for i in 0..self.items.len() {
@@ -1035,18 +1070,37 @@ impl<'a> Builder<'a> {
                 // only the kinds that are ordinary slot objects with a
                 // different map class; everything else is decided by payload
                 Kind::Slots if reflectee.is_some() => MapType::Mirror,
-                Kind::Slots => match MapType::from_index(crate::heap::aux(v.as_obj().unwrap()) as usize) {
-                    Some(k) if matches!(k, MapType::Mirror | MapType::Proxy | MapType::FctProxy
-                        | MapType::Process | MapType::Profiler | MapType::Ovframe
-                        | MapType::Bvframe | MapType::Assignment) => k,
-                    _ => MapType::SlotsDeps,
-                },
+                Kind::Slots => {
+                    match MapType::from_index(crate::heap::aux(v.as_obj().unwrap()) as usize) {
+                        Some(k)
+                            if matches!(
+                                k,
+                                MapType::Mirror
+                                    | MapType::Proxy
+                                    | MapType::FctProxy
+                                    | MapType::Process
+                                    | MapType::Profiler
+                                    | MapType::Ovframe
+                                    | MapType::Bvframe
+                                    | MapType::Assignment
+                            ) =>
+                        {
+                            k
+                        }
+                        _ => MapType::SlotsDeps,
+                    }
+                }
                 Kind::Str => MapType::StringM,
                 Kind::ByteVec => MapType::ByteVector,
                 Kind::Vector => MapType::ObjVector,
                 Kind::Method => {
-                    let blk = v.as_obj().unwrap().borrow().payload.method().is_some_and(|m| m.is_block);
-                    if blk { MapType::BlockMethod } else { MapType::OuterMethod }
+                    let blk =
+                        v.as_obj().unwrap().borrow().payload.method().is_some_and(|m| m.is_block);
+                    if blk {
+                        MapType::BlockMethod
+                    } else {
+                        MapType::OuterMethod
+                    }
                 }
                 Kind::Block => MapType::Block,
             };
@@ -1076,7 +1130,8 @@ impl<'a> Builder<'a> {
                     Some(m) => m,
                     _ => unreachable!(),
                 };
-                let (lits, code, file, source) = self.mparts[&(Rc::as_ptr(&m) as *const u8 as usize)];
+                let (lits, code, file, source) =
+                    self.mparts[&(Rc::as_ptr(&m) as *const u8 as usize)];
                 {
                     let mut mf = vec![
                         self.items[code].addr | MEM_TAG,
@@ -1177,7 +1232,9 @@ impl<'a> Builder<'a> {
                 };
                 let mut b = vec![
                     VTBL_SENTINEL + map_kind as u32 * 4,
-                    as_smi(words as i32 - if kind == Kind::Vector { vec_len(&v) as i32 } else { 0 }),
+                    as_smi(
+                        words as i32 - if kind == Kind::Vector { vec_len(&v) as i32 } else { 0 },
+                    ),
                     as_smi(nslots as i32),
                     anno,
                 ];
@@ -1225,7 +1282,14 @@ impl<'a> Builder<'a> {
             objs,
             bytes: self.bytes.clone(),
         };
-        let empty = |a: u32| Space { objs_bottom: a, objs_top: a, bytes_bottom: a, bytes_top: a, objs: vec![], bytes: vec![] };
+        let empty = |a: u32| Space {
+            objs_bottom: a,
+            objs_top: a,
+            bytes_bottom: a,
+            bytes_top: a,
+            objs: vec![],
+            bytes: vec![],
+        };
 
         let mut vm_oops = vec![nil; VM_OOP_NAMES.len()];
         for (k, r) in roots.iter().enumerate() {
@@ -1242,7 +1306,10 @@ impl<'a> Builder<'a> {
             Some(vs) => vs.iter().map(|v| self.tagged(v)).collect::<Result<_, _>>()?,
             None => VM_STRINGS
                 .iter()
-                .map(|s| self.items[*self.strs.get(s.as_bytes()).expect("VM string not interned")].addr | MEM_TAG)
+                .map(|s| {
+                    self.items[*self.strs.get(s.as_bytes()).expect("VM string not interned")].addr
+                        | MEM_TAG
+                })
                 .collect(),
         };
 
@@ -1253,18 +1320,27 @@ impl<'a> Builder<'a> {
             timestamp: self.vm.timestamp as i32,
             snapshot_code: false,
             vm_date: "serf".into(),
-            sizes: [EDEN as i32, SURV as i32, old_size as i32, 1024 * 1024, 512 * 1024, 512 * 1024, 512 * 1024],
+            sizes: [
+                EDEN as i32,
+                SURV as i32,
+                old_size as i32,
+                1024 * 1024,
+                512 * 1024,
+                512 * 1024,
+                512 * 1024,
+            ],
             page_aligned: false,
             maps_canonical: true,
             vm_oops,
             tenuring_threshold: as_smi(8),
             // MAP_READ_SNAPSHOT_TEMPLATE takes these as Map*, not as tagged
             // mapOops: the map body starts two words into its object
-            vm_maps: [smi_map, float_map, mark_map, map_map]
-                .iter()
-                .map(|m| (m & !3) + 8)
-                .collect(),
-            new_gen: vec![empty(0x0400_0000), empty(0x0400_0000 + EDEN), empty(0x0400_0000 + EDEN + SURV)],
+            vm_maps: [smi_map, float_map, mark_map, map_map].iter().map(|m| (m & !3) + 8).collect(),
+            new_gen: vec![
+                empty(0x0400_0000),
+                empty(0x0400_0000 + EDEN),
+                empty(0x0400_0000 + EDEN + SURV),
+            ],
             old: vec![old],
             string_table,
             vm_strings,
@@ -1290,7 +1366,8 @@ fn slot_count(v: &Value) -> usize {
 
 /// Words of a map body (everything after the mapOop's mark and map words).
 fn map_body_len(body: &[u32]) -> usize {
-    let k = MapType::from_index(((body[0] - VTBL_SENTINEL) / 4) as usize).unwrap_or(MapType::SlotsDeps);
+    let k =
+        MapType::from_index(((body[0] - VTBL_SENTINEL) / 4) as usize).unwrap_or(MapType::SlotsDeps);
     match k {
         MapType::Smi | MapType::Float => 5,
         MapType::Mark | MapType::MapM => 1,
@@ -1326,7 +1403,8 @@ pub fn build(vm: &Vm) -> Result<Snapshot, String> {
     let empty_str = vm.string("");
     let empty_vec = vm.vector(vec![]);
     let empty_bytes = vm.bytes_with(vm.t_string.clone(), vec![]);
-    let mut roots = vec![vm.lobby.clone(), vm.nil.clone(), vm.tru.clone(), vm.fals.clone(), empty_str];
+    let mut roots =
+        vec![vm.lobby.clone(), vm.nil.clone(), vm.tru.clone(), vm.fals.clone(), empty_str];
     roots.push(vm.nil.clone()); // assignmentObj, patched in finish
     roots.push(empty_vec.clone());
     roots.push(empty_bytes);

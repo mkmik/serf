@@ -132,7 +132,10 @@ fn lending<T>(vm: &mut Vm, frames: &mut Vec<Frame>, body: impl FnOnce(&mut Vm) -
 pub enum Outcome {
     Done(Value),
     /// the stack executed `_Yield:` and is parked, ready to resume
-    Yielded { rcvr: Value, arg: Value },
+    Yielded {
+        rcvr: Value,
+        arg: Value,
+    },
 }
 
 /// An activation is a heap object, so this is one bump and a few stores -- the
@@ -179,7 +182,10 @@ fn cause_of_error(vm: &mut Vm) -> Option<String> {
             }
         }
         if let Some(i) = b.find("receiver") {
-            parts.push(format!("receiver: {:.200}", default_print_string(vm, &b.slots.get(i).value)));
+            parts.push(format!(
+                "receiver: {:.200}",
+                default_print_string(vm, &b.slots.get(i).value)
+            ));
         }
     }
     if parts.is_empty() {
@@ -292,12 +298,7 @@ fn err(frames: &[Frame], msg: String) -> Unwind {
         .iter()
         .rev()
         .take(24)
-        .map(|f| {
-            format!(
-                "  at {} ({}:{})",
-                f.method.sel, f.method.file, f.method.line
-            )
-        })
+        .map(|f| format!("  at {} ({}:{})", f.method.sel, f.method.file, f.method.line))
         .collect();
     Unwind::Err(SelfErr { msg, trace })
 }
@@ -432,7 +433,10 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     };
                     let target = home_of(frames.last().unwrap().scope);
                     if act_dead(target) {
-                        return Err(err(frames, "non-local return to an activation that already returned".into()));
+                        return Err(err(
+                            frames,
+                            "non-local return to an activation that already returned".into(),
+                        ));
                     }
                     loop {
                         let f = frames.pop().unwrap();
@@ -490,7 +494,8 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
             DELEGATEE => {
                 let idx = (index << 4) | x;
                 index = 0;
-                delegatee = act_method(frames.last().unwrap().scope).lit_strs.get(idx).cloned().flatten();
+                delegatee =
+                    act_method(frames.last().unwrap().scope).lit_strs.get(idx).cloned().flatten();
                 if delegatee.is_none() {
                     return Err(err(frames, "delegatee must be a name".into()));
                 }
@@ -500,7 +505,12 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 let idx = (index << 4) | x;
                 index = 0;
                 let normal = op == SEND;
-                let sel = match act_method(frames.last().unwrap().scope).lit_strs.get(idx).cloned().flatten() {
+                let sel = match act_method(frames.last().unwrap().scope)
+                    .lit_strs
+                    .get(idx)
+                    .cloned()
+                    .flatten()
+                {
                     Some(s) => s,
                     None => return Err(err(frames, "selector must be a string".into())),
                 };
@@ -515,11 +525,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     args.clear();
                     args.extend((n - argc..n).map(|i| f.at(i)));
                     f.truncate(n - argc);
-                    let recv = if normal {
-                        f.pop().unwrap()
-                    } else {
-                        act_recv(f.scope)
-                    };
+                    let recv = if normal { f.pop().unwrap() } else { act_recv(f.scope) };
                     (recv, args)
                 };
                 let mut cur_sel: Rc<str> = sel;
@@ -532,8 +538,8 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                 // site, not to whatever is being sent from it. Primitives and
                 // resends never reach `lookup` by this path, so they leave the
                 // site empty rather than filling it with someone else's hit.
-                let mut site = (!cur_resend && cur_del.is_none() && !cur_sel.starts_with('_'))
-                    .then_some(idx);
+                let mut site =
+                    (!cur_resend && cur_del.is_none() && !cur_sel.starts_with('_')).then_some(idx);
 
                 loop {
                     // _Restart re-enters the current activation from the top,
@@ -565,7 +571,8 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         vm.temp_roots.push(cur_recv);
                         vm.temp_roots.extend_from_slice(&cur_args);
                         vm.temp_roots.extend(fail);
-                        let called = lending(vm, frames, |vm| prims::call(vm, base, &cur_recv, &cur_args));
+                        let called =
+                            lending(vm, frames, |vm| prims::call(vm, base, &cur_recv, &cur_args));
                         // ...and it rewrites the copies it was given, not these
                         // locals, so a local that outlives the call has to be
                         // taken back from `temp_roots`. Only the fail block
@@ -666,7 +673,10 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 vm.lookup(&dv, &cur_sel)
                             }
                             Err(_) => {
-                                return Err(err(frames, format!("no delegatee slot '{}' in the method holder", d)))
+                                return Err(err(
+                                    frames,
+                                    format!("no delegatee slot '{}' in the method holder", d),
+                                ))
                             }
                         }
                     } else {
@@ -721,10 +731,19 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 continue;
                             }
                             let r = default_print_string(vm, &cur_recv);
-                            return Err(err(frames, format!("{} does not understand '{}'", r, cur_sel)));
+                            return Err(err(
+                                frames,
+                                format!("{} does not understand '{}'", r, cur_sel),
+                            ));
                         }
                         Err(LookupErr::Ambiguous) => {
-                            return Err(err(frames, format!("'{}' is ambiguous: found in more than one parent", cur_sel)))
+                            return Err(err(
+                                frames,
+                                format!(
+                                    "'{}' is ambiguous: found in more than one parent",
+                                    cur_sel
+                                ),
+                            ))
                         }
                     };
 
@@ -740,7 +759,10 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         match b.find(&target) {
                             Some(i) => b.assign(i, cur_args[0].clone()),
                             None => {
-                                return Err(err(frames, format!("assignment slot '{}' has no data slot", sname)));
+                                return Err(err(
+                                    frames,
+                                    format!("assignment slot '{}' has no data slot", sname),
+                                ));
                             }
                         }
                         frames.last_mut().unwrap().push(cur_recv);
@@ -764,7 +786,10 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         Some(m) => m,
                     };
                     if m.nargs != cur_args.len() {
-                        return Err(err(frames, format!("'{}' expects {} arguments", cur_sel, m.nargs)));
+                        return Err(err(
+                            frames,
+                            format!("'{}' expects {} arguments", cur_sel, m.nargs),
+                        ));
                     }
 
                     let (nrecv, nholder, lexical) = if m.is_block {
@@ -772,7 +797,10 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         match lex {
                             Some(l) => (act_recv(l), act_holder(l), Some(l)),
                             None => {
-                                return Err(err(frames, "block code activated outside of a block".into()))
+                                return Err(err(
+                                    frames,
+                                    "block code activated outside of a block".into(),
+                                ))
                             }
                         }
                     } else {
@@ -808,8 +836,11 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                     if frames.len() >= vm.max_frames {
                         let mut h: std::collections::HashMap<String, usize> = Default::default();
                         for f in frames.iter() {
-                            *h.entry(format!("{} ({}:{})", f.method.sel, f.method.file, f.method.line))
-                                .or_insert(0) += 1;
+                            *h.entry(format!(
+                                "{} ({}:{})",
+                                f.method.sel, f.method.file, f.method.line
+                            ))
+                            .or_insert(0) += 1;
                         }
                         let mut v: Vec<_> = h.into_iter().collect();
                         v.sort_by(|a, b| b.1.cmp(&a.1));
@@ -863,7 +894,11 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                             None => return Err(err(frames, "nothing to branch on".into())),
                         };
                         let is_false = vm.is_false(&c);
-                        if (op == BRANCH_FALSE) == is_false { target(&lit) } else { None }
+                        if (op == BRANCH_FALSE) == is_false {
+                            target(&lit)
+                        } else {
+                            None
+                        }
                     }
                 };
                 match dest {
