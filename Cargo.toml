@@ -1,9 +1,14 @@
 [package]
-name = "serf"
+# crates.io already has a `serf` (and a `self`); the binary below is still serf.
+name = "selflang"
 version = "0.1.0"
 edition = "2021"
 description = "A Self VM in Rust: scanner, parser, bytecode compiler, interpreter, and the C++ VM's snapshot format"
 license = "Apache-2.0"
+repository = "https://github.com/mkmik/serf"
+# The checked-in worlds and screenshots are ~27 MB even gzipped, past crates.io's
+# 10 MB package limit, and nothing in the crate needs them to build.
+exclude = ["*.snap", "shots/", "reference/"]
 
 [[bin]]
 name = "serf"

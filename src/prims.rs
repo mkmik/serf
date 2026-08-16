@@ -128,8 +128,14 @@ const ERRNO_NAMES: &[&str] = &[
     "EBADMACHO",
 ];
 
+// `errno` is a macro over a per-thread location, and the function behind it is
+// named per platform: `__error` on macOS and the BSDs, `__errno_location` on
+// Linux. Naming only the first is what kept the bin from linking on Linux.
+// The table above is still macOS's, as the C++ VM's is, so a name read back on
+// Linux is only right for the first 34 -- the numbers diverge past EPIPE.
 extern "C" {
-    #[link_name = "__error"]
+    #[cfg_attr(target_vendor = "apple", link_name = "__error")]
+    #[cfg_attr(not(target_vendor = "apple"), link_name = "__errno_location")]
     fn libc_errno() -> *mut i32;
 }
 
