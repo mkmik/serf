@@ -22,9 +22,9 @@ Paths below like `vm/…` and `objects/…` refer to the C++ Self implementation
 git submodule update --init          # or clone with --recurse-submodules
 ```
 
-The snapshots in this repo — `Clean-4.4.snap` as shipped there, and
-`core.snap`, `morphic.snap` and `gas.snap` written by that VM — carry the Self
-copyright; see [LICENSE.self](LICENSE.self).
+The snapshots in this repo — `Clean-4.4.snap` and `Demo-4.4.snap` as shipped
+there, and `core.snap`, `morphic.snap` and `gas.snap` written by that VM — carry
+the Self copyright; see [LICENSE.self](LICENSE.self).
 
 ## Running it
 
