@@ -702,6 +702,11 @@ impl Value {
     pub fn method(&self) -> Option<Rc<Method>> {
         self.as_obj().and_then(obj::method_of)
     }
+    /// A block object, whose method is its `value...` slot's rather than its
+    /// own: what a send finds in a slot is data, not something to run.
+    pub fn is_block(&self) -> bool {
+        self.as_obj().is_some_and(|o| pay_kind(o) == PayKind::Block)
+    }
     pub fn bytes(&self) -> Option<Vec<u8>> {
         self.as_obj().and_then(obj::bytes)
     }

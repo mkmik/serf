@@ -124,21 +124,102 @@ fn order(who: &str, a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> 
     }
 }
 
-fn ovf(who: &'static str) -> impl Fn(Option<i64>) -> Result<i64, String> {
-    move |o| o.ok_or_else(|| format!("{}: integer overflow", who))
+/// An arithmetic primitive's answer, or the failure that says it did not fit.
+///
+/// Both bounds are the smallint's rather than the machine's: `checked_add` and
+/// friends answer in an `i64`, which has a bit the heap's tagged word does not,
+/// so two smallints can add up to something only `Oop::int` would notice.
+///
+/// The failure is spelled the way the world spells it. `traits smallInt`'s fail
+/// blocks compare the error against 'overflowError' and retry in bigInts when it
+/// matches (`objects/core/smallInt.self:122`); a sentence reads to them as an
+/// error nobody handles, which is why `1000 factorial` reported a failed
+/// primitive rather than promoting.
+fn ovf(o: Option<i64>) -> Result<i64, String> {
+    match o {
+        Some(v) if (crate::heap::INT_MIN..=crate::heap::INT_MAX).contains(&v) => Ok(v),
+        _ => Err("overflowError".into()),
+    }
 }
 
+/// Run a shift over the smallint's own width rather than the machine's.
+///
+/// A smallint is 63 bits (`heap::INT_MAX`), so `-1 _IntLogicalShiftRight: 1`
+/// is the largest smallint -- not `i64::MAX`, which is a word too wide to be
+/// one and panics on the way into an `Oop`. The C++ VM gets this free by
+/// shifting the tagged word and clearing the tag again
+/// (`vm/src/i386/prims/asmPrims_i386.S:111`); `v << 1` and back is the same
+/// trick with one tag bit instead of two.
+fn in_field(v: i64, f: impl FnOnce(u64) -> u64) -> i64 {
+    (f((v as u64) << 1) as i64) >> 1
+}
+
+/// A shift count. The machine's shift instruction takes the count modulo the
+/// word, so the C++ VM answers nonsense for a count it cannot hold; serf
+/// shifts everything out instead, which is at least the limit of the sane
+/// counts.
+fn shift_count(v: &Value, who: &str) -> Result<u32, String> {
+    Ok(u32::try_from(as_i(v, who)?).unwrap_or(u32::MAX))
+}
+
+/// A float as a smallint, or the overflow failure.
+///
+/// A float holds numbers a smallint cannot, and saturating one of those into an
+/// `i64` hands `Oop::int` a word that is not a smallint at all. The world asks
+/// through `_FloatAsIntIfFail:` (`objects/core/float.self:284`) precisely
+/// because this is a conversion that can fail.
+fn as_smallint(f: f64) -> Result<i64, String> {
+    // 2^62, which is what `INT_MAX as f64` rounds up to anyway; a float below
+    // it truncates to a smallint, and NaN fails both comparisons
+    let lim = -(crate::heap::INT_MIN as f64);
+    if f >= -lim && f < lim {
+        Ok(f as i64)
+    } else {
+        Err("overflowError".into())
+    }
+}
+
+/// The width of a C integer in a byte vector, in bytes. The sizes are the ones
+/// the C++ VM has C types for (`prims/miscPrims.cpp:120`).
+fn c_int_size(v: &Value, who: &str) -> Result<usize, String> {
+    match as_i(v, who)? {
+        8 => Ok(1),
+        16 => Ok(2),
+        32 => Ok(4),
+        64 => Ok(8),
+        _ => Err("badSizeError".into()),
+    }
+}
+
+/// Where in a byte vector one sits: a byte index, and the whole width of it has
+/// to be inside (`prims/miscPrims.cpp:51`).
+fn c_int_at(recv: &Value, v: &Value, n: usize, who: &str) -> Result<usize, String> {
+    let i = as_i(v, who)?;
+    let o = as_obj(recv, who)?;
+    if !matches!(o.borrow().payload.kind(), PayKind::Bytes) {
+        return Err("badTypeError".into());
+    }
+    let len = indexable_len(recv, who)?;
+    if i < 0 || i as usize + n > len {
+        return Err("badIndexError".into());
+    }
+    Ok(i as usize)
+}
+
+/// A hash is a smallint, so it has 63 bits and not 64 to be in: `>> 2` is what
+/// leaves a positive one, and it drops the two bits a hash misses least -- the
+/// bottom of a float's mantissa, the bottom of the FNV mix.
 fn hash_of(v: &Value) -> i64 {
     match v {
         Value::Int(i) => *i,
-        Value::Float(f) => f.to_bits() as i64,
+        Value::Float(f) => (f.to_bits() >> 2) as i64,
         Value::Obj(o) => {
             if let Some(b) = o.borrow().payload.bytes() {
                 let mut h: u64 = 0xcbf29ce484222325;
                 for c in &b {
                     h = (h ^ *c as u64).wrapping_mul(0x100000001b3);
                 }
-                return (h >> 1) as i64;
+                return (h >> 2) as i64;
             }
             identity_hash(&Value::Obj(*o))
         }
@@ -296,9 +377,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
     let v = |x: Value| Ok(P::Val(x));
     match name {
         // ------------------------------------------------------ arithmetic
-        "_IntAdd:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntAdd:")(a.checked_add(b)), |a, b| a + b)?),
-        "_IntSub:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntSub:")(a.checked_sub(b)), |a, b| a - b)?),
-        "_IntMul:" => v(arith(name, recv, &args[0], |a, b| ovf("_IntMul:")(a.checked_mul(b)), |a, b| a * b)?),
+        "_IntAdd:" => v(arith(name, recv, &args[0], |a, b| ovf(a.checked_add(b)), |a, b| a + b)?),
+        "_IntSub:" => v(arith(name, recv, &args[0], |a, b| ovf(a.checked_sub(b)), |a, b| a - b)?),
+        "_IntMul:" => v(arith(name, recv, &args[0], |a, b| ovf(a.checked_mul(b)), |a, b| a * b)?),
         "_IntDiv:" => v(arith(
             name,
             recv,
@@ -307,7 +388,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 if b == 0 {
                     Err("divisionByZeroError".into())
                 } else {
-                    ovf("_IntDiv:")(a.checked_div(b))
+                    ovf(a.checked_div(b))
                 }
             },
             |a, b| a / b,
@@ -320,7 +401,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 if b == 0 {
                     Err("divisionByZeroError".into())
                 } else {
-                    ovf("_IntMod:")(a.checked_rem(b))
+                    ovf(a.checked_rem(b))
                 }
             },
             |a, b| a % b,
@@ -335,20 +416,28 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_IntOr:" => v(Value::Int(as_i(recv, name)? | as_i(&args[0], name)?)),
         "_IntXor:" => v(Value::Int(as_i(recv, name)? ^ as_i(&args[0], name)?)),
         "_IntArithmeticShiftLeft:" => {
-            let (a, b) = (as_i(recv, name)?, as_i(&args[0], name)?);
-            v(Value::Int(if b >= 64 { 0 } else { a << b }))
+            let (a, n) = (as_i(recv, name)?, shift_count(&args[0], name)?);
+            let r = in_field(a, |w| w.checked_shl(n).unwrap_or(0));
+            // "will fail with overflowError if the resulting number is too
+            // large to be represented as an integer" (`prims/prim.cpp:1083`)
+            if a != 0 && (n >= 63 || r >> n != a) {
+                return Err("overflowError".into());
+            }
+            v(Value::Int(r))
         }
         "_IntLogicalShiftLeft:" => {
-            let (a, b) = (as_i(recv, name)? as u64, as_i(&args[0], name)?);
-            v(Value::Int(if b >= 64 { 0 } else { (a << b) as i64 }))
+            let (a, n) = (as_i(recv, name)?, shift_count(&args[0], name)?);
+            v(Value::Int(in_field(a, |w| w.checked_shl(n).unwrap_or(0))))
         }
         "_IntLogicalShiftRight:" => {
-            let (a, b) = (as_i(recv, name)? as u64, as_i(&args[0], name)?);
-            v(Value::Int(if b >= 64 { 0 } else { (a >> b) as i64 }))
+            let (a, n) = (as_i(recv, name)?, shift_count(&args[0], name)?);
+            v(Value::Int(in_field(a, |w| w.checked_shr(n).unwrap_or(0))))
         }
         "_IntArithmeticShiftRight:" => {
-            let (a, b) = (as_i(recv, name)?, as_i(&args[0], name)?);
-            v(Value::Int(if b >= 64 { if a < 0 { -1 } else { 0 } } else { a >> b }))
+            let (a, n) = (as_i(recv, name)?, shift_count(&args[0], name)?);
+            // an arithmetic right shift only ever narrows, so the value needs
+            // no help staying inside the field; `a >> 63` is its sign fill
+            v(Value::Int(a.checked_shr(n).unwrap_or(a >> 63)))
         }
         // ---------------------------------------------------------- floats
         "_FloatAdd:" => v(Value::Float(as_f(recv, name)? + as_f(&args[0], name)?)),
@@ -374,15 +463,17 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_FloatGE:" => v(vm.boolean(as_f(recv, name)? >= as_f(&args[0], name)?)),
         "_FloatEQ:" => v(vm.boolean(as_f(recv, name)? == as_f(&args[0], name)?)),
         "_FloatNE:" => v(vm.boolean(as_f(recv, name)? != as_f(&args[0], name)?)),
-        "_FloatAsInt" | "_FloatTruncate" => v(Value::Int(as_f(recv, name)?.trunc() as i64)),
-        "_FloatFloor" => v(Value::Int(as_f(recv, name)?.floor() as i64)),
-        "_FloatCeil" => v(Value::Int(as_f(recv, name)?.ceil() as i64)),
-        "_FloatRound" => v(Value::Int(as_f(recv, name)?.round() as i64)),
+        "_FloatAsInt" | "_FloatTruncate" => v(Value::Int(as_smallint(as_f(recv, name)?.trunc())?)),
+        "_FloatFloor" => v(Value::Int(as_smallint(as_f(recv, name)?.floor())?)),
+        "_FloatCeil" => v(Value::Int(as_smallint(as_f(recv, name)?.ceil())?)),
+        "_FloatRound" => v(Value::Int(as_smallint(as_f(recv, name)?.round())?)),
         "_IntAsFloat" => v(Value::Float(as_i(recv, name)? as f64)),
         "_IntComplement" => v(Value::Int(!as_i(recv, name)?)),
         "_FloatFromInt32:" | "_FloatFromInt64:" => v(Value::Float(as_i(&args[0], name)? as f64)),
         "_FloatFromInt32" | "_FloatFromInt64" => v(Value::Float(as_i(recv, name)? as f64)),
-        "_Int32FromFloat:" | "_Int64FromFloat:" => v(Value::Int(as_f(&args[0], name)?.trunc() as i64)),
+        "_Int32FromFloat:" | "_Int64FromFloat:" => {
+            v(Value::Int(as_smallint(as_f(&args[0], name)?.trunc())?))
+        }
         "_FloatPrintString" => {
             let t = fmt_float(as_f(recv, name)?);
             v(vm.string(&t))
@@ -393,7 +484,7 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
             v(vm.string(&t))
         }
         "_AsFloat" => v(Value::Float(as_f(recv, name)?)),
-        "_AsInteger" => v(Value::Int(as_f(recv, name)? as i64)),
+        "_AsInteger" => v(Value::Int(as_smallint(as_f(recv, name)?.trunc())?)),
         "_Sqrt" => v(Value::Float(as_f(recv, name)?.sqrt())),
         "_Sin" => v(Value::Float(as_f(recv, name)?.sin())),
         "_Cos" => v(Value::Float(as_f(recv, name)?.cos())),
@@ -843,18 +934,29 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 }
                 None => return Err("noProcessError".into()),
             };
-            // the process we are displacing is a Rust local for the length of
-            // the run, and the world may hold it nowhere else
             let prev = vm.current_proc.replace(recv.clone());
+            // This is the one primitive that runs the interpreter, so it is the
+            // one place a collection happens *inside* a primitive -- and the
+            // process, the result vector and the process being displaced are all
+            // Rust locals of the send that got here, which no root walk reaches.
+            // Handing them to `temp_roots` is half of it: the collector rewrites
+            // the copies, so the copies are what has to be read back. Parking
+            // the process under the address it had before the run leaves
+            // `Vm::procs` naming a corpse, and the next scavenge trips over it
+            // rather than over anything nearby.
             let n_roots = vm.temp_roots.len();
+            vm.temp_roots.extend([*recv, args[0]]);
             vm.temp_roots.extend(prev);
             let outcome = crate::interp::run_stack(vm, &mut stack);
+            let recv = vm.temp_roots[n_roots];
+            let result = vm.temp_roots[n_roots + 1];
+            let prev = vm.temp_roots.get(n_roots + 2).copied();
             vm.temp_roots.truncate(n_roots);
             vm.current_proc = prev;
             let cause = match outcome {
                 Ok(crate::interp::Outcome::Yielded { rcvr, arg }) => {
-                    set_result(vm, &args[0], &[rcvr, arg])?;
-                    vm.put_proc(*recv, stack);
+                    set_result(vm, &result, &[rcvr, arg])?;
+                    vm.put_proc(recv, stack);
                     "yielded"
                 }
                 Ok(crate::interp::Outcome::Done(r)) => {
@@ -1010,6 +1112,44 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                 _ => unreachable!(),
             }
             v(*recv)
+        }
+        // A C integer inside a byte vector: native width, native byte order, as
+        // the C++ VM's `memcpy` of the C type (`prims/miscPrims.cpp:46`). The
+        // world stores a bigInt's digits through these, so without them
+        // `bigInt fromInt:` fails on its first digit and every promotion out of
+        // a smallint -- `1000 factorial` -- reports 'unexpectedly many digits'.
+        "_CSignedIntSize:At:" | "_CUnsignedIntSize:At:" => {
+            let n = c_int_size(&args[0], name)?;
+            let i = c_int_at(recv, &args[1], n, name)?;
+            let o = as_obj(recv, name)?.borrow();
+            let mut w = [0u8; 8];
+            for (k, b) in w[..n].iter_mut().enumerate() {
+                *b = o.payload.byte_at(i + k);
+            }
+            let u = u64::from_le_bytes(w);
+            let x = if name.starts_with("_CS") {
+                // sign-extend from the top of the field
+                let s = 64 - n * 8;
+                (((u << s) as i64) >> s) as i128
+            } else {
+                u as i128
+            };
+            if !(crate::heap::INT_MIN as i128..=crate::heap::INT_MAX as i128).contains(&x) {
+                // "Note: may fail with overflow error" (`prims/prim.cpp:378`)
+                return Err("overflowError".into());
+            }
+            v(Value::Int(x as i64))
+        }
+        "_CSignedIntSize:At:Put:" | "_CUnsignedIntSize:At:Put:" => {
+            let n = c_int_size(&args[0], name)?;
+            let i = c_int_at(recv, &args[1], n, name)?;
+            // truncated to the field, as the C++ VM's assignment to a C type is
+            let w = (as_i(&args[2], name)? as u64).to_le_bytes();
+            let o = as_obj(recv, name)?.borrow_mut();
+            for (k, b) in w[..n].iter().enumerate() {
+                o.payload.set_byte_at(i + k, *b);
+            }
+            v(Value::Int(0)) // "Returns zero"
         }
         // block copy, the workhorse behind copyFrom:UpTo: and friends
         "_CopyByteRangeDstPos:Src:SrcPos:Length:" | "_CopyRangeDstPos:Src:SrcPos:Length:" => {

@@ -335,6 +335,10 @@ pub fn run(vm: &mut Vm, scope: ObjRef) -> Result<Value, Unwind> {
                 let n_roots = vm.temp_roots.len();
                 vm.temp_roots.push(arg);
                 let failed = lending(vm, &mut frames, cause_of_error);
+                // that sent, so it may have collected: the action to run is
+                // wherever the collector put the copy, not where this local
+                // still says it is
+                let arg = vm.temp_roots[n_roots];
                 let sent = lending(vm, &mut frames, |vm| send(vm, arg, "doAction", vec![]));
                 vm.temp_roots.truncate(n_roots);
                 sent?;
@@ -562,6 +566,16 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         vm.temp_roots.extend_from_slice(&cur_args);
                         vm.temp_roots.extend(fail);
                         let called = lending(vm, frames, |vm| prims::call(vm, base, &cur_recv, &cur_args));
+                        // ...and it rewrites the copies it was given, not these
+                        // locals, so a local that outlives the call has to be
+                        // taken back from `temp_roots`. Only the fail block
+                        // does: every arm below assigns `cur_recv` and
+                        // `cur_args` before the loop reads them again. A stale
+                        // one would be a pointer into a space that has been
+                        // abandoned, which survives being read -- the scavenge
+                        // after the one that moved it is where it is noticed.
+                        let at_fail = n_roots + 1 + cur_args.len();
+                        fail = fail.map(|_| vm.temp_roots[at_fail]);
                         vm.temp_roots.truncate(n_roots);
                         match called {
                             Err(m) => match fail {
@@ -570,14 +584,20 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                         eprintln!("prim failed: {} -> {}", cur_sel, m);
                                     }
                                     // a fail block takes the error, and
-                                    // sometimes the primitive's name too
+                                    // sometimes the primitive's name too --
+                                    // the selector as it was sent, `IfFail:`
+                                    // and all, as `interpreter.cpp:485` pushes
+                                    // it. The world puts it in the message it
+                                    // reports, so naming the block's own
+                                    // selector there says nothing at all.
                                     let two = b.as_obj().map_or(false, |o| {
                                         o.borrow().find("value:With:").is_some()
                                     });
                                     let err_s = vm.string(&m);
                                     cur_args = if two {
+                                        let sent = vm.string(&cur_sel);
                                         cur_sel = "value:With:".into();
-                                        vec![err_s, vm.string(&cur_sel)]
+                                        vec![err_s, sent]
                                     } else {
                                         cur_sel = "value:".into();
                                         vec![err_s]
@@ -727,7 +747,16 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                         break;
                     }
 
-                    let m = match val.method() {
+                    // A method found in a slot is code and runs; a *block* found
+                    // in one is data and is simply answered. `updateBlock value:
+                    // o` reads the slot, then sends `value:` to what it holds --
+                    // and it is that send that runs the block, through the
+                    // `value...` slot every block carries a method object in
+                    // (`compile.rs:292`, `image_obj.rs:457`). Running it on the
+                    // read instead activates it with no arguments at all, which
+                    // is how a world full of `updateBlock`-shaped slots comes
+                    // apart: "'updateBlock' expects 1 arguments".
+                    let m = match val.method().filter(|_| !val.is_block()) {
                         None => {
                             frames.last_mut().unwrap().push(val);
                             break;

@@ -26,9 +26,30 @@ t check: 'negative' Is: -5 abs           Should: 5.
 t check: 'compare'  Is: 3 < 4            Should: true.
 t check: 'eq mixed' Is: 3 = 'x'          Should: false.
 t check: 'shift'    Is: 1 << 10          Should: 1024.
+"a shift runs over the smallint's 63 bits, not the machine's 64: a logical
+ right shift of -1 is the largest smallint, and a left shift that leaves the
+ field either wraps (logical) or fails (arithmetic), never escaping it"
+t check: 'lsr'      Is: (-1 _IntLogicalShiftRight: 1)  Should: 4611686018427387903.
+t check: 'lsr0'     Is: (-1 _IntLogicalShiftRight: 0)  Should: -1.
+t check: 'lsl wrap' Is: (1 _IntLogicalShiftLeft: 62)   Should: -4611686018427387904.
+t check: 'asl ovf'  Is: (1 _IntArithmeticShiftLeft: 62 IfFail: [|:e| 'ovf'])
+                    Should: 'ovf'.
+"a sum of two smallints can be too wide to be one, and a failing primitive
+ names its error the way the world spells it -- `traits smallInt` compares
+ against 'overflowError' and retries in bigInts when it matches -- and hands
+ the fail block the selector as it was sent"
+t check: 'add ovf'  Is: ((1 << 61) _IntAdd: (1 << 61) IfFail: [|:e| e])
+                    Should: 'overflowError'.
+t check: 'fail name' Is: (1 _IntDiv: 0 IfFail: [|:e. :n| n])
+                    Should: '_IntDiv:IfFail:'.
 t check: 'float'    Is: 2.0 ** 10        Should: 1024.0.
 
-"--- booleans and blocks"
+"--- booleans and blocks. A block in a data slot is data: reading the slot
+ answers the block, and only sending it `value` runs it. A method in a slot
+ is code, and reading the slot runs it"
+t check: 'blockslot' Is: [| o | o: (| b <- 0 |). o b: [|:x| x + 1].
+                          (o b) value: 41 ] value                     Should: 42.
+t check: 'methslot' Is: [| o | o: (| m = ( 7 ) |). o m ] value        Should: 7.
 t check: 'ifTrue'   Is: ((3 < 4) ifTrue: ['y'] False: ['n'])   Should: 'y'.
 t check: 'block0'   Is: [ 1 + 1 ] value                        Should: 2.
 t check: 'block2'   Is: ([|:a. :b| a * b] value: 6 With: 7)     Should: 42.
@@ -108,6 +129,17 @@ t check: 'inject'   Is: ((((vector copySize: 0) copyAddLast: 1) copyAddLast: 2)
                     Should: 3.
 t check: 'includes' Is: (((vector copySize: 1) at: 0 Put: 7) includes: 7)
                     Should: true.
+"a C integer inside a byte vector: the width is in bits, the index in bytes,
+ the order the machine's. This is what a bigInt keeps its digits in"
+t check: 'cint'     Is: [| b | b: 'abcd' copy.
+                          b _CUnsignedIntSize: 32 At: 0 Put: 305419896.
+                          b _CUnsignedIntSize: 32 At: 0 ] value       Should: 305419896.
+t check: 'cint sgn' Is: [| b | b: 'abcd' copy.
+                          b _CSignedIntSize: 8 At: 0 Put: 255.
+                          b _CSignedIntSize: 8 At: 0 ] value          Should: -1.
+t check: 'cint end' Is: [| b | b: 'abcd' copy.
+                          b _CUnsignedIntSize: 32 At: 1 IfFail: [|:e| e] ] value
+                    Should: 'badIndexError'.
 
 "--- loops run in constant space: whileTrue: recurses in tail position"
 t check: 'bigloop'  Is: ((| parent* = traits object.
