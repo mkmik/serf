@@ -2,7 +2,13 @@
 # serf test suite: the Self-level checks, then a full image round-trip.
 set -e
 cd "$(dirname "$0")"
-cargo build --release 2>&1 | grep -E '^(error|warning: unused)' && exit 1
+# The build's own exit status is what says it failed; the grep only adds unused
+# warnings to that. It used to be the whole check, and it read the failure off
+# the word `error` at the start of a line -- which CI colours, so `^error` never
+# matched there and a build that never produced a binary surfaced thirty lines
+# later as `./target/release/serf: not found`.
+out=$(cargo build --release --color never 2>&1) || { printf '%s\n' "$out"; exit 1; }
+printf '%s\n' "$out" | grep -E '^warning: unused' && exit 1
 cargo test --release --quiet
 # again in debug, so the `debug_assert`s the arena leans on actually run -- the
 # release build compiles out the check that a pointer lands in a live space
