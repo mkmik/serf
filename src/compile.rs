@@ -94,7 +94,13 @@ struct C<'a> {
 /// Compile one top-level statement into a runnable method.
 pub fn compile_statement(vm: &mut Vm, e: &Expr, file: &str) -> Result<Rc<Method>, String> {
     let _g = crate::gc::NoGc::new();
-    let o = ObjLit { args: vec![], slots: vec![], body: vec![e.clone()], line: stmt_line(e) };
+    let o = ObjLit {
+        args: vec![],
+        slots: vec![],
+        body: vec![e.clone()],
+        line: stmt_line(e),
+        anno: None,
+    };
     let file: Rc<str> = file.into();
     let mut c = C { vm, mbs: vec![], file: file.clone() };
     c.push_method(&o, "<top level>", false)
@@ -120,6 +126,7 @@ pub fn build_object(vm: &mut Vm, o: &ObjLit, file: &Rc<str>) -> Result<Value, St
         return Err("argument slots are only allowed in methods".into());
     }
     let mut slots = vec![];
+    let mut annos: Vec<(usize, &Vec<u8>)> = vec![];
     for d in &o.slots {
         let value = match &d.init {
             Some(Expr::ObjLit(inner)) if is_method_literal(inner) => {
@@ -130,8 +137,17 @@ pub fn build_object(vm: &mut Vm, o: &ObjLit, file: &Rc<str>) -> Result<Value, St
             None => vm.nil.clone(),
         };
         let kind = if d.parent { SlotKind::Parent } else { SlotKind::Data };
+        if let Some(a) = &d.anno {
+            annos.push((slots.len(), a));
+        }
         slots.push(Slot { name: d.name.as_str().into(), kind, value });
         if d.mutable {
+            // a world annotates the assignment slot the same as the slot it
+            // assigns: `globals modules vector directory:` carries the
+            // ModuleInfo `directory` does
+            if let Some(a) = &d.anno {
+                annos.push((slots.len(), a));
+            }
             slots.push(Slot {
                 name: format!("{}:", d.name).as_str().into(),
                 kind: SlotKind::Assign,
@@ -139,7 +155,18 @@ pub fn build_object(vm: &mut Vm, o: &ObjLit, file: &Rc<str>) -> Result<Value, St
             });
         }
     }
-    Ok(Value::obj(slots, Payload::None))
+    let mut v = Value::obj(slots, Payload::None);
+    // an object with no annotations has no room for them, so the first one
+    // widens it -- which moves it, and a Rust local is not a root
+    for (i, a) in annos {
+        let a = vm.bytes_with(vm.t_string.clone(), a.clone());
+        v = vm.set_slot_anno(v, i, a);
+    }
+    if let Some(a) = &o.anno {
+        let a = vm.bytes_with(vm.t_string.clone(), a.clone());
+        v = vm.set_obj_anno(v, a);
+    }
+    Ok(v)
 }
 
 /// What a parsed body evaluates to: a method if it has code, otherwise the
@@ -166,7 +193,7 @@ fn is_method_literal(o: &ObjLit) -> bool {
 /// Slot initializers are evaluated when the literal is created, as in
 /// Expr::Eval in the C++ parser.
 fn eval_const(vm: &mut Vm, e: &Expr, file: &Rc<str>) -> Result<Value, String> {
-    let o = ObjLit { args: vec![], slots: vec![], body: vec![e.clone()], line: 0 };
+    let o = ObjLit { args: vec![], slots: vec![], body: vec![e.clone()], line: 0, anno: None };
     let m = compile_method(vm, &o, "<slot initializer>", file)?;
     let lobby = vm.lobby.clone();
     let scope = interp::new_scope(m, lobby, lobby, &[], None);
@@ -400,8 +427,11 @@ impl<'a> C<'a> {
         if args.len() == 1 && sel.ends_with(':') && sel.matches(':').count() == 1 {
             let base = &sel[..sel.len() - 1];
             if let Some((lvl, idx, mutable)) = self.resolve(base) {
+                // a constant local has no assignment slot, so `foo: x` beside
+                // a `foo = ...` is an ordinary send and lands on the receiver
+                // -- vector.self has a local `error` and sends `error:`
                 if !mutable {
-                    return Err(format!("'{}' is a constant slot and cannot be assigned", base));
+                    return Ok(false);
                 }
                 self.expr(&args[0])?;
                 if lvl > 0 {

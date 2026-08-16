@@ -908,7 +908,9 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         }
         "_MirrorCopyAnnotation:" => {
             let r = reflectee(recv)?;
-            vm.set_obj_anno(r, args[0]);
+            // the reflectee widens, so it moves; the mirror holding it is a heap
+            // object, which `switch_pointers` finds
+            let _ = vm.set_obj_anno(r, args[0]);
             v(*recv)
         }
         // add or replace a slot on a copy of the reflectee, answering a
@@ -1350,10 +1352,24 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         // in the heap and every root to it. `put_slot` answers where the
         // object went, because a `Value` in a Rust local is neither.
         "_AddSlots:" => {
-            let src: Vec<Slot> = as_obj(&args[0], name)?.borrow().slots.iter().collect();
+            let from = as_obj(&args[0], name)?;
+            let src: Vec<Slot> = from.borrow().slots.iter().collect();
+            // a slot's annotation travels with the slot: a fileout writes the
+            // ModuleInfo on the slots of a literal and `addSlotsTo:From:`
+            // moves them onto the object that keeps them
+            let annos: Vec<Option<Value>> =
+                (0..src.len()).map(|i| crate::value::slot_anno(from, i)).collect();
             let mut dst = *recv;
-            for s in src {
+            for (s, anno) in src.into_iter().zip(annos) {
+                let name = s.name;
                 dst = vm.put_slot(dst, s);
+                if let Some(a) = anno {
+                    // the widening moves the object, so take the answer back
+                    let i = dst.as_obj().and_then(|o| o.borrow().find(sym_str(name)));
+                    if let Some(i) = i {
+                        dst = vm.set_slot_anno(dst, i, a);
+                    }
+                }
             }
             v(dst)
         }
@@ -1440,6 +1456,38 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
                     Err("primitiveFailedError".into())
                 }
             }
+        }
+
+        // Read a file of Self expressions and run them, answering the last
+        // one's value -- run_script_prim, which is how `bootstrap read:From:`
+        // reads a module out of `objects/`. The expressions run against the
+        // world's lobby, as evalExpressions does.
+        "_RunScript" => {
+            let path = recv.as_str().ok_or("badTypeError")?;
+            let src = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let stmts = crate::parser::parse_script(&src)?;
+            let lobby = vm.image_roots.as_ref().map_or_else(|| vm.lobby.clone(), |r| r[0].clone());
+            // the lobby and the answer are Rust locals across a run of the
+            // interpreter, which collects; `temp_roots` holds them and the
+            // collector rewrites the copies, so the copies are what to read
+            let n_roots = vm.temp_roots.len();
+            vm.temp_roots.extend([lobby, vm.nil_v()]);
+            for e in &stmts {
+                let m = crate::compile::compile_statement(vm, e, &path)?;
+                let lobby = vm.temp_roots[n_roots];
+                let scope = crate::interp::new_scope(m, lobby, lobby, &[], None);
+                match crate::interp::run(vm, scope) {
+                    Ok(r) => vm.temp_roots[n_roots + 1] = r,
+                    Err(u) => {
+                        let m = crate::interp::describe(vm, u);
+                        vm.temp_roots.truncate(n_roots);
+                        return Err(m);
+                    }
+                }
+            }
+            let last = vm.temp_roots[n_roots + 1];
+            vm.temp_roots.truncate(n_roots);
+            v(last)
         }
 
         // ------------------------------------------------------------- i/o

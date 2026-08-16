@@ -2,6 +2,42 @@
 
 Known, reproducible, not fixed. One section each; delete a section when it goes.
 
+## Six of `objects/core`'s 135 modules do not file in
+
+`bootstrap read: 'M' From: 'core'` against a loaded `core.snap`, with
+`bootstrap selfObjectsWorkingDir: 'reference/self/objects'` first:
+
+| module | |
+|---|---|
+| `bytecodeFormat`, `absBCInterpreter`, `int32and64` | `badTypeError` from a slot initializer -- some primitive is refusing an argument, and the report does not say which |
+| `generatedCases` | `selector must be a string`, from a *loaded* method in `errorHandling.self` -- so the module's own error is lost behind a second gap in the world's error path |
+| `shortcuts` | `'p': parent slots are not allowed in a method` -- serf's compiler refuses one, the C++ `create_outerMethod` does not |
+| `tty` | never returns |
+
+Every one of them parses; these are runtime and compiler gaps, not syntax.
+The other 129 re-file and leave the world running.
+
+## A module that reads a sub-module ends up sharing its object
+
+`about.self` ends with `bootstrap read: 'coreVersion' From: 'core'`, and after
+filing it in, the two modules are one object:
+
+```sh
+./target/release/serf --load core.snap --run \
+  "(globals modules about) _Eq: (globals modules coreVersion)"          # false
+./target/release/serf --load core.snap --run \
+  "bootstrap selfObjectsWorkingDir: 'reference/self/objects'.
+   bootstrap read: 'about' From: 'core'.
+   (globals modules about) _Eq: (globals modules coreVersion)"          # true
+```
+
+So `bootstrap stub -> 'globals' -> 'modules' -> 'coreVersion' -> ()` answered
+the object the enclosing module was defined into. The stub protocol
+(`objects/core/init.self`, `followThrough:IfNeedToMakeObject:`) walks the
+world with `_MirrorContentsAt:IfFail:` and `_MirrorDefine:`, and a define is
+`switch_pointers` here -- something in that pair loses which object is which.
+A module with no sub-parts, `vector`, files in correctly.
+
 ## The interpreter is ~1.3x slower than the cell heap
 
 Measured against the last pre-flip commit (2411e7f), built as its own binary:

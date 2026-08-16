@@ -30,8 +30,17 @@ use value::{default_print_string, Value, Vm};
 
 const INIT: &str = include_str!("../self/init.self");
 
-fn eval_source(vm: &mut Vm, src: &[u8], file: &str, echo: bool) -> Result<(), String> {
-    for e in parser::parse_program(src)? {
+/// `script` is what tells a file from a string: a file's statements are
+/// separated by newlines as well as by periods. See `lexer::lex_script`.
+fn eval_source(
+    vm: &mut Vm,
+    src: &[u8],
+    file: &str,
+    echo: bool,
+    script: bool,
+) -> Result<(), String> {
+    let parsed = if script { parser::parse_script(src)? } else { parser::parse_program(src)? };
+    for e in parsed {
         let m = compile::compile_statement(vm, &e, file)?;
         // once an image is loaded, everything runs in its world
         let lobby = vm.image_roots.as_ref().map_or_else(|| vm.lobby.clone(), |r| r[0].clone());
@@ -589,7 +598,7 @@ fn main() {
     }
 
     let mut vm = Vm::new();
-    if let Err(e) = eval_source(&mut vm, INIT.as_bytes(), "init.self", false) {
+    if let Err(e) = eval_source(&mut vm, INIT.as_bytes(), "init.self", false, true) {
         eprintln!("bootstrap failed: {}", e);
         std::process::exit(1);
     }
@@ -757,7 +766,7 @@ fn main() {
             "-e" => {
                 i += 1;
                 let src = args.get(i).cloned().unwrap_or_default();
-                if let Err(e) = eval_source(&mut vm, src.as_bytes(), "<-e>", true) {
+                if let Err(e) = eval_source(&mut vm, src.as_bytes(), "<-e>", true, false) {
                     eprintln!("{}", e);
                     std::process::exit(1);
                 }
@@ -780,7 +789,7 @@ fn main() {
                         // booting a snapshot lands you at a prompt, unless the
                         // command line already says what to do
                         interactive = !args.iter().any(|a| a == "-e");
-                    } else if let Err(e) = eval_source(&mut vm, &src, f, false) {
+                    } else if let Err(e) = eval_source(&mut vm, &src, f, false, true) {
                         eprintln!("{}", e);
                         std::process::exit(1);
                     }

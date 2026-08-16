@@ -734,15 +734,16 @@ pub fn slot_anno(o: ObjRef, i: usize) -> Option<Value> {
 impl Vm {
     /// Give an object an annotation. An object that has never had one has no
     /// room for it, so this reshapes it -- which means every pointer to it
-    /// moves, exactly as adding a slot does.
-    pub fn set_obj_anno(&mut self, o: Value, a: Value) {
-        let Some(at) = o.as_obj() else { return };
+    /// moves, exactly as adding a slot does, and this answers where it went.
+    pub fn set_obj_anno(&mut self, o: Value, a: Value) -> Value {
+        let Some(at) = o.as_obj() else { return o };
         let wide = obj::annotate(at);
         if wide != at {
             self.switch(at, wide);
         }
         heap::set_obj_anno(wide, obj::to_oop(a));
         record_if_old(wide);
+        Value::Obj(wide)
     }
 
     /// Annotating an object that has no room for annotations widens it, and a
