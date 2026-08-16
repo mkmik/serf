@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # run-tests.sh runs the heap and obj tests under Miri too -- that is what
+      # says the `unsafe` in heap.rs is sound rather than merely untested. It
+      # skips silently when nightly is absent, so install it rather than let CI
+      # quietly cover none of it. Nightly goes first: this action makes the
+      # toolchain it installs the default, and the suite builds on stable.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: dtolnay/rust-toolchain@stable
+      # The X11 foreign-call check needs a display; the suite brings up its own
+      # Xvfb and skips when the binary is missing.
+      - run: sudo apt-get update -qq && sudo apt-get install -qq -y xvfb
+      - run: ./run-tests.sh
+
+  # Every merge to main is a minor release. Lives here rather than in its own
+  # workflow so it inherits `needs: test` instead of re-running the suite.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Two merges landing at once would both bump from the same base version.
+    concurrency: release
+    permissions:
+      contents: write # push the bump commit, tag, and GitHub release
+      id-token: write # crates.io trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      # Cargo reads the version from the checked-in file, so the bump has to be
+      # a real commit on main; the tag alone would publish the previous version.
+      - run: cargo set-version --bump minor
+      - id: v
+        run: |
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0] | "v=\(.version)\nname=\(.name)"' >> "$GITHUB_OUTPUT"
+
+      # Before the push, so a registry or trusted-publishing problem fails while
+      # main is still untouched rather than after it has been bumped and tagged.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      # Each of the three steps below asks whether its artifact already exists,
+      # so re-running a failed run resumes instead of colliding. Safe because
+      # checkout is pinned to the run's own commit, making the bump
+      # deterministic: a re-run always computes the same version.
+      #
+      # The tag is what we resume from, not the commit -- a re-run's commit
+      # differs by timestamp alone, so comparing SHAs would never match. The
+      # content check is what makes trusting the tag safe.
+      - run: |
+          if git fetch origin "refs/tags/v$V:refs/tags/v$V" 2>/dev/null; then
+            git diff --quiet "v$V" || {
+              echo "::error::v$V exists but its tree differs from this run's bump"
+              exit 1
+            }
+            echo "v$V is already pushed; resuming from it"
+            git reset --hard "v$V"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "Release $V"
+            git tag -a "v$V" -m "v$V"
+            # GITHUB_TOKEN by design does not trigger workflows, which is what
+            # keeps this push from re-triggering the job forever.
+            git push origin HEAD:main "v$V"
+          fi
+        env:
+          V: ${{ steps.v.outputs.v }}
+
+      # Still after the push: a failed publish leaves a tag with no crate, and
+      # either a re-run or the next merge moves things forward. Publishing first
+      # and then failing to push would strand a version that main does not know
+      # it used, and every later run would collide with it.
+      # crates.io answers 403 to curl's default User-Agent, which would make an
+      # already-published version look absent and send us into a publish that
+      # can only fail -- hence the explicit agent and the status check.
+      - run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "User-Agent: $NAME release workflow (github.com/$GITHUB_REPOSITORY)" \
+            "https://crates.io/api/v1/crates/$NAME/$V")
+          case "$code" in
+            200) echo "$NAME $V is already on crates.io" ;;
+            404) cargo publish --locked ;;
+            *)   echo "::error::crates.io returned $code for $NAME $V"; exit 1 ;;
+          esac
+        env:
+          NAME: ${{ steps.v.outputs.name }}
+          V: ${{ steps.v.outputs.v }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - run: gh release view "v$V" >/dev/null 2>&1 || gh release create "v$V" --generate-notes
+        env:
+          V: ${{ steps.v.outputs.v }}
+          GH_TOKEN: ${{ github.token }}
