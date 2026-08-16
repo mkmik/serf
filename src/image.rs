@@ -10,7 +10,8 @@
 //! as objects is `image_obj.rs`.
 //!
 //! ponytail: compressed snapshots are piped through the filter the header names,
-//! the way the C++ VM does, instead of linking a gzip crate. Code zones are
+//! the way the C++ VM does, instead of linking a gzip crate -- and out through
+//! `gzip` again on write, so what serf saves is a quarter of the size. Code zones are
 //! still refused: `Snapshot code: y` images hold i386 machine code that is
 //! meaningless here (the C++ VM regenerates it anyway).
 
@@ -26,6 +27,9 @@ pub const VM_MINOR: i32 = 1;
 pub const STRING_TABLE_SIZE: usize = 20011;
 pub const NUM_VM_STRINGS: usize = 182;
 pub const IDEALIZED_PAGE: u32 = 8192;
+/// what serf writes, and what the shipped snapshots already name
+pub const COMPRESSION_FILTER: &str = "gzip";
+pub const DECOMPRESSION_FILTER: &str = "zcat";
 
 /// `APPLY_TO_VM_OOPS`, in order.
 pub const VM_OOP_NAMES: [&str; 40] = [
@@ -147,6 +151,8 @@ pub struct Snapshot {
     pub vm_date: String,
     pub sizes: [i32; 7],
     pub page_aligned: bool,
+    /// true if the binary section came through a decompression filter
+    pub compressed: bool,
     pub maps_canonical: bool,
     pub vm_oops: Vec<u32>,
     pub tenuring_threshold: u32,
@@ -170,6 +176,19 @@ mod tests {
         let s = super::Snapshot::read(&p).unwrap();
         assert_eq!(s.vm_oops.len(), super::VM_OOP_NAMES.len());
         assert!(s.old.iter().any(|s| !s.objs.is_empty()));
+    }
+
+    /// and what the writer gzips must come back out of the reader unchanged
+    #[test]
+    fn writes_a_compressed_snapshot() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Clean-4.4.snap");
+        let s = super::Snapshot::read(&p).unwrap();
+        let out = std::env::temp_dir().join(format!("serf-write-{}.snap", std::process::id()));
+        s.write(&out).unwrap();
+        let back = super::Snapshot::read(&out).unwrap();
+        std::fs::remove_file(&out).unwrap();
+        assert!(back.compressed && !back.page_aligned);
+        assert_eq!(back.binary_section().unwrap(), s.binary_section().unwrap());
     }
 }
 
@@ -239,11 +258,16 @@ fn decompress(body: &[u8], filter: &str) -> Result<Vec<u8>, String> {
             filter, KNOWN
         ));
     }
+    pipe_through(filter, body)
+}
+
+/// Feed the binary tail through an external filter and collect what comes back.
+fn pipe_through(filter: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     let mut child = Command::new(filter)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run the decompression filter {:?}: {}", filter, e))?;
+        .map_err(|e| format!("cannot run the filter {:?}: {}", filter, e))?;
     let mut sink = child.stdin.take().expect("stdin was piped");
     // the tail is megabytes and the pipe holds a few pages, so feed the filter
     // while its output is being read, or both ends block forever
@@ -253,9 +277,26 @@ fn decompress(body: &[u8], filter: &str) -> Result<Vec<u8>, String> {
     })
     .map_err(|e| format!("{}: {}", filter, e))?;
     if !out.status.success() {
-        return Err(format!("{} failed to decompress the snapshot: {}", filter, out.status));
+        return Err(format!("{} failed on the snapshot's binary section: {}", filter, out.status));
     }
     Ok(out.stdout)
+}
+
+/// The binary section, decompressed if the header named a filter: the bytes the
+/// reader really parses. Two snapshots hold the same world when these match --
+/// the header text and the compression around them are only framing.
+pub fn tail(data: &[u8]) -> Result<Vec<u8>, String> {
+    let marker = BINARY_MARKER.as_bytes();
+    let split = data
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .ok_or("not a Self snapshot: no binary-data marker")?;
+    let body = &data[split + marker.len()..];
+    let head = String::from_utf8_lossy(&data[..split]);
+    match head.lines().find_map(|l| l.strip_prefix("Decompression filter: ")) {
+        Some(f) => decompress(body, f.trim()),
+        None => Ok(body.to_vec()),
+    }
 }
 
 fn ascii_field<'a>(lines: &mut std::slice::Iter<'a, &'a str>, key: &str) -> Result<&'a str, String> {
@@ -417,6 +458,7 @@ impl Snapshot {
             vm_date,
             sizes,
             page_aligned,
+            compressed,
             maps_canonical,
             vm_oops,
             tenuring_threshold,
@@ -432,12 +474,16 @@ impl Snapshot {
 
     // ----------------------------------------------------------------- writing
 
+    /// Write a snapshot with its binary section gzipped, the way the shipped
+    /// images are: a world is mostly zeros and pointers, so it is a third of
+    /// the size, and the reader pipes it back through `zcat`.
     pub fn write(&self, path: &Path) -> Result<(), String> {
-        let bytes = self.to_bytes()?;
-        std::fs::write(path, bytes).map_err(|e| format!("{}: {}", path.display(), e))
+        let mut o = self.header();
+        o.extend_from_slice(&pipe_through(COMPRESSION_FILTER, &self.binary_section()?)?);
+        std::fs::write(path, o).map_err(|e| format!("{}: {}", path.display(), e))
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+    fn header(&self) -> Vec<u8> {
         let mut o: Vec<u8> = vec![];
         o.extend_from_slice(HEADER_LINE.as_bytes());
         o.extend_from_slice(format!("Version: {}.{}.{}\n", self.major, self.minor, self.version).as_bytes());
@@ -447,10 +493,17 @@ impl Snapshot {
         for (i, name) in SPACE_SIZE_NAMES.iter().enumerate() {
             o.extend_from_slice(format!("{}: {}\n", name, self.sizes[i]).as_bytes());
         }
-        o.extend_from_slice(b"Compressed: n\n");
+        o.extend_from_slice(b"Compressed: y\n");
+        o.extend_from_slice(format!("Compression filter: {}\n", COMPRESSION_FILTER).as_bytes());
+        o.extend_from_slice(format!("Decompression filter: {}\n", DECOMPRESSION_FILTER).as_bytes());
         o.extend_from_slice(b"Page aligned: n\n");
         o.extend_from_slice(BINARY_MARKER.as_bytes());
+        o
+    }
 
+    /// Everything after the binary-data marker, uncompressed: see `tail`.
+    pub fn binary_section(&self) -> Result<Vec<u8>, String> {
+        let mut o: Vec<u8> = vec![];
         let w = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
 
         push_delim(&mut o, "Misc data");
