@@ -793,7 +793,8 @@ mod tests {
     #[test]
     fn a_miniature_world_survives_being_collected() {
         let t_object = make(&[], Payload::None, false);
-        let t_string = make(&[s("parent", SlotKind::Parent, Val::Obj(t_object))], Payload::None, false);
+        let t_string =
+            make(&[s("parent", SlotKind::Parent, Val::Obj(t_object))], Payload::None, false);
         let greeting = make(
             &[s("parent", SlotKind::Parent, Val::Obj(t_string))],
             Payload::Bytes(b"hello: 720".to_vec()),
@@ -827,11 +828,8 @@ mod tests {
             Payload::None,
             false,
         );
-        let lobby = make(
-            &[s("globals", SlotKind::Parent, Val::Obj(globals))],
-            Payload::None,
-            false,
-        );
+        let lobby =
+            make(&[s("globals", SlotKind::Parent, Val::Obj(globals))], Payload::None, false);
 
         let h = heap::heap();
         let mut w = World { regs: vec![lobby] };
@@ -861,7 +859,11 @@ mod tests {
             let b = items[2].as_obj().expect("the block is gone");
             let a = block_scope(b).expect("the block lost its activation");
             let held = act_local(a, 0).as_obj().expect("the activation lost its local");
-            assert_eq!(bytes(held), Some(b"hello: 720".to_vec()), "round {round}: through the block");
+            assert_eq!(
+                bytes(held),
+                Some(b"hello: 720".to_vec()),
+                "round {round}: through the block"
+            );
             assert!(Rc::ptr_eq(&act_method(a), &m), "the activation lost its method");
         }
         assert!(h.old_live() > 0, "nothing in the world was ever tenured");

@@ -37,15 +37,95 @@ extern "C" {
 /// answers this name and the world reads it: `while_EINTR_do:IfFail:` retries
 /// on 'EINTR', and the console waits when a non-blocking read says 'EAGAIN'.
 const ERRNO_NAMES: &[&str] = &[
-    "NOERR", "EPERM", "ENOENT", "ESRCH", "EINTR", "EIO", "ENXIO", "E2BIG", "ENOEXEC", "EBADF",
-    "ECHILD", "EDEADLK", "ENOMEM", "EACCES", "EFAULT", "ENOTBLK", "EBUSY", "EEXIST", "EXDEV", "ENODEV",
-    "ENOTDIR", "EISDIR", "EINVAL", "ENFILE", "EMFILE", "ENOTTY", "ETXTBSY", "EFBIG", "ENOSPC", "ESPIPE",
-    "EROFS", "EMLINK", "EPIPE", "EDOM", "ERANGE", "EAGAIN", "EINPROGRESS", "EALREADY", "ENOTSOCK", "EDESTADDRREQ",
-    "EMSGSIZE", "EPROTOTYPE", "ENOPROTOOPT", "EPROTONOSUPPORT", "ESOCKTNOSUPPORT", "ENOTSUP", "EPFNOSUPPORT", "EAFNOSUPPORT", "EADDRINUSE", "EADDRNOTAVAIL",
-    "ENETDOWN", "ENETUNREACH", "ENETRESET", "ECONNABORTED", "ECONNRESET", "ENOBUFS", "EISCONN", "ENOTCONN", "ESHUTDOWN", "ETOMANYREFS",
-    "ETIMEDOUT", "ECONNREFUSED", "ELOOP", "ENAMETOOLONG", "EHOSTDOWN", "EHOSTUNREACH", "ENOTEMPTY", "EPROCLIM", "EUSERS", "EDQUOT",
-    "ESTALE", "EREMOTE", "EBADRPC", "ERPCMISMATCH", "EPROGUNAVAIL", "EPROGMISMATCH", "EPROCUNAVAIL", "ENOLCK", "ENOSYS", "EFTYPE",
-    "EAUTH", "ENEEDAUTH", "EPWROFF", "EDEVERR", "EOVERFLOW", "EBADEXEC", "EBADARCH", "ESHLIBVERS", "EBADMACHO",
+    "NOERR",
+    "EPERM",
+    "ENOENT",
+    "ESRCH",
+    "EINTR",
+    "EIO",
+    "ENXIO",
+    "E2BIG",
+    "ENOEXEC",
+    "EBADF",
+    "ECHILD",
+    "EDEADLK",
+    "ENOMEM",
+    "EACCES",
+    "EFAULT",
+    "ENOTBLK",
+    "EBUSY",
+    "EEXIST",
+    "EXDEV",
+    "ENODEV",
+    "ENOTDIR",
+    "EISDIR",
+    "EINVAL",
+    "ENFILE",
+    "EMFILE",
+    "ENOTTY",
+    "ETXTBSY",
+    "EFBIG",
+    "ENOSPC",
+    "ESPIPE",
+    "EROFS",
+    "EMLINK",
+    "EPIPE",
+    "EDOM",
+    "ERANGE",
+    "EAGAIN",
+    "EINPROGRESS",
+    "EALREADY",
+    "ENOTSOCK",
+    "EDESTADDRREQ",
+    "EMSGSIZE",
+    "EPROTOTYPE",
+    "ENOPROTOOPT",
+    "EPROTONOSUPPORT",
+    "ESOCKTNOSUPPORT",
+    "ENOTSUP",
+    "EPFNOSUPPORT",
+    "EAFNOSUPPORT",
+    "EADDRINUSE",
+    "EADDRNOTAVAIL",
+    "ENETDOWN",
+    "ENETUNREACH",
+    "ENETRESET",
+    "ECONNABORTED",
+    "ECONNRESET",
+    "ENOBUFS",
+    "EISCONN",
+    "ENOTCONN",
+    "ESHUTDOWN",
+    "ETOMANYREFS",
+    "ETIMEDOUT",
+    "ECONNREFUSED",
+    "ELOOP",
+    "ENAMETOOLONG",
+    "EHOSTDOWN",
+    "EHOSTUNREACH",
+    "ENOTEMPTY",
+    "EPROCLIM",
+    "EUSERS",
+    "EDQUOT",
+    "ESTALE",
+    "EREMOTE",
+    "EBADRPC",
+    "ERPCMISMATCH",
+    "EPROGUNAVAIL",
+    "EPROGMISMATCH",
+    "EPROCUNAVAIL",
+    "ENOLCK",
+    "ENOSYS",
+    "EFTYPE",
+    "EAUTH",
+    "ENEEDAUTH",
+    "EPWROFF",
+    "EDEVERR",
+    "EOVERFLOW",
+    "EBADEXEC",
+    "EBADARCH",
+    "ESHLIBVERS",
+    "EBADMACHO",
 ];
 
 // `errno` is a macro over a per-thread location, and the function behind it is
@@ -239,12 +319,29 @@ const TWAINS_RESULT_SIZE: i64 = 27;
 /// Flags the C++ VM exposes to tune its compilers and diagnostics.
 fn is_vm_flag(name: &str) -> bool {
     const FLAGS: &[&str] = &[
-        "_CheckAssertions", "_WizardMode", "_NakedMethods", "_PrintCompiledCode",
-        "_VMProfiling", "_VMCompilerProfiling", "_UseLRUInterrupts", "_Inline",
-        "_CountSends", "_SaveOutgoingArgsOfPatchedFrames", "_Trace", "_Spy",
-        "_LogVMMessages", "_PrintFlags", "_Verbose", "_TraceLookup",
-        "_DebugPrims", "_SICDeferUncommonBranches", "_UseInlineCaching",
-        "_CompileWithSICNames", "_BugHunt", "_ShowSICCode", "_PrintInlining",
+        "_CheckAssertions",
+        "_WizardMode",
+        "_NakedMethods",
+        "_PrintCompiledCode",
+        "_VMProfiling",
+        "_VMCompilerProfiling",
+        "_UseLRUInterrupts",
+        "_Inline",
+        "_CountSends",
+        "_SaveOutgoingArgsOfPatchedFrames",
+        "_Trace",
+        "_Spy",
+        "_LogVMMessages",
+        "_PrintFlags",
+        "_Verbose",
+        "_TraceLookup",
+        "_DebugPrims",
+        "_SICDeferUncommonBranches",
+        "_UseInlineCaching",
+        "_CompileWithSICNames",
+        "_BugHunt",
+        "_ShowSICCode",
+        "_PrintInlining",
     ];
     let base = name.trim_end_matches(':');
     FLAGS.contains(&base)
@@ -265,7 +362,8 @@ fn lookup_path(vm: &Vm, path: &[&str]) -> Option<Value> {
 fn make_mirror(vm: &Vm, on: &Value) -> Result<Value, String> {
     let roots = vm.image_roots.as_ref().ok_or("_Mirror needs a loaded image")?;
     let proto = roots[mirror_proto_index(vm, on)].clone();
-    let slots: Vec<Slot> = proto.as_obj().ok_or("reflectTypeError")?.borrow().slots.iter().collect();
+    let slots: Vec<Slot> =
+        proto.as_obj().ok_or("reflectTypeError")?.borrow().slots.iter().collect();
     Ok(Value::obj(slots, Payload::Mirror(*on)))
 }
 
@@ -363,11 +461,22 @@ fn mirror_proto_index(vm: &Vm, v: &Value) -> usize {
             let b = o.borrow();
             match b.payload.kind() {
                 PayKind::Bytes => {
-                    if b.slots.iter().any(|s| s.kind == SlotKind::Parent && s.value.id_eq(&vm.t_string)) { 29 } else { 22 }
+                    if b.slots
+                        .iter()
+                        .any(|s| s.kind == SlotKind::Parent && s.value.id_eq(&vm.t_string))
+                    {
+                        29
+                    } else {
+                        22
+                    }
                 }
                 PayKind::Vector => 26,
                 PayKind::Method => {
-                    if b.payload.method().is_some_and(|m| m.is_block) { 24 } else { 23 }
+                    if b.payload.method().is_some_and(|m| m.is_block) {
+                        24
+                    } else {
+                        23
+                    }
                 }
                 PayKind::Block => 21,
                 PayKind::Mirror => 36,
@@ -571,7 +680,8 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         "_ByteAt:Put:" => call(vm, "_At:Put:", recv, args),
         "_ByteVectorConcatenate:Prototype:" => {
             let a = recv.bytes().ok_or("_ByteVectorConcatenate: receiver is not a byte vector")?;
-            let b = args[0].bytes().ok_or("_ByteVectorConcatenate: argument is not a byte vector")?;
+            let b =
+                args[0].bytes().ok_or("_ByteVectorConcatenate: argument is not a byte vector")?;
             let mut z = a;
             z.extend_from_slice(&b);
             let slots: Vec<Slot> = as_obj(&args[1], name)?.borrow().slots.iter().collect();
@@ -684,7 +794,10 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         // its enclosing method's, sliced by offset and length. This is what an
         // outliner shows when you expand a slot holding code. A mirror on a
         // block *object* fails, as blockMap inherits Map's refusal.
-        "_MirrorSource" | "_MirrorSourceOffset" | "_MirrorSourceLength" | "_MirrorCodes"
+        "_MirrorSource"
+        | "_MirrorSourceOffset"
+        | "_MirrorSourceLength"
+        | "_MirrorCodes"
         | "_MirrorLiterals" => {
             let r = reflectee(recv)?;
             let m = as_obj(&r, name)?.borrow().payload.method().ok_or("reflectTypeError")?;
@@ -800,7 +913,8 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
         }
         // add or replace a slot on a copy of the reflectee, answering a
         // mirror on that copy
-        "_MirrorCopyAt:Put:IsParent:IsArgument:Annotation:" | "_MirrorCopyAddSlot:Contents:IsParent:IsArgument:" => {
+        "_MirrorCopyAt:Put:IsParent:IsArgument:Annotation:"
+        | "_MirrorCopyAddSlot:Contents:IsParent:IsArgument:" => {
             let r = reflectee(recv)?;
             let n = as_name(&args[0], name)?;
             let parent = args.get(2).map_or(false, |b| b.id_eq(&vm.boolean(true)));
@@ -1401,10 +1515,7 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
         }
         return Ok(P::Val(Value::obj([], Payload::Proxy(Some(0)))));
     }
-    if prim
-        .split_once("_delete")
-        .is_some_and(|(_, sel)| sel == "delete" || sel == "basicDelete")
-    {
+    if prim.split_once("_delete").is_some_and(|(_, sel)| sel == "delete" || sel == "basicDelete") {
         as_obj(recv, name)?.borrow_mut().payload.set_proxy(None);
         return Ok(P::Val(recv.clone()));
     }
@@ -1479,10 +1590,8 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
     let (cname, ret, argtypes): (&str, &str, &[&str]) = match sig {
         Some(e) => (e.1, e.2, e.3),
         None => {
-            let (f, cut) = vm
-                .ffi
-                .split_glue(prim)
-                .ok_or_else(|| format!("unknown primitive '{}'", name))?;
+            let (f, cut) =
+                vm.ffi.split_glue(prim).ok_or_else(|| format!("unknown primitive '{}'", name))?;
             let sel = &prim[cut..];
             return untyped_glue(vm, name, f, sel, recv, args);
         }
@@ -1499,10 +1608,9 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
     let f = if handled_here {
         std::ptr::null_mut()
     } else {
-        vm.ffi
-            .sym(cname)
-            .or_else(|| vm.ffi.sym(&format!("X{}", cname)))
-            .ok_or_else(|| format!("primitiveNotDefinedError: no C function '{}' for '{}'", cname, name))?
+        vm.ffi.sym(cname).or_else(|| vm.ffi.sym(&format!("X{}", cname))).ok_or_else(|| {
+            format!("primitiveNotDefinedError: no C function '{}' for '{}'", cname, name)
+        })?
     };
 
     // receiver is the first declared argument
@@ -1683,7 +1791,12 @@ fn math_glue(cname: &str) -> Option<fn(f64, f64) -> f64> {
 /// Hand-written wrappers the C++ VM defines itself. `read_wrap`/`write_wrap`
 /// take a buffer plus its length and an offset, and bounds-check before
 /// touching the file descriptor.
-fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result<Option<P>, String> {
+fn native_wrap(
+    vm: &mut Vm,
+    cname: &str,
+    recv: &Value,
+    args: &[Value],
+) -> Result<Option<P>, String> {
     // libm takes and answers C doubles, which the integer-register call path
     // carries in neither direction. Rust's f64 has every one of them.
     if let Some(f) = math_glue(cname) {
@@ -1731,10 +1844,8 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
         const MS_PER_DAY: u64 = 1000 * 60 * 60 * 24;
         let e = proxy_ptr(recv).ok_or("deadProxyError")? as usize;
         let t = unsafe { *((e + TIME_OFFSET) as *const u64) };
-        let v = vm.vector(vec![
-            Value::Int((t / MS_PER_DAY) as i64),
-            Value::Int((t % MS_PER_DAY) as i64),
-        ]);
+        let v = vm
+            .vector(vec![Value::Int((t / MS_PER_DAY) as i64), Value::Int((t % MS_PER_DAY) as i64)]);
         return Ok(Some(P::Val(v)));
     }
     // These take the coordinates as two Self vectors and pass XPoints, so they
@@ -1767,8 +1878,7 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
             return Err("different number of x and y coordinates".into());
         }
         // XPoint is two shorts
-        let pts: Vec<i16> =
-            xs.iter().zip(&ys).flat_map(|(x, y)| [*x as i16, *y as i16]).collect();
+        let pts: Vec<i16> = xs.iter().zip(&ys).flat_map(|(x, y)| [*x as i16, *y as i16]).collect();
         let n = xs.len() as u64;
         let p = pts.as_ptr() as u64;
         let fill = cname == "XFillPolygon_wrap";
@@ -1815,7 +1925,10 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
                 let i = (y * w + x) as usize;
                 if put {
                     let p = map.get(px.byte_at(i) as usize).copied().unwrap_or(0);
-                    crate::ffi::Ffi::call(f as *mut _, &[img as u64, x as u64, y as u64, p as u64])?;
+                    crate::ffi::Ffi::call(
+                        f as *mut _,
+                        &[img as u64, x as u64, y as u64, p as u64],
+                    )?;
                 } else {
                     let p = crate::ffi::Ffi::call(f as *mut _, &[img as u64, x as u64, y as u64])?;
                     px.set_byte_at(i, p as u8);
@@ -1915,10 +2028,7 @@ fn native_wrap(vm: &mut Vm, cname: &str, recv: &Value, args: &[Value]) -> Result
     if !vm.ffi.is_loaded() {
         let _ = vm.ffi.load("libc.dylib");
     }
-    let f = vm
-        .ffi
-        .sym(if rw { "write" } else { "read" })
-        .ok_or("primitiveNotDefinedError")?;
+    let f = vm.ffi.sym(if rw { "write" } else { "read" }).ok_or("primitiveNotDefinedError")?;
     // read and write want a C pointer, and the arena is ours. Bounce through
     // a Rust buffer: a write copies out of the object, a read copies back in.
     let p = o.borrow_mut().payload;

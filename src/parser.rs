@@ -20,13 +20,7 @@ pub enum Expr {
     Float(f64),
     Str(Vec<u8>),
     SelfE,
-    Send {
-        recv: Option<Box<Expr>>,
-        sel: String,
-        args: Vec<Expr>,
-        kind: SendKind,
-        line: u32,
-    },
+    Send { recv: Option<Box<Expr>>, sel: String, args: Vec<Expr>, kind: SendKind, line: u32 },
     ObjLit(Box<ObjLit>),
     Block(Box<ObjLit>),
     Return(Box<Expr>),
@@ -239,7 +233,13 @@ impl Parser {
             let line = self.line();
             self.i += 1;
             let arg = self.unary()?;
-            e = Expr::Send { recv: Some(Box::new(e)), sel: op, args: vec![arg], kind: SendKind::Normal, line };
+            e = Expr::Send {
+                recv: Some(Box::new(e)),
+                sel: op,
+                args: vec![arg],
+                kind: SendKind::Normal,
+                line,
+            };
         }
         Ok(e)
     }
@@ -249,7 +249,13 @@ impl Parser {
         while let Tok::Name(n) = self.tok().clone() {
             let line = self.line();
             self.i += 1;
-            e = Expr::Send { recv: Some(Box::new(e)), sel: n, args: vec![], kind: SendKind::Normal, line };
+            e = Expr::Send {
+                recv: Some(Box::new(e)),
+                sel: n,
+                args: vec![],
+                kind: SendKind::Normal,
+                line,
+            };
         }
         Ok(e)
     }
@@ -264,13 +270,31 @@ impl Parser {
             return self.err("expected a message after '.'");
         }
         match self.tok().clone() {
-            Tok::Int(v) => { self.i += 1; Ok(Expr::Int(v)) }
-            Tok::Float(v) => { self.i += 1; Ok(Expr::Float(v)) }
-            Tok::Str(v) => { self.i += 1; Ok(Expr::Str(v)) }
-            Tok::SelfKw => { self.i += 1; Ok(Expr::SelfE) }
+            Tok::Int(v) => {
+                self.i += 1;
+                Ok(Expr::Int(v))
+            }
+            Tok::Float(v) => {
+                self.i += 1;
+                Ok(Expr::Float(v))
+            }
+            Tok::Str(v) => {
+                self.i += 1;
+                Ok(Expr::Str(v))
+            }
+            Tok::SelfKw => {
+                self.i += 1;
+                Ok(Expr::SelfE)
+            }
             Tok::Name(n) => {
                 self.i += 1;
-                Ok(Expr::Send { recv: None, sel: n, args: vec![], kind: SendKind::ImplicitSelf, line })
+                Ok(Expr::Send {
+                    recv: None,
+                    sel: n,
+                    args: vec![],
+                    kind: SendKind::ImplicitSelf,
+                    line,
+                })
             }
             Tok::LParen => {
                 self.i += 1;
@@ -347,7 +371,12 @@ impl Parser {
                     args.push(a);
                 }
                 let body = self.method_body(args)?;
-                o.slots.push(SlotDecl { name: op, parent: false, mutable: false, init: Some(body) });
+                o.slots.push(SlotDecl {
+                    name: op,
+                    parent: false,
+                    mutable: false,
+                    init: Some(body),
+                });
                 Ok(())
             }
             Tok::Kw(k) => {
@@ -361,7 +390,12 @@ impl Parser {
                     args.push(self.slot_arg_name()?);
                 }
                 let body = self.method_body(args)?;
-                o.slots.push(SlotDecl { name: sel, parent: false, mutable: false, init: Some(body) });
+                o.slots.push(SlotDecl {
+                    name: sel,
+                    parent: false,
+                    mutable: false,
+                    init: Some(body),
+                });
                 Ok(())
             }
             _ => self.err("expected a slot"),
