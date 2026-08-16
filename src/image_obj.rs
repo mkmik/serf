@@ -1330,6 +1330,7 @@ impl<'a> Builder<'a> {
                 512 * 1024,
             ],
             page_aligned: false,
+            compressed: true, // Snapshot::write gzips
             maps_canonical: true,
             vm_oops,
             tenuring_threshold: as_smi(8),

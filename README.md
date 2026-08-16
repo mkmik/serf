@@ -61,6 +61,7 @@ stdout, which needs Self processes. Use `-e`, which prints the result itself, or
 ./target/release/serf world.self --save w.snap        # write a snapshot
 ./target/release/serf --load core.snap --save w.snap  # round-trip a real one
 ./target/release/serf --verify-image w.snap           # bytes + structural walk
+./target/release/serf --recompress in.snap out.snap   # gzip one without booting it
 ./target/release/serf --dump-image w.snap             # header, spaces, object walk
 ./target/release/serf --load w.snap --stats           # summary of the reachable graph
 ./target/release/serf --load w.snap --prims           # primitives the image calls
@@ -261,19 +262,24 @@ string test compared against *serf's* `traits string` rather than the image's;
 and each block minted a duplicate of its value method object.
 
 The C++ VM is 32-bit i386 and cannot run here, so verification is serf's own:
-`--verify-image` re-serialises a snapshot and requires the bytes back identical,
-then walks every space linearly the way the C++ enumeration does, computing each
-object's size from its map — the objects must tile the region exactly. (That
-check earned its keep: it found a map word being written over the shared
-assignment object.) `run-tests.sh` additionally saves a world with methods,
-blocks, closures and recursion, reloads it, and runs it.
+`--verify-image` re-serialises a snapshot and requires the binary section back
+byte for byte — gzip framing aside, so the shipped compressed images are held to
+serf's writer as well: `Clean-4.4.snap`, written by the C++ VM, re-serialises to
+the same 18,608,852 bytes. It then walks every space linearly the way the C++
+enumeration does, computing each object's size from its map — the objects must
+tile the region exactly. (That check earned its keep: it found a map word being
+written over the shared assignment object.) `run-tests.sh` additionally saves a
+world with methods, blocks, closures and recursion, reloads it, and runs it.
 
 Caveats before pointing this at a real Self 4 world:
 
 * Integers must fit Self's 30-bit `smi` and floats its 30-bit float; `--save`
   errors rather than truncating.
 * A block still bound to a home activation is refused by `--save`.
-* Compressed images and `Snapshot code: y` images are refused on read.
+* A compressed image is piped through the decompression filter its header names
+  (from a short allowlist); `Snapshot code: y` images are refused on read.
+* Everything serf writes is gzipped and compact, the shipped snapshots' own form,
+  so saving needs `gzip` on the path.
 * An image written from serf's own small world is well-formed but has nothing for
   the C++ VM to boot into — round-tripping a real image is the useful path.
 * Only reachable objects are carried over, so a round trip collects garbage.
@@ -285,9 +291,9 @@ Caveats before pointing this at a real Self 4 world:
 
 ## Running the Morphic GUI
 
-`morphic.snap` is 16.8 MB, 328,307 objects, 163,743 reachable from the lobby. It
-boots to the world's own console, and the world's Morphic desktop draws on a real
-X server.
+`morphic.snap` is 3.9 MB gzipped (16.7 MB of heap), 328,307 objects, 163,743
+reachable from the lobby. It boots to the world's own console, and the world's
+Morphic desktop draws on a real X server.
 
 ```sh
 export DISPLAY=/private/tmp/com.apple.launchd.XXXXXXXX/org.xquartz:0   # XQuartz
