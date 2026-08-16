@@ -1,64 +1,61 @@
 # serf — a Self VM in Rust
 
-A from-scratch Self implementation: scanner, parser, bytecode compiler, and a
-bytecode interpreter, plus a small world written in Self. No JIT, no
-dependencies. Built and tested on macOS arm64; it is portable Rust, so any
-target `rustc` supports should work.
+A from-scratch Self implementation: scanner, parser, bytecode compiler,
+interpreter, generational collector, the C++ VM's snapshot format, and a small
+world written in Self. No JIT, no dependencies. Built and tested on macOS
+arm64; it is portable Rust, so any target `rustc` supports should work.
 
-All of it is safe Rust except `src/heap.rs`, which is where the object heap is
-being rebuilt on direct tagged pointers — a moving collector cannot be written
-in safe Rust, and confining that to one module is the point. That module is a
-complete generational collector, checked under Miri; the VM still runs on the
-older cell heap in `src/gc.rs` until it is ported onto it. See
-[MEMORY.md](MEMORY.md).
+`unsafe` lives in four modules and nowhere else: `heap.rs` (a moving collector
+cannot be written in safe Rust), `ffi.rs` and the X11 glue in `prims.rs`
+(foreign calls), and `metrics.rs` (a counting `GlobalAlloc`). The heap is
+checked under Miri.
 
 ```sh
 cargo build --release
 ```
 
 Paths below like `vm/…` and `objects/…` refer to the C++ Self implementation at
-<https://github.com/russellallen/self>. The snapshots in this repo —
-`Clean-4.4.snap` as shipped there, and `core.snap`/`morphic.snap` built from
-`objects/` by that VM — carry the Self copyright; see [LICENSE.self](LICENSE.self).
-
-That implementation is vendored as a git submodule under `reference/self`, so
-those paths resolve locally — `reference/self/vm/…`, `reference/self/objects/…` —
-as a reference and test bench while implementing serf:
+<https://github.com/russellallen/self>, vendored as a submodule under
+`reference/self`:
 
 ```sh
 git submodule update --init          # or clone with --recurse-submodules
 ```
 
-### serf's own world
+The snapshots in this repo — `Clean-4.4.snap` as shipped there, and
+`core.snap`, `morphic.snap` and `gas.snap` written by that VM — carry the Self
+copyright; see [LICENSE.self](LICENSE.self).
+
+## Running it
 
 ```sh
 ./target/release/serf                 # REPL, Ctrl-D to leave
 ./target/release/serf -e '3 + 4 * 2'  # 14 -- binary sends have no precedence
 ./target/release/serf file.self       # run a file
 ./target/release/serf file.self -i    # run it, then drop into the REPL
-./target/release/serf self/test.self  # 46 checks, non-zero exit on failure
-./run-tests.sh                        # everything below, as far as it applies
+./target/release/serf self/test.self  # 81 tests, non-zero exit on failure
+./run-tests.sh                        # unit tests, Miri, the Self checks, GC
+                                      # checks, image round-trips, X11
 ```
 
 ### A C++-format image
 
-`--load` binds the image's lobby as `snapshotLobby`; `-e` prints each
-statement's value; `--run` evaluates with the image's lobby as `self`.
+`--load` binds the image's lobby as `snapshotLobby`; `--run` evaluates with that
+lobby as `self`; `-e` prints each statement's value. Naming an image
+positionally instead *boots* it, as `Self -s` does — the world takes the
+process over from there, so nothing after it on the command line runs.
 
 ```sh
-./target/release/serf morphic.snap        # boot an image: banner, then a prompt
-                                          # in that world, as `Self -s` does
-./target/release/serf morphic.snap -e 'desktop worlds size'   # or drive it directly
+./target/release/serf morphic.snap                    # boot: banner, then the
+                                                      # world's own prompt
+./target/release/serf --load morphic.snap --run 'desktop worlds size'
 ./target/release/serf --load core.snap --run '3 + 4'
 ./target/release/serf --load core.snap -e "(snapshotLobby _SlotAt: 'traits') _SlotNames _Size"
-./target/release/serf --load core.snap -e "((snapshotLobby _SlotAt: 'traits') _SlotAt: 'smallInt') _SlotNames"
 ```
 
 `printLine` does **not** work on a loaded world: it goes through that world's
-stdout, which needs Self processes. Use `-e`, which prints the result itself,
-or `'...' _StringPrint` for explicit output.
-
-Reading, writing and inspecting images:
+stdout, which needs Self processes. Use `-e`, which prints the result itself, or
+`'...' _StringPrint`.
 
 ```sh
 ./target/release/serf world.self --save w.snap        # write a snapshot
@@ -79,9 +76,9 @@ DISPLAY=:99 ./target/release/serf self/x11-demo.self   # opens a window, draws
 DISPLAY=:99 xwd -root -silent > shot.xwd               # look at the result
 ```
 
-`run-tests.sh` runs that demo against an `Xvfb` it starts itself, so the suite
-never pops a window. `SERF_X11=real ./run-tests.sh` uses `$DISPLAY` instead
-(XQuartz, a visible window); `SERF_X11=off` skips it.
+`run-tests.sh` runs that demo against an `Xvfb` it starts itself.
+`SERF_X11=real` uses `$DISPLAY` instead (XQuartz, a visible window);
+`SERF_X11=off` skips it.
 
 ## What it is
 
@@ -91,21 +88,23 @@ never pops a window. `SERF_X11=real ./run-tests.sh` uses `$DISPLAY` instead
 | `src/parser.rs` | grammar, after `vm/src/any/parser/parser.cpp` |
 | `src/compile.rs` | bytecodes, the set from `vm/src/any/parser/byteCodes.hh` |
 | `src/interp.rs` | the interpreter loop, after `vm/src/any/interpreter/` |
-| `src/value.rs` | objects, slots, and the multiple-parent lookup |
-| `src/prims.rs` | primitives (`_IntAdd:`, `_Clone`, `_AddSlots:`, …) |
-| `src/gc.rs` | the object heap: a generational collector, after `memory/` |
-| `src/heap.rs` | the arena and collector the heap is being rebuilt on: tagged pointers, one allocation |
-| `src/metrics.rs` | Prometheus metrics for it, over a one-page HTTP server |
+| `src/heap.rs` | the arena and the collector: tagged pointers, one allocation |
+| `src/obj.rs` | the Self object laid out in that arena: slots, payloads, fields |
+| `src/gc.rs` | when a collection may run, and what it is allowed to see |
+| `src/value.rs` | the `Vm`, slots, lookup across multiple parents, maps |
+| `src/prims.rs` | primitives (`_IntAdd:`, `_Clone`, `_AddSlots:`, …) and X11 glue |
+| `src/ffi.rs` | resolving glue primitives against a shared library by name |
 | `src/image.rs` | snapshot file format, after `memory/universe.cpp` and `space.cpp` |
 | `src/image_obj.rs` | snapshot words <-> serf objects: maps, slot descriptors, layout |
+| `src/metrics.rs` | Prometheus metrics, over a one-page HTTP server |
 | `self/init.self` | the world: traits object/boolean/block/number/indexable |
 
 Object model as in the C++ VM: prototypes, no classes; slots are data, parent
 (`p* = x`) or assignment (`x <- 3` also makes `x:`); a slot holding code is a
 method, activated on lookup; lookup searches the receiver then all parents in
 parallel and reports an ambiguity if two distinct slots match. Blocks are
-objects with a `value`/`value:`/`value:With:` slot closed over the enclosing
-activation; `^` returns from the home method.
+objects with a `value`/`value:`/… slot closed over the enclosing activation;
+`^` returns from the home method.
 
 Bytecodes are Self's: 4-bit opcode, 4-bit index, wider indices shifted in by
 `INDEX_CODE` prefixes; `LEXICAL_LEVEL` before a local access; `DELEGATEE` and
@@ -113,98 +112,87 @@ the undirected-resend flag before a send.
 
 Two things worth knowing about the interpreter:
 
-* Activations live in a `Vec`, not on the Rust stack, so Self recursion is
-  bounded by memory (500k frames, then a clean error) rather than by a segfault.
+* Frames live in a `Vec`, not on the Rust stack, so Self recursion is bounded by
+  memory (500k frames, then a clean error) rather than by a segfault. The
+  activations themselves are heap objects, operand stack included.
 * A send in tail position always reuses the caller's frame, which is why
   `whileTrue:` — genuine recursion in Self — runs in constant space. An
-  activation that tail-calls has not returned, so the callee's frame carries
-  it: a `^` out of one of its blocks finds the continuation there and returns
-  through it. (Before there was a collector this was decided by asking whether
-  anything else still held the scope, which only worked because `Rc` freed a
-  discarded block immediately.)
+  activation that tail-calls has not returned, so the callee's frame carries it:
+  a `^` out of one of its blocks finds the continuation there and returns
+  through it.
+
+Known problems that are reproducible and not fixed live in [OPEN.md](OPEN.md).
 
 ## Maps, and what a send caches on
 
 A send caches what lookup found, and the question is what to key that on. The
 receiver's identity is the wrong answer: a loop over a thousand clones of one
 prototype presents a thousand receivers and misses every time. The C++ VM keys
-on the receiver's *map* — `MethodLookupKey` "adds the receiver map to that
-info, and is specific to a given receiver map" (`lookup/key.hh:49`) — and serf
-now does the same.
+on the receiver's *map* (`lookup/key.hh:49`), and so does serf.
 
 serf's map is the shape a lookup depends on: every slot's name and kind, plus
 the value of every **parent** slot, since a search recurses into those. A data
 slot's value is not in it, because it cannot change what a lookup finds. Shapes
-are interned, so two objects of one shape name the same `MapRef`. On a real
-world that is `core.snap`'s 69,954 objects across 6,062 shapes, and morphic's
-138,202 across 12,828 — about one shape per eleven objects.
+are interned, so two objects of one shape name the same `MapRef` — `core.snap`
+is 6,064 shapes over its reachable graph, one per 11.5 objects; morphic 12,830,
+one per 10.8.
 
 Each send site keeps one entry and probes it twice: the same receiver as last
 time answers without touching the object at all, and a *different* receiver of
 the same shape answers after one deref to read its map. The first is what a
 monomorphic site wants; the second is the one receiver keying could never make.
-A loop cloning a prototype and sending to the clone goes from 800,186 misses to
-221, and 0.36s to 0.30s; an integer loop, which the identity probe already
-handled, is unchanged.
 
 ```sh
-SERF_MEM_TRACE=1 ./target/release/serf …    # mallocs, frees and bytes at exit
-SERF_MAP_VERIFY=1 ./target/release/serf …   # check every memoised map against
-                                            # a freshly computed shape, so a
+SERF_MAP_VERIFY=1 ./target/release/serf …   # check every memoised map against a
+                                            # freshly computed shape, so a
                                             # mutation that changed a shape
                                             # without saying so fails on the spot
 ```
 
-```
-serf_maps_total                     distinct shapes interned
-serf_send_site_hits_total           inline cache probes that hit
-serf_send_site_map_hits_total       ...of those, the ones that hit on the shape
-                                    of a receiver the site had never seen --
-                                    exactly what receiver keying would have missed
-serf_send_site_misses_total
-```
-
-Known problems that are reproducible and not fixed live in [OPEN.md](OPEN.md).
-
 ## Garbage collection
 
-Generation Scavenging, as in `memory/`: a young generation of two semispaces
-that surviving objects are copied between, and an old generation swept by mark
-and sweep. An object that survives two scavenges is tenured. A `Value` is a
-handle — an index into a table saying where the object currently is — so moving
-an object is one table store and no reference anywhere else changes. That is
-also what makes `_Define` cheap: the C++ VM scans the whole heap to switch
-pointers (`memory/universe.cpp:315`), serf assigns.
+Generation Scavenging, as in `memory/`: one arena of direct tagged pointers, a
+young generation of two semispaces that survivors are copied between, and an old
+generation swept by mark and sweep. An object that survives two scavenges is
+tenured. There is no handle table — a `Value` *is* the pointer — so a scavenge
+leaves a forwarding pointer behind and updates every reference it scans. That is
+also the bill `_AddSlots:` pays: adding a slot widens an object, which means
+rebuilding it and walking the heap to switch pointers
+(`memory/universe.cpp:315`), affordable only because it happens while a world is
+being programmed, not while it runs.
 
-Old objects that are written to are remembered, so a scavenge scans them and
-not the whole old generation; the remembered set is exact rather than
-card-marked, because `ObjRef::borrow_mut` is the only way to mutate an object
-and can therefore do the recording itself.
+Old objects that are written to are remembered, so a scavenge scans them and not
+the whole old generation; the remembered set is exact rather than card-marked,
+because every field write goes through `obj::record_if_old` and can do the
+recording itself.
 
 Allocation never collects: it fills the young space and asks for a collection,
-which happens at a safepoint between two bytecodes, where every live reference
-is reachable from the `Vm`. The interpreter lends its activation stack to the
-`Vm` across anything that can re-enter it, and image load, image save and
-compilation — which keep half-built graphs in Rust locals — suspend collection
-outright.
+which happens at a safepoint between two bytecodes, where every live reference is
+reachable from the `Vm`. The interpreter lends its activation stack to the `Vm`
+across anything that can re-enter it, and image load, image save and compilation
+— which keep half-built graphs in Rust locals — suspend collection outright.
 
-What the collector does *not* manage is what an object contains: slot vectors
-past the fourth, byte payloads, methods and activations are still Rust
-allocations, at 1.9M `malloc`s per test run. [MEMORY.md](MEMORY.md) designs the
-replacement — direct tagged pointers, one arena, every Self-universe entity in
-it, activations included.
+The arena is one allocation, sized up front (`SERF_HEAP_WORDS`), and it holds
+the whole Self universe: slots, payloads, methods, activations, annotations,
+identity hashes. What is meant to be left on `malloc` is the exemption list in
+[MEMORY.md](MEMORY.md) — the symbol table, VM-side caches, the compiler's AST,
+foreign buffers — but the interpreter has not reached that yet: a 200k-iteration
+loop still makes about 1.4M of them, seven per iteration. It also runs ~1.3x
+slower than the handle-table heap it replaced, which is [OPEN.md](OPEN.md).
 
 ```sh
-SERF_GC=off      ./target/release/serf …   # never collect
-SERF_GC_STRESS=1 ./target/release/serf …   # collect after every allocation and
-                                           # never recycle a handle, so touching
-                                           # a missed root panics on the spot
-SERF_GC_VERIFY=1 ./target/release/serf …   # scan every old object, not just the
-                                           # remembered ones: one that was
-                                           # written without the barrier firing
-                                           # fails the run
-SERF_GC_STATS=1  ./target/release/serf …   # a line per collection
-SERF_GC_YOUNG=n  ./target/release/serf …   # objects per semispace (65536)
+SERF_GC=off          ./target/release/serf …   # never collect
+SERF_GC_STRESS=1     ./target/release/serf …   # collect after every allocation, so
+                                               # touching a missed root fails at once
+SERF_GC_VERIFY=1     ./target/release/serf …   # scan every old object, not just the
+                                               # remembered ones: one written without
+                                               # the barrier firing fails the run
+SERF_HEAP_VERIFY=1   ./target/release/serf …   # walk every space before and after
+                                               # each collection
+SERF_GC_STATS=1      ./target/release/serf …   # a line per collection
+SERF_YOUNG_WORDS=n   ./target/release/serf …   # words per semispace (512k)
+SERF_OLD_WORDS=n     ./target/release/serf …   # old generation reserve (16M words)
+SERF_MEM_TRACE=1     ./target/release/serf …   # mallocs, frees and bytes at exit
 ```
 
 `memory scavenge` and `memory garbageCollect` work from Self, through
@@ -212,215 +200,160 @@ SERF_GC_YOUNG=n  ./target/release/serf …   # objects per semispace (65536)
 
 ### Metrics
 
-Every VM serves Prometheus metrics on a port the OS picks, so any number of
-them can run at once, and says which on startup:
+Every VM serves Prometheus metrics on a port the OS picks, so any number of them
+can run at once, and says which on startup:
 
 ```
 $ ./target/release/serf morphic.snap
 serf: metrics on http://127.0.0.1:53318/metrics
 ```
 
-```
-serf_gc_collections_total{generation="young"}         37
-serf_gc_pause_seconds_bucket{generation="young",…}    histogram of pauses
-serf_gc_pause_seconds_max{generation="young"}         0.001746208
-serf_gc_objects_allocated_total                       1867249
-serf_gc_objects_freed_total                           1866756
-serf_gc_objects_promoted_total                        491
-serf_gc_young_objects / serf_gc_old_objects           heap occupancy
-serf_gc_young_capacity_objects                        65536
-serf_gc_remembered_objects                            2
-```
-
-A collection is stop-the-world — one thread, and it only runs at a safepoint —
-so `serf_gc_pause_seconds` is the whole pause, not a component of it.
-`SERF_METRICS=off` to keep the port shut.
+`serf_gc_collections_total`, `serf_gc_pause_seconds` (histogram and `_max`),
+`serf_gc_objects_{allocated,freed,promoted}_total`,
+`serf_gc_{young,old,remembered}_objects`, `serf_gc_young_capacity_objects`,
+`serf_maps_total`, `serf_switch_pointers_total`,
+`serf_send_site_{hits,map_hits,misses}_total`, `serf_mem_{mallocs,frees}_total`,
+`serf_mem_malloc_bytes_total`. A collection is stop-the-world — one thread, and
+it only runs at a safepoint — so `serf_gc_pause_seconds` is the whole pause, not
+a component of it. `SERF_METRICS=off` keeps the port shut.
 
 ## Images
 
 `--save` and `--load` read and write the C++ VM's snapshot format: the ASCII
 header, then a raw dump of the 32-bit tagged heap, the canonical string table
 (20011 buckets, `hashpjw`), the 182 `VMString[]` handles and the vtbl table.
-Reading rebuilds serf objects from the heap's maps -- slot descriptors become
-slots, `obj` slots read the object's words, a constant slot holding an
-assignment object becomes an assignable slot, and method maps become serf
-methods whose bytecodes the interpreter runs directly (it is the same
-instruction set). Writing goes the other way: it canonicalises a map per
-distinct object shape, lays out one old space, and rebuilds the string table.
-
-The two hard sections are empty by construction: with `Snapshot code: n` the
-C++ `zone::write_snapshot` writes nothing, and `Process::write_snapshot` is a
-no-op in the C++ VM as well.
+Reading rebuilds serf objects from the heap's maps — slot descriptors become
+slots, `obj` slots read the object's words, a constant slot holding an assignment
+object becomes an assignable slot, and method maps become serf methods whose
+bytecodes the interpreter runs directly, since it is the same instruction set.
+Writing goes the other way: it canonicalises a map per distinct object shape,
+lays out one old space, and rebuilds the string table. The two hard sections are
+empty by construction — with `Snapshot code: n` the C++ `zone::write_snapshot`
+writes nothing, and `Process::write_snapshot` is a no-op there too.
 
 ### Checked against a real world
 
-`core.snap` is an 8.4 MB image built from `objects/` by
-`worldBuilder.self` on a VM compiled from `vm/`. serf reads it, walks all
-185,644 objects, reaches 69,940 from the lobby, runs its methods, and writes
-it back out. Round-tripping it reproduces the reachable graph exactly: same
-objects, slots, parent slots, assignment slots, annotations, methods,
-bytecodes, literals, blocks, vectors, and the same checksum over every integer
-and float. `run-tests.sh` asserts that whenever `core.snap` is present.
+`core.snap` is an 8.4 MB image built from `objects/` by `worldBuilder.self` on a
+VM compiled from `vm/`. serf reads it, walks all 185,644 objects, reaches 82,613
+from the lobby, runs its methods, and writes it back out. Round-tripping it
+reproduces the reachable graph exactly: same objects, slots, parent slots,
+assignment slots, annotations, methods, bytecodes, literals, blocks, vectors, and
+the same checksum over every integer and float. `run-tests.sh` asserts that
+whenever `core.snap` is present.
 
-That world found nine bugs that the synthetic tests could not:
+That world found nine bugs the synthetic tests could not, the two that mattered
+most being:
 
-* `blockMethodMap` adds `_sourceOffset` and `_sourceLen`, so its slot
-  descriptors start 11 words into the map, not 9 -- which is why it overrides
-  `slots()` in `codeSlotsMap.hh`. The reader desynchronised after 6,963 objects.
-* The writer emitted the 9-word form of that map, so its own images desynced.
-* **Assignment slots did not exist.** Self stores only the data slot and
-  derives `x:` from that slot being an *obj* slot
-  (`slotDesc::assignment_slot_name`, `assert(is_obj_slot(), ...)`). The whole
-  world decoded with zero assignable slots, so nothing in a loaded world could
-  be written to. There are 90,033 of them.
-* An arg slot's `data` is its **index into the argument list**, not a word
-  offset into the object, and argument order comes from that index rather than
-  from the slot's position in the map.
-* Every map annotation was dropped -- 206k maps carry one, so a round trip lost
-  every comment, category and module-info in the world.
-* Mirrors, proxies, processes and vframes were demoted to plain slots objects.
-* Method slot flags were lost: block methods' lexical-parent slots (8,626 of
-  them) came back as ordinary data slots, and constant slots became per-object.
-* Loaded strings were written back as byte vectors, because the string test
-  compared against *serf's* `traits string` rather than the image's.
-* Each block minted a duplicate copy of its value method object.
+* **Assignment slots did not exist.** Self stores only the data slot and derives
+  `x:` from that slot being an *obj* slot (`slotDesc::assignment_slot_name`). The
+  whole world decoded with zero assignable slots, so nothing in a loaded world
+  could be written to. There are 90,038 of them.
+* `blockMethodMap` adds `_sourceOffset` and `_sourceLen`, so its slot descriptors
+  start 11 words into the map, not 9 — which is why it overrides `slots()` in
+  `codeSlotsMap.hh`. The reader desynchronised after 6,963 objects; the writer
+  emitted the 9-word form, so its own images desynced too.
 
-Verification, given the C++ VM is 32-bit i386 and cannot run here:
-`--verify-image` re-serialises a snapshot and requires the bytes to come back
-identical, then walks every space linearly the way the C++ enumeration does,
-computing each object's size from its map -- the objects must tile the region
-exactly. (That check earned its keep: it found a map word being written over
-the shared assignment object.) `run-tests.sh` additionally saves a world with
-methods, blocks, closures and recursion, reloads it, and runs it.
+The rest: an arg slot's `data` is its index into the argument list, not a word
+offset; every map annotation was dropped (206,214 maps carry one); mirrors,
+proxies, processes and vframes were demoted to plain slots objects; method slot
+flags were lost; loaded strings were written back as byte vectors, because the
+string test compared against *serf's* `traits string` rather than the image's;
+and each block minted a duplicate of its value method object.
 
-Caveats worth knowing before pointing this at a real Self 4 world:
+The C++ VM is 32-bit i386 and cannot run here, so verification is serf's own:
+`--verify-image` re-serialises a snapshot and requires the bytes back identical,
+then walks every space linearly the way the C++ enumeration does, computing each
+object's size from its map — the objects must tile the region exactly. (That
+check earned its keep: it found a map word being written over the shared
+assignment object.) `run-tests.sh` additionally saves a world with methods,
+blocks, closures and recursion, reloads it, and runs it.
+
+Caveats before pointing this at a real Self 4 world:
 
 * Integers must fit Self's 30-bit `smi` and floats its 30-bit float; `--save`
   errors rather than truncating.
-* Live blocks cannot be written -- their home activation is not a heap object.
+* A block still bound to a home activation is refused by `--save`.
 * Compressed images and `Snapshot code: y` images are refused on read.
-* A loaded world runs only as far as the primitives it calls exist here; the
-  Self 4 world wants hundreds, plus processes and the `IfFail:` protocol.
-* An image written from serf's own small world is well-formed but has nothing
-  for the C++ VM to boot into -- round-tripping a real image is the useful path.
-* Only reachable objects are carried over, so a round trip collects garbage:
-  `core.snap` holds 185,644 objects and 69,940 are reachable.
-* Canonical strings with equal content are written as one object. The world
-  holds ~200 such pairs; Self's own invariant says canonical strings are
-  unique by content, so this merges what should already have been merged.
-* A `mapOop` reachable as an ordinary value decodes to an empty object -- serf
-  has no maps to decode it into.
-* Running a loaded world stops at the first primitive serf lacks (`_Mirror`,
-  `_ThisProcess`, ...); reading, writing and calling ordinary methods work.
+* An image written from serf's own small world is well-formed but has nothing for
+  the C++ VM to boot into — round-tripping a real image is the useful path.
+* Only reachable objects are carried over, so a round trip collects garbage.
+* Canonical strings with equal content are written as one object. The world holds
+  ~200 such pairs; Self's own invariant says canonical strings are unique by
+  content, so this merges what should already have been merged.
+* A `mapOop` reachable as an ordinary value decodes to an empty object — serf has
+  no maps to decode it into.
 
-## Running an image's own world
+## Running the Morphic GUI
 
-`--load` binds the image's lobby as `snapshotLobby`, `--run` evaluates an
-expression with that lobby as `self`, and `--prims` lists every primitive the
-image's methods mention. Loaded methods execute directly: the bytecode set is
-the same one serf compiles to.
-
-```sh
-./target/release/serf --load morphic.snap --run "snapshotAction postRead"
-./target/release/serf --load morphic.snap --prims | head
-```
-
-Two things make a loaded world run rather than merely decode. Primitives whose
-selector ends in `IfFail:` hand the error string to the block, exactly as the
-C++ VM does for `primitiveNotDefinedError`, so the world routes around
-primitives serf lacks instead of stopping. And everything serf hands back --
-integers, error strings, booleans, vectors -- must inherit from the *image's*
-traits, taken from its `smi_map`/`float_map` and its prototype roots; using
-serf's own left `42 pred` not understood and put `init.self` frames in the
-middle of Self backtraces.
-
-### Running the Morphic GUI
-
-`morphic.snap` is 16.5 MB, 316,021 objects, 151,636 reachable from the lobby.
-It boots to the world's own console, and the world's Morphic desktop draws on
-a real X server.
+`morphic.snap` is 16.8 MB, 328,307 objects, 163,743 reachable from the lobby. It
+boots to the world's own console, and the world's Morphic desktop draws on a real
+X server.
 
 ```sh
 export DISPLAY=/private/tmp/com.apple.launchd.XXXXXXXX/org.xquartz:0   # XQuartz
 ./target/release/serf morphic.snap
 ```
 
-That is all: the world comes up, prints its banner, opens its desktop and
-offers its own prompt. `shots/18-morphic-autodisplay.png` is what it looks
-like -- the saved world's outliners, drawn by the real Morphic with real
-fonts. Expressions run against that world with `--run`: `3 + 4`, `desktop
-open`, `paintNames at: 'black'`.
+That is all: the world comes up, prints its banner, opens its desktop and offers
+its own prompt. `shots/18-morphic-autodisplay.png` is what it looks like — the
+saved world's outliners, drawn by the real Morphic with real fonts. Expressions
+run against that world with `--run`: `3 + 4`, `desktop open`, `paintNames at:
+'black'`.
 
-A snapshot remembers the display it was saved on, and `morphic.snap` was built
-in a container against an Xvfb, so its answer is `8f40c1e90598:99.0` and it is
-nobody's machine. serf falls back to `$DISPLAY` and says so:
-
-```
-serf: no display "8f40c1e90598:99.0"; using $DISPLAY
-```
-
-Set `SERF_DISPLAY_STRICT` to keep the world's own answer instead, and it will
-offer you its "Could not open display" menu, where choice 2 is Try Local
-Display and choice 1 lets you type a name.
+A snapshot remembers the display it was saved on, and `morphic.snap` was built in
+a container against an Xvfb, so its answer is `8f40c1e90598:99.0` and it is
+nobody's machine. serf falls back to `$DISPLAY` and says so; set
+`SERF_DISPLAY_STRICT` to keep the world's own answer instead.
 
 What it took, beyond the interpreter and the image reader:
 
 * **Foreign calls.** `src/ffi.rs` resolves glue primitives against libX11 by
-  name, so the 362 `_X...` primitives the image mentions dispatch generically
-  rather than one by one. The generated conventions matter: `...ResultProxy:`
-  fills the last argument and the unary `...ResultProxy` fills the receiver, a
-  `_len` string is passed as pointer *and* length, a NULL answer from a
-  `proxy`-typed call is a failure, and `int_or_errno` answers the errno name.
-  The wrappers `objects/glue/xlib_glue.cpp` compiles into the C++ VM are in
-  `prims.rs`: the region calls are renames, and XCreateImage, XImagePutData,
-  XFillPolygon, XDrawLines, XNextEvent and friends are a few lines each.
-* **Self processes.** TWAINS is *asymmetric* -- the scheduler runs a process
-  with `p _TWAINSResultVector: r SingleStep: b StopAt: a IfFail: fb` and the
-  process transfers back with `_Yield: action` -- so a process is a nested
-  interpreter loop rather than a rewrite into symmetric coroutines.
-  `run_stack` takes a `&mut Vec<Frame>` and answers `Done` or `Yielded`, so a
-  stack parks and resumes; `Vm::procs` holds one per process object.
-* **The event loop.** `scheduler schedule` answers `schedulerProcess` when its
-  readyQ is empty, so the world runs TWAINS on the process it is already in.
-  That means *wait for the next signal* (`TWAINS_await_signal`). serf sleeps a
-  tick and reports `sigio` and `sigrealtimer`, which is what drives the
-  console and the timer queue; `select_wrap` answers which descriptors are
-  ready.
-* **doesNotUnderstand.** A failed lookup is a message, not an error: the VM
-  sends `undefinedSelector:Receiver:Type:Delegatee:MethodHolder:Arguments:` to
-  the current process, and the world forwards it to the receiver's own
-  handler. `x11Globals fontFamily` conjures font families that way.
-* **Identity hashes and canonical strings.** Self keeps an object's identity
-  hash in its mark word so hashed collections survive a snapshot, and `string
-  hash` is `canonicalize identityHash`. Deriving a hash from the address, or
-  compiling a string literal to a fresh object, leaves every dictionary in the
-  image unable to find its own keys.
+  name, so the 362 `_X…` primitives the image mentions dispatch generically
+  rather than one by one. The generated conventions matter: `…ResultProxy:` fills
+  the last argument and the unary `…ResultProxy` fills the receiver, a `_len`
+  string is passed as pointer *and* length, and a NULL from a `proxy`-typed call
+  is a failure. The wrappers `objects/glue/xlib_glue.cpp` compiles into the C++
+  VM are in `prims.rs`.
+* **Self processes.** TWAINS is *asymmetric* — the scheduler runs a process with
+  `p _TWAINSResultVector: … SingleStep: … StopAt: … IfFail: …` and the process
+  transfers back with `_Yield:` — so a process is a nested interpreter loop rather
+  than a rewrite into symmetric coroutines. `run_stack` answers `Done` or
+  `Yielded`, so a stack parks and resumes. `scheduler schedule` answers
+  `schedulerProcess` when its readyQ is empty, meaning *wait for the next
+  signal*: serf sleeps a tick and reports `sigio` and `sigrealtimer`, which is
+  what drives the console and the timer queue.
+* **`IfFail:` and doesNotUnderstand.** A primitive whose selector ends in
+  `IfFail:` hands the error string to the block, as the C++ VM does for
+  `primitiveNotDefinedError`, so the world routes around primitives serf lacks. A
+  failed lookup is a message, not an error: the VM sends
+  `undefinedSelector:Receiver:…` to the current process and the world forwards it
+  to the receiver's own handler.
+* **Identity hashes and canonical strings.** Self keeps an object's identity hash
+  in its header so hashed collections survive a snapshot, and `string hash` is
+  `canonicalize identityHash`. Deriving a hash from the address, or compiling a
+  string literal to a fresh object, leaves every dictionary in the image unable to
+  find its own keys.
 * **The parser, handed back to the world.** `_ParseObjectFileName:ErrorObj:`
-  parses a string as an object body and answers a mirror on it -- a method
-  when the body has code, an object when it is only slots -- and
-  `_MirrorEvaluate:` runs such a method with a mirror's reflectee as `self`.
-  That is how every button script, editor accept and doIt in Morphic gets
-  compiled -- without it a ui2Button kept the default `event:From:` it
-  inherits, so pressing one sent `buttonPress:Event:` to an outliner that has
-  no such slot. What serf compiles carries no source: its parser records no
-  per-method spans, so such a method answers `''`.
+  parses a string as an object body and answers a mirror on it;
+  `_MirrorEvaluate:` runs such a method with a mirror's reflectee as `self`. That
+  is how every button script, editor accept and doIt in Morphic gets compiled.
+  What serf compiles carries no source — its parser records no per-method spans —
+  so such a method answers `''`.
 
-Still rough: activation mirrors are missing, so the debugger cannot show a
-stack.
+Everything else stops at the first primitive serf lacks: a loaded world runs only
+as far as the primitives it calls exist here. Activation mirrors are missing, so
+the debugger cannot show a stack.
 
 ## Deliberately not here
 
-* **No JIT, and maps only as a key.** Every object still owns its slot vector;
-  what is interned is its *shape*, which is what the send caches key on. A real
-  map would share the descriptors too — see [MEMORY.md](MEMORY.md).
-* **No compaction and no finalization.** The old generation is swept into a
-  free list, never compacted, and nothing runs when an object dies.
-* **No processes, no `IfFail:` protocol, no debugger.** Errors abort to the
-  REPL with a Self-level backtrace.
-* **No `{ }` slot annotations**, so the Self 4 world fileouts in `objects/`
-  don't load as-is.
-* **No `|` binary selector** — a bare `|` always closes a slot list. Use
-  `bitOr:`.
+* **No JIT, and maps only as a key.** Every object still carries its own slot
+  descriptors; what is interned is its *shape*, which is what the send caches key
+  on. A real map would share the descriptors too — see [MEMORY.md](MEMORY.md).
+* **No compaction and no finalization.** The old generation is swept into a free
+  list, never compacted, and nothing runs when an object dies.
+* **No `{ }` slot annotations** in the parser, so the Self 4 world fileouts in
+  `objects/` don't load as-is. (Annotations *in an image* round-trip fine.)
+* **No `|` binary selector** — a bare `|` always closes a slot list. Use `bitOr:`.
 
 ## Sample
 
