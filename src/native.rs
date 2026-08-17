@@ -149,7 +149,20 @@ pub fn claims(cname: &str) -> bool {
         || cname.ends_with("OfDisplay")
         || matches!(
             cname,
-            "ConnectionNumber" | "DefaultScreen" | "RootWindow" | "DefaultRootWindow"
+            // the macros a world can reach for either as `Foo(display, screen)`
+            // or as `FooOfScreen(screen)`; the second form is the one Self 4.4
+            // uses, and the first is what let self/x11-demo.self reach a real
+            // Xlib with a synthetic display and crash exactly as promised above
+            "ConnectionNumber"
+                | "DefaultScreen"
+                | "RootWindow"
+                | "DefaultRootWindow"
+                | "BlackPixel"
+                | "WhitePixel"
+                | "DefaultDepth"
+                | "DefaultVisual"
+                | "DefaultColormap"
+                | "DefaultGC"
         )
 }
 
@@ -888,7 +901,18 @@ mod tests {
     /// pointer, which would not fail at all.
     #[test]
     fn every_x_shaped_name_is_claimed() {
-        for c in ["XFillRectangle", "XPending", "BlackPixelOfScreen", "ConnectionNumber"] {
+        // the last four are the `Foo(display, screen)` macros, which read like
+        // plain C names and reached a real Xlib until they were listed
+        for c in [
+            "XFillRectangle",
+            "XPending",
+            "BlackPixelOfScreen",
+            "ConnectionNumber",
+            "BlackPixel",
+            "WhitePixel",
+            "DefaultDepth",
+            "DefaultColormap",
+        ] {
             assert!(claims(c), "{} was not claimed", c);
         }
         // and the rest of the glue -- libc, libm -- is left alone

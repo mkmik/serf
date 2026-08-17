@@ -1592,8 +1592,19 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
     let (cname, ret, argtypes): (&str, &str, &[&str]) = match sig {
         Some(e) => (e.1, e.2, e.3),
         None => {
-            let (f, cut) =
-                vm.ffi.split_glue(prim).ok_or_else(|| format!("unknown primitive '{}'", name))?;
+            // A Mac with no XQuartz has no X symbol for dlsym to find, and the
+            // world opens its display this way -- so where the native canvas
+            // is answering, fall back to what the name looks like. `f` stays
+            // null there, and `untyped_glue` never reaches for it.
+            let split = vm.ffi.split_glue(prim);
+            let (f, cut) = match split {
+                Some(x) => x,
+                None => (
+                    std::ptr::null_mut(),
+                    native_split(vm, prim)
+                        .ok_or_else(|| format!("unknown primitive '{}'", name))?,
+                ),
+            };
             let (cname, sel) = prim.split_at(cut);
             return untyped_glue(vm, name, f, cname, sel, recv, args);
         }
@@ -2357,6 +2368,23 @@ fn v_of(x: Value) -> Result<P, String> {
     Ok(P::Val(x))
 }
 
+/// Where to cut a glue name that no library could split, which only the native
+/// canvas can go on to answer -- and only for a name it claims, since the cut
+/// is a guess and everything else here would take that guess to a C pointer.
+fn native_split(vm: &Vm, prim: &str) -> Option<usize> {
+    #[cfg(feature = "native")]
+    {
+        vm.native.as_ref()?;
+        let cut = crate::ffi::Ffi::split_by_shape(prim)?;
+        crate::native::claims(&prim[..cut]).then_some(cut)
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        let _ = (vm, prim);
+        None
+    }
+}
+
 /// Fallback for primitives with no table entry (the Xlib macros).
 fn untyped_glue(
     vm: &mut Vm,
@@ -2406,6 +2434,7 @@ fn untyped_glue(
     // else's machine; rather than make the world ask, fall back to $DISPLAY.
     // Set SERF_DISPLAY_STRICT to keep the world's own answer.
     if r == 0
+        && !native // there is no $DISPLAY to fall back to, and `f` may be null
         && name.starts_with("_XOpenDisplay")
         && words.first().is_some_and(|w| *w != 0 && unsafe { *(*w as *const u8) } != 0)
         && std::env::var_os("SERF_DISPLAY_STRICT").is_none()

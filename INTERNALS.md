@@ -97,7 +97,10 @@ DISPLAY=:99 xwd -root -silent > shot.xwd               # look at the result
 
 `run-tests.sh` runs that demo against an `Xvfb` it starts itself.
 `SERF_X11=real` uses `$DISPLAY` instead (XQuartz, a visible window);
-`SERF_X11=off` skips it.
+`SERF_X11=off` skips it. On macOS it then runs the same demo through the
+native backend below, in a real window and with `SERF_SHOT` to say what came
+out of it; `SERF_NATIVE=off` skips that one. CI runs the whole suite on both:
+Linux with an `Xvfb` it installs, macOS with nothing installed at all.
 
 ## Drawing without an X server
 

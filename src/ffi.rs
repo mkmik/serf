@@ -158,6 +158,39 @@ impl Ffi {
         None
     }
 
+    /// The same split with no library to ask, which is a Mac with no XQuartz
+    /// on it: there dlsym knows no X symbol at all, and the native canvas can
+    /// only answer a call whose name has already been cut in two.
+    ///
+    /// Generated glue repeats the C name as a lowercase-initial selector
+    /// (`XFlushxFlush`, `BlackPixelblackPixel:`), so the cut is where the
+    /// repeat starts -- but that letter turns up inside names too, as the `x`
+    /// in `XCreatePixmapxCreate:` does, so take the cut whose two halves agree
+    /// for longest. Hand-written prims repeat nothing
+    /// (`XOpenDisplayResultProxy:`, the one call a real world makes this way),
+    /// so cut before the result proxy instead.
+    ///
+    /// A wrong guess costs nothing: the caller only accepts a cut the native
+    /// backend claims, and an X name it does not implement answers an error
+    /// rather than reaching anything real.
+    pub fn split_by_shape(prim: &str) -> Option<usize> {
+        let lead = prim.chars().next()?.to_ascii_lowercase();
+        let repeat = prim
+            .char_indices()
+            .skip(1)
+            .filter(|&(_, c)| c == lead)
+            .map(|(i, _)| (common_prefix(&prim[..i], &prim[i..]), i))
+            // one letter in common is the lead itself, which every candidate
+            // has; it takes a word to tell a repeat from a coincidence
+            .filter(|&(n, _)| n >= 3)
+            .max();
+        if let Some((_, i)) = repeat {
+            return Some(i);
+        }
+        let c = prim.strip_suffix("ResultProxy:").or_else(|| prim.strip_suffix("ResultProxy"))?;
+        Some(c.len())
+    }
+
     /// Call a variadic C function: the arguments past `fixed` go through the
     /// `...` so the ABI puts them where the callee's va_list looks.
     pub fn call_variadic(f: *mut c_void, fixed: usize, a: &[u64]) -> Result<u64, String> {
@@ -220,9 +253,45 @@ impl Ffi {
     }
 }
 
+/// How far two names agree, ignoring the case of the first letter each.
+fn common_prefix(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x.eq_ignore_ascii_case(y)).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::Ffi;
+
+    /// The names a world and self/x11-demo.self actually send, on a host where
+    /// dlsym cannot be asked which prefix is real.
+    #[test]
+    fn a_glue_name_splits_by_its_shape() {
+        for (prim, cname) in [
+            // hand-written: no repeat to find, so the result proxy says where
+            ("XOpenDisplayResultProxy:", "XOpenDisplay"),
+            // generated: the C name repeated with a lowercase initial
+            ("XFlushxFlush", "XFlush"),
+            ("BlackPixelblackPixel:", "BlackPixel"),
+            ("RootWindowrootWindow:", "RootWindow"),
+            ("XMapWindowxMapWindow:", "XMapWindow"),
+            ("XOpenDisplayxOpenDisplayResultProxy:", "XOpenDisplay"),
+            // and abbreviated after the first word, which is why the halves
+            // are compared rather than required to match
+            ("XSetForegroundxSetFg:To:", "XSetForeground"),
+            ("XCreateSimpleWindowxCreate:X:Y:W:H:B:Bd:Bg:", "XCreateSimpleWindow"),
+            ("XFillRectanglexFill:GC:X:Y:W:H:", "XFillRectangle"),
+            ("XDrawStringxDrawString:GC:X:Y:S:L:", "XDrawString"),
+            // the lead letter inside the name is the trap: cutting at the `x`
+            // of Pixmap leaves XCreatePi, which Xlib would never have
+            ("XCreatePixmapxCreate:W:H:D:", "XCreatePixmap"),
+        ] {
+            let cut = Ffi::split_by_shape(prim).unwrap_or_else(|| panic!("{} did not split", prim));
+            assert_eq!(&prim[..cut], cname, "{} split wrong", prim);
+        }
+        // a libc name is not glue at all, and guessing at one would be worse
+        // than saying so: nothing repeats and no proxy comes back
+        assert_eq!(Ffi::split_by_shape("gethostname"), None);
+    }
 
     /// XCopyArea's tail: two `int`s, the arguments the ABI puts on the stack.
     #[allow(clippy::too_many_arguments)]

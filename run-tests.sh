@@ -231,9 +231,21 @@ if command -v python3 >/dev/null && command -v curl >/dev/null; then
   # -u: the line naming the port is on stdout, which python buffers into a file
   python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$T/www" >"$T/www.log" 2>&1 &
   httpd=$!
+  # A minute rather than the ten seconds this used to allow: the first python3
+  # on a cold macOS runner takes tens of seconds to get as far as printing the
+  # port, and it had been failing there with an empty log. Waiting longer is
+  # free everywhere else, since the loop leaves the moment the line appears.
   n=0
-  while ! grep -q "port" "$T/www.log" 2>/dev/null && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+  while ! grep -q "port" "$T/www.log" 2>/dev/null && [ $n -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
   port=$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$T/www.log")
+  # Without this, a server that never came up is reported as two fetches of a
+  # URL with an empty port, which says nothing about which of the two failed.
+  [ -n "$port" ] || {
+    echo "url fetch: python printed no port in 60s; its output was:"
+    cat "$T/www.log"
+    kill $httpd 2>/dev/null
+    exit 1
+  }
   U="http://127.0.0.1:$port/hello.self"
   got=$(SERF_CACHE="$T/cache" $R "$U" 2>&1 | tail -1)
   # and again: the file is on disk, so this asks the server only whether it changed
@@ -270,4 +282,16 @@ if [ -n "$D" ]; then
   out=$(SERF_BACKEND=x11 DISPLAY=$D $R self/x11-demo.self 2>&1 | tail -1)
   [ "$out" = "drew" ] || { echo "x11 demo failed on $D: $out"; exit 1; }
   echo "x11 demo ok ($D)"
+fi
+
+# The same demo with no X server at all: the native canvas answers the calls
+# itself. Only where it is the default backend, since elsewhere it would want
+# the display the X leg just used. It opens a real window for a few seconds --
+# SERF_NATIVE=off skips it -- and SERF_SHOT writes what it drew, so a run with
+# nobody watching still says whether pixels came out.
+if [ "${SERF_NATIVE:-on}" != off ] && [ "$(uname)" = Darwin ]; then
+  out=$(SERF_BACKEND=native SERF_SHOT="$T/native.png" $R self/x11-demo.self 2>&1 | tail -1)
+  [ "$out" = "drew" ] || { echo "native demo failed: $out"; exit 1; }
+  [ -s "$T/native.png" ] || { echo "native demo wrote no shot"; exit 1; }
+  echo "native demo ok"
 fi
