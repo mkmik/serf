@@ -514,6 +514,59 @@ fn boot(vm: &mut Vm) {
     }
 }
 
+/// Where fetched images live: `$SERF_CACHE`, else the usual cache directory.
+fn cache_dir() -> Result<std::path::PathBuf, String> {
+    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    var("SERF_CACHE")
+        .or_else(|| var("XDG_CACHE_HOME").map(|d| d.join("serf")))
+        .or_else(|| var("HOME").map(|d| d.join(".cache/serf")))
+        .ok_or_else(|| "no HOME to keep a cache in; set SERF_CACHE".to_string())
+}
+
+/// A URL is a fine name for an image: fetch it into the cache directory and
+/// hand back the local path. Later runs revalidate rather than download again
+/// -- If-Modified-Since and If-None-Match, which is curl's job, not ours.
+///
+/// ponytail: curl rather than an HTTP client of our own. The crate has no
+/// dependencies and TLS is not something to write for a convenience.
+fn fetch(url: &str) -> Result<std::path::PathBuf, String> {
+    let dir = cache_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    // the whole URL is the key, punched into one filesystem-safe name
+    let key: String = url
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    let (file, etag, part) =
+        (dir.join(&key), dir.join(format!("{}.etag", key)), dir.join(format!("{}.part", key)));
+    // a partial download from a run that died would otherwise look like a body
+    let _ = std::fs::remove_file(&part);
+    let mut curl = std::process::Command::new("curl");
+    // -R keeps the server's mtime, which is what -z then asks the next run about
+    curl.arg("-fsSLR").arg("-o").arg(&part);
+    if file.exists() {
+        curl.arg("-z").arg(&file);
+        // and If-None-Match, but only with an etag to match: a server that sends
+        // none leaves the file empty, and an empty If-None-Match still takes
+        // precedence over the date -- and then matches nothing
+        if std::fs::metadata(&etag).is_ok_and(|m| m.len() > 0) {
+            curl.arg("--etag-compare").arg(&etag);
+        }
+    }
+    curl.arg("--etag-save").arg(&etag).arg("--").arg(url);
+    let ok = curl.status().map_err(|e| format!("cannot run curl: {}", e))?.success();
+    match (ok, part.exists()) {
+        // 200: the new body replaces the old one, whole or not at all
+        (true, true) => std::fs::rename(&part, &file).map_err(|e| format!("{}: {}", key, e))?,
+        (true, false) => {} // 304: no body sent, the copy on disk stands
+        (false, _) if file.exists() => {
+            eprintln!("serf: {} unreachable, using the cached copy", url)
+        }
+        (false, _) => return Err(format!("cannot fetch {}", url)),
+    }
+    Ok(file)
+}
+
 fn main() {
     // A port the OS picks, so any number of VMs can run at once; it goes to
     // stderr, where the rest of the VM's own chatter goes. SERF_METRICS=off
@@ -531,7 +584,24 @@ fn main() {
         std::process::exit(1);
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // any argument naming a file may name a URL instead: fetch it first, so
+    // everything downstream -- --load, --dump-image, a bare snapshot -- sees a
+    // path and needs to know nothing about where it came from
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .map(|a| {
+            if !a.starts_with("http://") && !a.starts_with("https://") {
+                return a;
+            }
+            match fetch(&a) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1)
+                }
+            }
+        })
+        .collect();
     let mut interactive = args.is_empty();
     let mut i = 0;
     while i < args.len() {

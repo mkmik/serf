@@ -209,6 +209,29 @@ if [ -f Clean-4.4.snap ]; then
   echo "button cache ok"
 fi
 
+# A URL names a file too: fetched once into the cache, revalidated after that.
+# Its own throwaway server on a port the OS picks, which http.server prints.
+if command -v python3 >/dev/null && command -v curl >/dev/null; then
+  mkdir -p "$T/www"
+  echo "'fetched' printLine." >"$T/www/hello.self"
+  # -u: the line naming the port is on stdout, which python buffers into a file
+  python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$T/www" >"$T/www.log" 2>&1 &
+  httpd=$!
+  n=0
+  while ! grep -q "port" "$T/www.log" 2>/dev/null && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+  port=$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$T/www.log")
+  U="http://127.0.0.1:$port/hello.self"
+  got=$(SERF_CACHE="$T/cache" $R "$U" 2>&1 | tail -1)
+  # and again: the file is on disk, so this asks the server only whether it changed
+  got2=$(SERF_CACHE="$T/cache" $R "$U" 2>&1 | tail -1)
+  kill $httpd 2>/dev/null
+  wait $httpd 2>/dev/null || true # reap it, or the shell reports the signal itself
+  codes=$(sed -n 's/.*"GET \/hello.self HTTP\/1.1" \([0-9]*\).*/\1/p' "$T/www.log" | tr '\n' ' ')
+  [ "$got$got2" = "fetchedfetched" ] || { echo "url fetch: got [$got] [$got2]"; exit 1; }
+  [ "$codes" = "200 304 " ] || { echo "url cache: server saw [$codes] want [200 304 ]"; exit 1; }
+  echo "url fetch and cache ok"
+fi
+
 # X11 foreign calls. Headless by default: our own Xvfb, which -displayfd lets
 # pick a free display and tells us when it is ready to accept connections.
 # SERF_X11=real runs the same check against $DISPLAY instead, so the window
