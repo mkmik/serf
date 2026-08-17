@@ -15,8 +15,8 @@ Tested on:
 
 The VM is portable Rust with no dependencies, so other targets `rustc` supports
 should work. It can also draw the world itself, with no X server anywhere and
-text from the fonts installed on the host — that part takes three crates and is
-off by default; see [INTERNALS.md](INTERNALS.md).
+text from the fonts installed on the host — that part takes three crates, and
+is what macOS gets by default; see [INTERNALS.md](INTERNALS.md).
 
 There is no JIT — serf is a bytecode interpreter with per-send inline caches
 and a generational collector, so it is far behind the real thing on a
@@ -43,7 +43,7 @@ the terminal and opens its desktop — on macOS in a window of serf's own, drawn
 without an X server, and on Linux on `$DISPLAY`. `SERF_BACKEND=native` or
 `=x11` asks for either one where the default is not what you want.
 
-![The Self 4.4 demo world, booted by serf](https://raw.githubusercontent.com/mkmik/serf/main/shots/19-demo-4.4.png)
+![The Self 4.4 demo world, booted by serf](https://raw.githubusercontent.com/mkmik/serf/main/shots/20-demo-4.4-native.png)
 
 `serf` with no arguments is a REPL for serf's own small world; the other flags —
 loading an image without booting it, saving one, the GC and metrics knobs — are
