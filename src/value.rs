@@ -836,8 +836,9 @@ pub struct Vm {
     pub image_strings: Option<Vec<Value>>,
     /// dynamically loaded C libraries, for the image's glue primitives
     pub ffi: crate::ffi::Ffi,
-    /// the native canvas, when SERF_BACKEND=native asked for one. Present
-    /// means the world's X calls are answered here rather than by a server.
+    /// the native canvas: the default on macOS, elsewhere when
+    /// SERF_BACKEND=native asked for one. Present means the world's X calls
+    /// are answered here rather than by a server.
     #[cfg(feature = "native")]
     pub native: Option<crate::native::Native>,
     /// parked Self process stacks. A list rather than a map: the key is an
@@ -932,10 +933,15 @@ impl Vm {
             image_roots: None,
             image_strings: None,
             ffi: crate::ffi::Ffi::default(),
-            // opened on demand, so a run that never draws never makes a window
+            // opened on demand, so a run that never draws never makes a window.
+            // macOS has no X server unless someone installs one, so native is
+            // the default there; SERF_BACKEND=x11 asks for the FFI path back.
             #[cfg(feature = "native")]
-            native: (std::env::var("SERF_BACKEND").as_deref() == Ok("native"))
-                .then(crate::native::Native::new),
+            native: match std::env::var("SERF_BACKEND").as_deref() {
+                Ok("native") => Some(crate::native::Native::new()),
+                Ok(_) => None,
+                Err(_) => cfg!(target_os = "macos").then(crate::native::Native::new),
+            },
             procs: vec![],
             stacks: vec![],
             temp_roots: vec![],
