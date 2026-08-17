@@ -31,12 +31,11 @@ cargo install selflang     # crates.io already had a `serf`; the binary is still
 
 ## Run the Self 4.4 demo world
 
-The snapshots are too big to ship in the crate, so fetch one from the repo, and
-start XQuartz (macOS) or use your X display (Linux):
+The snapshots are too big to ship in the crate, so point serf at one in the
+repo, and start XQuartz (macOS) or use your X display (Linux):
 
 ```sh
-curl -LO https://github.com/mkmik/serf/raw/main/Demo-4.4.snap
-serf Demo-4.4.snap
+serf https://github.com/mkmik/serf/raw/main/Demo-4.4.snap
 ```
 
 The world takes the process over from there: it prints the Self 4.4 banner on
