@@ -14,5 +14,19 @@ exclude = ["*.snap", "shots/", "reference/"]
 name = "serf"
 path = "src/main.rs"
 
+# The VM itself has no dependencies, so it ports wherever rustc goes:
+# `--no-default-features` builds the interpreter and the X11 path, which reaches
+# libX11 through src/ffi.rs and needs nothing at link time. Only the native
+# canvas takes crates, and cosmic-text's tree is pure Rust -- no -sys crate, no
+# cc, no pkg-config -- so it cross-compiles the same way.
+[features]
+default = ["native"]
+native = ["dep:cosmic-text", "dep:softbuffer", "dep:winit"]
+
+[dependencies]
+cosmic-text = { version = "0.19", optional = true }
+softbuffer = { version = "0.4", optional = true }
+winit = { version = "0.30", optional = true }
+
 [profile.release]
 opt-level = 3

@@ -836,6 +836,10 @@ pub struct Vm {
     pub image_strings: Option<Vec<Value>>,
     /// dynamically loaded C libraries, for the image's glue primitives
     pub ffi: crate::ffi::Ffi,
+    /// the native canvas, when SERF_BACKEND=native asked for one. Present
+    /// means the world's X calls are answered here rather than by a server.
+    #[cfg(feature = "native")]
+    pub native: Option<crate::native::Native>,
     /// parked Self process stacks. A list rather than a map: the key is an
     /// object, and an object's address is not a key across a collection.
     pub procs: Vec<(Value, Vec<crate::interp::Frame>)>,
@@ -928,6 +932,10 @@ impl Vm {
             image_roots: None,
             image_strings: None,
             ffi: crate::ffi::Ffi::default(),
+            // opened on demand, so a run that never draws never makes a window
+            #[cfg(feature = "native")]
+            native: (std::env::var("SERF_BACKEND").as_deref() == Ok("native"))
+                .then(crate::native::Native::new),
             procs: vec![],
             stacks: vec![],
             temp_roots: vec![],

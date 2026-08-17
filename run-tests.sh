@@ -7,6 +7,11 @@ cd "$(dirname "$0")"
 # the word `error` at the start of a line -- which CI colours, so `^error` never
 # matched there and a build that never produced a binary surfaced thirty lines
 # later as `./target/release/serf: not found`.
+# The VM has to keep building with nothing but rustc, or "easy to port" stops
+# being true the first time something in the canvas leaks into it. It goes
+# first because both builds write the same binary, and what the rest of this
+# suite should be running is the full one.
+cargo build --release --no-default-features --color never >/dev/null
 out=$(cargo build --release --color never 2>&1) || { printf '%s\n' "$out"; exit 1; }
 printf '%s\n' "$out" | grep -E '^warning: unused' && exit 1
 cargo test --release --quiet
@@ -20,13 +25,22 @@ cargo test --quiet obj:: >/dev/null
 # pointer to one space rebuilt from a pointer into another caught the first
 # time it was tried. The heap is deliberately leaked, as gc.rs's spaces are,
 # so the leak check is off.
+# It runs against the dependency-free build: the `unsafe` it is here for is the
+# VM's own, and interpreting the canvas's crates is slow and checks nothing this
+# repo wrote. What it says is kept rather than discarded, too -- a bare `miri
+# FAILED` with the reason thrown away is an hour of working backwards.
 MIRI=$(rustup which --toolchain nightly cargo-miri 2>/dev/null || true)
 if [ -n "$MIRI" ]; then
-  PATH="$(dirname "$MIRI"):$PATH" MIRIFLAGS=-Zmiri-ignore-leaks \
-    cargo miri test --quiet heap:: >/dev/null 2>&1 \
-    && PATH="$(dirname "$MIRI"):$PATH" MIRIFLAGS=-Zmiri-ignore-leaks \
-       cargo miri test --quiet obj:: >/dev/null 2>&1 \
-    && echo "miri ok" || { echo "miri FAILED"; exit 1; }
+  miri() {
+    PATH="$(dirname "$MIRI"):$PATH" MIRIFLAGS=-Zmiri-ignore-leaks \
+      cargo miri test --quiet --no-default-features "$1" 2>&1
+  }
+  out=$(miri heap:: && miri obj::) || {
+    printf '%s\n' "$out"
+    echo "miri FAILED"
+    exit 1
+  }
+  echo "miri ok"
 else
   echo "miri not installed, skipping: rustup toolchain install nightly --component miri"
 fi

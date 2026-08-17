@@ -4,14 +4,23 @@ How the VM is put together: scanner, parser, bytecode compiler, interpreter,
 generational collector, the C++ VM's snapshot format, and a small world written
 in Self. [README.md](README.md) is the short version.
 
-`unsafe` lives in four modules and nowhere else: `heap.rs` (a moving collector
+`unsafe` lives in five modules and nowhere else: `heap.rs` (a moving collector
 cannot be written in safe Rust), `ffi.rs` and the X11 glue in `prims.rs`
-(foreign calls), and `metrics.rs` (a counting `GlobalAlloc`). The heap is
-checked under Miri.
+(foreign calls), `native.rs` (the C structs the world hands it), and
+`metrics.rs` (a counting `GlobalAlloc`). The heap is checked under Miri.
 
 ```sh
 cargo build --release
+cargo build --release --no-default-features   # the VM alone: no dependencies
 ```
+
+The VM has no dependencies, and `run-tests.sh` builds it that way every run so
+it stays true — that is what makes it portable. The `native` feature, on by
+default, adds the canvas that draws without an X server, and it takes three
+crates: `cosmic-text` for text, `winit` for the window and `softbuffer` for its
+pixels. Nothing in that tree needs a C toolchain — no `bindgen`, no
+`pkg-config`, and the only `-sys` crates are Apple's own framework bindings — so
+it cross-compiles much the way the VM does.
 
 Paths below like `vm/…` and `objects/…` refer to the C++ Self implementation at
 <https://github.com/russellallen/self>, vendored as a submodule under
@@ -90,6 +99,128 @@ DISPLAY=:99 xwd -root -silent > shot.xwd               # look at the result
 `SERF_X11=real` uses `$DISPLAY` instead (XQuartz, a visible window);
 `SERF_X11=off` skips it.
 
+## Drawing without an X server
+
+The world draws the way X does — `XCreateGC`, `XFillRectangle`, `XCopyArea`,
+`XLoadQueryFont` with an XLFD and then `XDrawString` — but nothing says an X
+server has to be behind that. `SERF_BACKEND=native` answers those calls in serf
+itself, onto a buffer of `0x00RRGGBB` pixels, with text from the fonts installed
+on the host. No Self code changes: it is the same interface the image already
+codes against.
+
+```sh
+SERF_BACKEND=native ./target/release/serf morphic.snap
+SERF_SHOT=f.png SERF_BACKEND=native ./target/release/serf Demo-4.4.snap
+
+./target/release/serf --draw-demo draw.png    # every drawing call, one sheet
+./target/release/serf --text-demo fonts.png   # the fonts the world asks for
+./target/release/serf --event-demo            # a scripted click, read back
+./target/release/serf --window-demo           # a real window, with real input
+```
+
+Two pieces of luck make it small. **The struct paths already work**: `XEvent_new`
+mallocs into `vm.c_heap` and the field accessors read at `struct_table` offsets,
+so an event filled in by `events::encode` needs no special case, and the same
+trick answers `XLoadQueryFont` — hand back a real `XFontStruct` and the world's
+`XFontStruct_ascentascent` finds what it expects. **And everything else is a
+handle**: a `Display`, `Screen`, `GC` or drawable is an integer the world only
+hands back, so it is tagged and indexed rather than allocated. A window, a
+pixmap and an `XImage` are one type, because to this backend they are the same
+rectangle of pixels.
+
+An X call the backend does not implement is an error rather than a fall-through
+to `dlsym`. On a host that has libX11 installed, handing it one of these handles
+would not fail — it would crash — and the world's `IfFail:` routes around an
+error perfectly well.
+
+Careful with anything that reaches *into* a struct Xlib allocated. A wrapper
+that merely calls Xlib fails loudly when Xlib is absent; one that reads its
+memory fails silently. `XImagePutData_wrap` dispatches every pixel through a
+function pointer it loads out of an `XImage`, which given a handle is not a call
+that fails but a jump into whatever that address holds. Both such wrappers in
+`prims.rs` branch on the backend.
+
+### Text
+
+The contract is smaller than X's font machinery suggests. `src/struct_table.rs`
+shows the image only ever reads `XFontStruct` ascent, descent, `fid`,
+`min`/`max_char_or_byte2` and `per_char` — and `per_char` has no accessor that
+indexes it, only one that asks whether it is there, so answering NULL forces
+every width through `XTextWidth`. Three numbers and a width function is all of
+it. Two things that are easy to get wrong:
+
+* **Measure and draw from one layout.** `XTextWidth` and `XDrawString` have to
+  agree exactly, or a text morph's cursor and its selection walk off the glyphs
+  they belong to, so a string is laid out once and both read that.
+* **Grayscale antialiasing, never subpixel.** Morphic moves rendered pixels
+  around constantly, and subpixel-filtered text refringes the moment it is
+  blitted somewhere else.
+
+Family names need one step of help: `fontdb` matches them with `==`, and the
+world spells them the way X did (`helvetica`, `lucidaTypewriter`), so they are
+resolved against the host's own spelling first. A family the host does not have
+falls back by shape rather than by name — the world's consoles have to stay
+monospaced.
+
+### The display's scale
+
+On a screen with more than one real pixel per logical one, the world would draw
+everything at half size: it is an X client and thinks in device pixels. So a
+`Canvas` keeps *its* coordinates and carries a scale, and the widening happens
+in `plot`, which every drawing call funnels through.
+
+Text and blits are the exceptions, on purpose. Glyphs rasterise at the scale and
+blend at real pixels, so they are sharp rather than drawn small and doubled —
+and blits copy real pixels, because Morphic draws its text into a backing pixmap
+and copies that to the window, so a copy that worked a logical pixel at a time
+would flatten every glyph on the way. `SERF_SCALE=1` forces it off, which is the
+only way a headless run has of saying.
+
+### Input, which is bytes rather than a call
+
+An event is the one place the world does not go through a function at all. It
+allocates 192 bytes with `XEvent_new`, has the server fill them, and then loads
+fields straight out of that buffer — `XButtonEvent_xx` is a four-byte read at
+offset 64. So `src/events.rs` does not hand the world a struct, it writes a
+*layout*, through the same `src/struct_table.rs` the reader reads through.
+
+Three things about that layout are not optional:
+
+* **`XLookupString` is handed the event and nothing else**, so the keysym has to
+  come back out of the encoded keycode. Keycodes are derived from the keysym in
+  two disjoint bands, because folding both into a low byte puts `XK_Return` on
+  the same keycode as Ctrl-M.
+* **Events carry a timestamp**, at offset 56. Morphic tells a click from a
+  double click from a press-and-hold by *when* they arrived, so a frozen clock
+  makes every gesture identical — a single click does nothing at all and two in
+  a row come out as something else.
+* **X reports motion when the pointer *moves*.** A window system reports a
+  cursor position on other occasions too, and a motion that did not move is not
+  nothing to the world: motion with a button held is a *drag*, so passing those
+  on turns every click into one and picks morphs up instead of clicking them.
+
+Only a hand on the mouse can click a world, which makes a bug in what a click
+*does* the one kind this cannot chase on its own — so it can be told to click:
+
+```sh
+SERF_TRACE_INPUT=1 …    # every event as it is handed to the world
+SERF_CLICK=254,681@20   # click there after 20s; `x2` for twice
+```
+
+`SERF_CLICK` spreads its press and release over time on purpose. A real click is
+a press, a pause and a release, and the world sees each in a different turn of
+its own loop; firing them into the queue together is a different gesture, and
+one the world reads differently.
+
+### What is deliberately not there
+
+Tiles, stipples, dashes and fill styles are accepted and ignored, so everything
+draws solid — the 4.4 worlds never set one. Line joins and caps are whatever a
+square pen dragged along the run leaves. There is one window, because winit
+allows one event loop per process, so a world that opens a second gets the
+first. `MapNotify`, `ReparentNotify` and the rest are not generated: nothing
+produces them without a window manager in the loop.
+
 ## What it is
 
 | | |
@@ -107,6 +238,11 @@ DISPLAY=:99 xwd -root -silent > shot.xwd               # look at the result
 | `src/image.rs` | snapshot file format, after `memory/universe.cpp` and `space.cpp` |
 | `src/image_obj.rs` | snapshot words <-> serf objects: maps, slot descriptors, layout |
 | `src/metrics.rs` | Prometheus metrics, over a one-page HTTP server |
+| `src/canvas.rs` | drawables, the graphics context, and X's drawing calls |
+| `src/text.rs` | X's core font calls, answered from the host's own fonts |
+| `src/events.rs` | the event queue, and an `XEvent` laid out as the world reads it |
+| `src/window.rs` | winit and softbuffer, translated into X events and one surface |
+| `src/native.rs` | the world's `_X…` primitives, answered without an X server |
 | `self/init.self` | the world: traits object/boolean/block/number/indexable |
 
 Object model as in the C++ VM: prototypes, no classes; slots are data, parent
