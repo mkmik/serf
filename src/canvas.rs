@@ -24,7 +24,9 @@
 ///
 /// Text is the exception, and deliberately: glyphs rasterise at `scale` and
 /// blend at real pixels, so they stay sharp rather than being drawn small and
-/// then doubled.
+/// then doubled. Lines are the other one: the pen walks real pixels, so a
+/// diagonal steps at the display's resolution instead of in blocks. Both cover
+/// the same footprint a 1:1 draw would have, so the world sees no difference.
 pub struct Canvas {
     pub w: i32,
     pub h: i32,
@@ -182,6 +184,24 @@ impl Canvas {
         }
     }
 
+    /// The same, one *real* pixel at a time -- the pen's path on a scaled
+    /// canvas. The clip is the world's, so it is still asked in logical
+    /// coordinates; the bounds test comes first, since a negative real pixel
+    /// would divide towards zero and land on the wrong logical one.
+    fn plot_at(&mut self, g: &Gc, x: i32, y: i32, rgb: u32) {
+        if x < 0 || y < 0 || x >= self.pw() || y >= self.ph() {
+            return;
+        }
+        if !g.allows(x / self.scale, y / self.scale) {
+            return;
+        }
+        let i = (y * self.pw() + x) as usize;
+        self.px[i] = match g.func {
+            Func::Copy => rgb,
+            Func::Xor => (self.px[i] ^ rgb) & 0xFF_FFFF,
+        };
+    }
+
     /// One coverage sample, for antialiased glyphs. Grayscale only, and never
     /// subpixel: Morphic blits its own pixels around constantly, and
     /// subpixel-filtered text refringes as soon as it is moved.
@@ -253,17 +273,25 @@ impl Canvas {
         }
     }
 
-    /// `XDrawLine`, Bresenham.
+    /// `XDrawLine`, Bresenham -- stepped in *real* pixels rather than the
+    /// world's. Run at the world's resolution and then blown up, a diagonal on
+    /// a retina display staircases in `scale`-sized blocks; run at the
+    /// display's, it staircases in its own pixels. A logical endpoint stands
+    /// for the centre of the block it names and the pen is `scale` real pixels
+    /// per logical one, so the footprint is the one an unscaled draw would
+    /// leave -- same width, same ends, finer steps in between.
     ///
     /// ponytail: a line wider than one pixel is a square pen dragged along the
     /// run, so joins and caps are whatever that leaves. X's join and cap styles
     /// need the pen to be a polygon; nothing in Morphic has asked yet.
     pub fn line(&mut self, g: &Gc, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let (h, s) = (self.scale / 2, self.scale);
+        let (x0, y0, x1, y1) = (x0 * s + h, y0 * s + h, x1 * s + h, y1 * s + h);
         let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
         let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
         let (mut x, mut y, mut err) = (x0, y0, dx + dy);
         loop {
-            self.pen(g, x, y);
+            self.nib(g, x, y);
             if x == x1 && y == y1 {
                 break;
             }
@@ -279,15 +307,21 @@ impl Canvas {
         }
     }
 
+    /// The square pen at one logical pixel, for the calls that are still drawn
+    /// in the world's own grid.
     fn pen(&mut self, g: &Gc, x: i32, y: i32) {
-        let n = g.line_width.max(1);
-        if n == 1 {
-            return self.plot(g, x, y, g.fg);
-        }
+        let (h, s) = (self.scale / 2, self.scale);
+        self.nib(g, x * s + h, y * s + h);
+    }
+
+    /// The pen where it actually lands: `line_width` *logical* pixels wide,
+    /// centred on a real one. On an unscaled canvas this is X's own pen.
+    fn nib(&mut self, g: &Gc, x: i32, y: i32) {
+        let n = g.line_width.max(1) * self.scale;
         let half = n / 2;
         for yy in y - half..y - half + n {
             for xx in x - half..x - half + n {
-                self.plot(g, xx, yy, g.fg);
+                self.plot_at(g, xx, yy, g.fg);
             }
         }
     }
@@ -310,9 +344,16 @@ impl Canvas {
         if n < 3 {
             return;
         }
-        let (lo, hi) = (ys[..n].iter().min().unwrap(), ys[..n].iter().max().unwrap());
+        // scanned in real pixels, and with the same centre-of-the-block reading
+        // of a vertex that `line` uses: the world fills a disc and then draws
+        // its outline over it, so a fill that stepped in whole logical blocks
+        // would leave its own coarser staircase sticking out past the edge.
+        let (h, s) = (self.scale / 2, self.scale);
+        let to_real = |v: &[i32]| v[..n].iter().map(|c| c * s + h).collect::<Vec<i32>>();
+        let (xs, ys) = (to_real(xs), to_real(ys));
+        let (lo, hi) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap());
         let mut cross: Vec<i32> = vec![];
-        for y in *lo..=*hi {
+        for y in lo..=hi {
             cross.clear();
             for i in 0..n {
                 let j = (i + 1) % n;
@@ -331,7 +372,7 @@ impl Canvas {
                 // as a line that should not be there.
                 if let [a, b] = pair {
                     for x in *a..*b {
-                        self.plot(g, x, y, g.fg);
+                        self.plot_at(g, x, y, g.fg);
                     }
                 }
             }
@@ -641,6 +682,51 @@ mod tests {
         c.blend(&Gc::default(), 1, 1, 0xFFFFFF, 255);
         assert_eq!(c.at(1, 1), 0xFFFFFF);
         assert_eq!(c.at(0, 0), 0, "blend widened a real pixel into a block");
+    }
+
+    /// The other path that works at the display's resolution: a diagonal
+    /// staircases in real pixels, not in `scale`-sized blocks, while still
+    /// covering the same footprint and the same ends as an unscaled draw.
+    #[test]
+    fn a_diagonal_staircases_at_the_displays_resolution() {
+        let g = Gc { fg: 0xFF0000, ..Gc::default() };
+        let (a, b) = ((0, 0), (4, 2));
+
+        let mut c = Canvas::scaled(8, 6, 0, 2);
+        c.line(&g, a.0, a.1, b.0, b.1);
+        // real pixel 2,1 is in logical block 1,0 -- which a doubled 1:1 line
+        // never touches, because it steps from block 0,0 straight to 1,1
+        assert_eq!(c.at(2, 1), 0xFF0000, "the step is still a whole logical block");
+        assert_eq!(c.get(0, 0), 0xFF0000, "an end moved off its own pixel");
+        assert_eq!(c.get(4, 2), 0xFF0000, "an end moved off its own pixel");
+        assert_eq!(c.get(0, 2), 0, "the line spilled below itself");
+
+        // and it is still the same line: every logical pixel a 1:1 draw inks,
+        // this one inks too
+        let mut flat = Canvas::new(8, 6, 0);
+        flat.line(&g, a.0, a.1, b.0, b.1);
+        for y in 0..6 {
+            for x in 0..8 {
+                if flat.get(x, y) == 0xFF0000 {
+                    assert_eq!(c.get(x, y), 0xFF0000, "logical {},{} went missing", x, y);
+                }
+            }
+        }
+
+        // xor feedback still undoes itself: the rubber band Morphic drags is
+        // the same line drawn twice
+        let x = Gc { fg: 0xFFFFFF, func: Func::Xor, ..Gc::default() };
+        let mut c = Canvas::scaled(8, 6, 0, 2);
+        c.line(&x, a.0, a.1, b.0, b.1);
+        c.line(&x, a.0, a.1, b.0, b.1);
+        assert_eq!(c.px.iter().filter(|&&p| p != 0).count(), 0, "xor left the line behind");
+
+        // and a fill steps as finely as the outline the world draws over it,
+        // or the fill shows past the edge that is meant to cover it
+        let mut c = Canvas::scaled(8, 6, 0, 2);
+        c.fill_polygon(&g, &[0, 8, 0], &[0, 4, 4]);
+        assert_eq!(c.at(4, 3), 0xFF0000, "the fill stepped a whole logical block");
+        assert_eq!(c.at(6, 3), 0, "the fill leaked past its own edge");
     }
 
     /// Morphic draws into a backing pixmap and copies it to the window, so a
