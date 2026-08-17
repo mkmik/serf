@@ -52,6 +52,16 @@ process over from there, so nothing after it on the command line runs.
 ./target/release/serf --load core.snap -e "(snapshotLobby _SlotAt: 'traits') _SlotNames _Size"
 ```
 
+Anywhere a file can be named, so can an `http://` or `https://` URL: it is
+fetched once into `$XDG_CACHE_HOME/serf` (`$SERF_CACHE` overrides, `~/.cache/serf`
+by default) and revalidated from then on — If-Modified-Since and If-None-Match,
+so an unchanged world costs one 304 and no download. Fetching is curl's job.
+When the server cannot be reached, the cached copy is used.
+
+```sh
+./target/release/serf --load https://example.org/worlds/core.snap --run '3 + 4'
+```
+
 `printLine` does **not** work on a loaded world: it goes through that world's
 stdout, which needs Self processes. Use `-e`, which prints the result itself, or
 `'...' _StringPrint`.
