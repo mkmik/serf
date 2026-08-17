@@ -1,4 +1,8 @@
+#[cfg(feature = "native")]
+mod canvas;
 mod compile;
+#[cfg(feature = "native")]
+mod events;
 mod ffi;
 mod gc;
 mod glue_table;
@@ -8,11 +12,17 @@ mod image_obj;
 mod interp;
 mod lexer;
 mod metrics;
+#[cfg(feature = "native")]
+mod native;
 mod obj;
 mod parser;
 mod prims;
 mod struct_table;
+#[cfg(feature = "native")]
+mod text;
 mod value;
+#[cfg(feature = "native")]
+mod window;
 
 use std::io::{BufRead, Write};
 
@@ -644,6 +654,27 @@ fn main() {
             }
             "--stats" => {
                 println!("{}", world_stats(&vm));
+            }
+            // the native canvas, with no window to put it in yet
+            #[cfg(feature = "native")]
+            "--text-demo" | "--draw-demo" => {
+                let text_only = args[i] == "--text-demo";
+                i += 1;
+                let f = args.get(i).cloned().unwrap_or_default();
+                let go = if text_only { text::demo(&f) } else { text::draw_demo(&f) };
+                if let Err(e) = go {
+                    eprintln!("demo failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(feature = "native")]
+            "--event-demo" => events::demo(),
+            // the whole native path at once: pixels, fonts and real input
+            #[cfg(feature = "native")]
+            "--window-demo" => {
+                let secs = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += usize::from(secs.is_some());
+                window::demo(secs.unwrap_or(20));
             }
             "--verify-image" => {
                 i += 1;

@@ -1481,6 +1481,8 @@ pub fn call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, 
 /// not in the table falls back to resolving the longest prefix that dlsym
 /// knows, which covers the Xlib macros.
 fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P, String> {
+    // libX11 is still wanted for libc and libm even in native mode; what
+    // changes is that its X symbols are never reached
     if !vm.ffi.is_loaded() {
         for lib in [
             "libX11.6.dylib",
@@ -1596,15 +1598,31 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
             return untyped_glue(vm, name, f, sel, recv, args);
         }
     };
+    // The native canvas answers the X calls, and it has to be asked before
+    // anything else: `native_wrap` below supplies some of the same names by
+    // calling into libX11, which on a host that has one does not fail -- it
+    // blocks in poll() on a display that was never opened.
+    #[cfg(feature = "native")]
+    let native = vm.native.is_some() && crate::native::claims(cname);
+    #[cfg(not(feature = "native"))]
+    let native = false;
+
     // The _wrap functions live in the VM's own C sources, not in any library
     // (vm/src/unix/prims/unixPrims.cpp), so serf supplies them.
-    if let Some(r) = native_wrap(vm, cname, recv, args)? {
-        return Ok(r);
+    // A glue call that takes or answers an `oop` deals in Self objects rather
+    // than machine words, so it cannot go down the word path at all -- in
+    // native mode as much as any other. Those keep coming through here, and
+    // their bodies branch on the backend instead.
+    let takes_oop = ret == "oop" || argtypes.contains(&"oop");
+    if !native || takes_oop {
+        if let Some(r) = native_wrap(vm, cname, recv, args)? {
+            return Ok(r);
+        }
     }
 
     // MYSELF is the glue's identity function: it boxes the receiver, which is
     // how a plain int becomes a sealed proxy (a unix file descriptor)
-    let handled_here = cname == "MYSELF" || is_x_wrap(cname);
+    let handled_here = cname == "MYSELF" || is_x_wrap(cname) || native;
     let f = if handled_here {
         std::ptr::null_mut()
     } else {
@@ -1677,6 +1695,13 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
     }
     let r = if cname == "MYSELF" {
         words.first().copied().unwrap_or(0)
+    } else if native {
+        #[cfg(feature = "native")]
+        {
+            crate::native::call(vm, cname, &words)?
+        }
+        #[cfg(not(feature = "native"))]
+        unreachable!()
     } else if is_x_wrap(cname) {
         x_wrap(vm, cname, &words)?
     } else if let Some(fixed) = crate::ffi::variadic_fixed(cname) {
@@ -1811,7 +1836,10 @@ fn native_wrap(
     if cname == "XLookupString_wrap" {
         let evt = proxy_ptr(recv).ok_or("deadProxyError")?;
         let o = args[0].as_obj().ok_or("badTypeError")?;
-        let f = vm.ffi.sym("XLookupString").ok_or("primitiveNotDefinedError")?;
+        #[cfg(feature = "native")]
+        let from_native = vm.native.is_some();
+        #[cfg(not(feature = "native"))]
+        let from_native = false;
         let mut ks: u64 = 0;
         let n = {
             // the arena is ours, not C's: hand the call a Rust buffer and
@@ -1821,8 +1849,22 @@ fn native_wrap(
                 return Err("badTypeError".into());
             }
             let mut buf = p.bytes().unwrap();
-            let (ptr, len) = (buf.as_mut_ptr() as u64, buf.len() as u64);
-            let n = crate::ffi::Ffi::call(f, &[evt, ptr, len, &mut ks as *mut u64 as u64, 0])?;
+            let n = if from_native {
+                #[cfg(feature = "native")]
+                {
+                    let (text, keysym) = crate::native::lookup_string_at(evt);
+                    ks = keysym as u64;
+                    let take = text.len().min(buf.len());
+                    buf[..take].copy_from_slice(&text[..take]);
+                    take as u64
+                }
+                #[cfg(not(feature = "native"))]
+                unreachable!()
+            } else {
+                let f = vm.ffi.sym("XLookupString").ok_or("primitiveNotDefinedError")?;
+                let (ptr, len) = (buf.as_mut_ptr() as u64, buf.len() as u64);
+                crate::ffi::Ffi::call(f, &[evt, ptr, len, &mut ks as *mut u64 as u64, 0])?
+            };
             for (k, b) in buf.iter().enumerate() {
                 p.set_byte_at(k, *b);
             }
@@ -1861,6 +1903,10 @@ fn native_wrap(
         let dpy = proxy_ptr(recv).ok_or("deadProxyError")?;
         let d = proxy_ptr(&args[0]).ok_or("deadProxyError")?;
         let gc = proxy_ptr(&args[1]).ok_or("deadProxyError")?;
+        #[cfg(feature = "native")]
+        if cname == "XDrawString16_wrap" && vm.native.is_some() {
+            return Err("primitiveNotDefinedError: no 16-bit text in the native backend".into());
+        }
         if cname == "XDrawString16_wrap" {
             // a vector of 16-bit chars becomes an XChar2b array
             let cs = ints(&args[4])?;
@@ -1876,6 +1922,12 @@ fn native_wrap(
         let (xs, ys) = (ints(&args[2])?, ints(&args[3])?);
         if xs.len() != ys.len() {
             return Err("different number of x and y coordinates".into());
+        }
+        #[cfg(feature = "native")]
+        if vm.native.is_some() {
+            let fill = cname == "XFillPolygon_wrap";
+            crate::native::polygon(vm, fill, d, gc, &xs, &ys);
+            return Ok(Some(P::Val(recv.clone())));
         }
         // XPoint is two shorts
         let pts: Vec<i16> = xs.iter().zip(&ys).flat_map(|(x, y)| [*x as i16, *y as i16]).collect();
@@ -1901,9 +1953,29 @@ fn native_wrap(
         const F_GET_PIXEL: usize = 104; // offsetof(XImage, f.get_pixel) here
         const F_PUT_PIXEL: usize = 112;
         let img = proxy_ptr(recv).ok_or("deadProxyError")? as usize;
-        let (w, h) = unsafe { (*(img as *const i32), *((img + 4) as *const i32)) };
         let put = cname == "XImagePutData_wrap";
-        let f = unsafe { *((img + if put { F_PUT_PIXEL } else { F_GET_PIXEL }) as *const u64) };
+        // This one reaches into the XImage for its size *and for the function
+        // pointer it dispatches every pixel through*, which is only meaningful
+        // when the image really is an Xlib one. The native backend's images are
+        // handles, so reading a function pointer out of one would not fail --
+        // it would jump into whatever that address happens to hold.
+        #[cfg(feature = "native")]
+        let from_native = vm.native.is_some();
+        #[cfg(not(feature = "native"))]
+        let from_native = false;
+        let (w, h, f) = if from_native {
+            #[cfg(feature = "native")]
+            {
+                let (w, h) = crate::native::image_size(vm, img as u64).ok_or("badTypeError")?;
+                (w, h, 0u64)
+            }
+            #[cfg(not(feature = "native"))]
+            unreachable!()
+        } else {
+            let wh = unsafe { (*(img as *const i32), *((img + 4) as *const i32)) };
+            let f = unsafe { *((img + if put { F_PUT_PIXEL } else { F_GET_PIXEL }) as *const u64) };
+            (wh.0, wh.1, f)
+        };
         let map: Vec<i64> = if put {
             match args[1].as_obj().ok_or("badTypeError")?.borrow().payload.vector() {
                 Some(x) => x.iter().map(|v| as_i(v, cname)).collect::<Result<_, _>>()?,
@@ -1925,17 +1997,56 @@ fn native_wrap(
                 let i = (y * w + x) as usize;
                 if put {
                     let p = map.get(px.byte_at(i) as usize).copied().unwrap_or(0);
-                    crate::ffi::Ffi::call(
-                        f as *mut _,
-                        &[img as u64, x as u64, y as u64, p as u64],
-                    )?;
+                    if from_native {
+                        #[cfg(feature = "native")]
+                        crate::native::image_put(vm, img as u64, x, y, p as u32);
+                    } else {
+                        crate::ffi::Ffi::call(
+                            f as *mut _,
+                            &[img as u64, x as u64, y as u64, p as u64],
+                        )?;
+                    }
                 } else {
-                    let p = crate::ffi::Ffi::call(f as *mut _, &[img as u64, x as u64, y as u64])?;
+                    let p = if from_native {
+                        #[cfg(feature = "native")]
+                        {
+                            crate::native::image_get(vm, img as u64, x, y) as u64
+                        }
+                        #[cfg(not(feature = "native"))]
+                        unreachable!()
+                    } else {
+                        crate::ffi::Ffi::call(f as *mut _, &[img as u64, x as u64, y as u64])?
+                    };
                     px.set_byte_at(i, p as u8);
                 }
             }
         }
         return Ok(Some(P::Val(recv.clone())));
+    }
+    // XTranslateCoordinates maps a point from one window's coordinates into
+    // another's, and the world uses it as soon as anything is not at the
+    // origin. There is no C function of this name to fall back on -- it is one
+    // of the VM's own wrappers -- so without an answer here the world gets a
+    // failed primitive and lays out against whatever its IfFail: block
+    // substitutes, which is how a click lands somewhere its morph is not.
+    //
+    // The native backend has one window and no window manager, so it and the
+    // root are the same coordinates and the map is the identity. That is the
+    // same fiction event positions are already reported under: `x_root` is
+    // `x`, because there is nowhere else for the pointer to be.
+    #[cfg(feature = "native")]
+    if cname == "XTranslateCoordinates_wrap" && vm.native.is_some() {
+        let ok = args
+            .get(2)
+            .and_then(|v| v.as_obj())
+            .map(|o| o.borrow().payload.vector_len() >= 2)
+            .unwrap_or(false);
+        if !ok {
+            return Err("badTypeError".into());
+        }
+        // the coordinates come back unchanged, and no child window is under
+        // the point -- `proxy_null` is what the glue declares
+        return Ok(Some(P::Val(Value::obj([], Payload::Proxy(Some(0))))));
     }
     // XNextEvent_wrap answers a clone of the event prototype for the event's
     // type, pointing at a fresh XEvent -- it needs Self objects, so it lives
@@ -1946,11 +2057,20 @@ fn native_wrap(
         let mem = vec![0u8; 192]; // sizeof(XEvent) here
         let p = mem.as_ptr() as u64;
         vm.c_heap.push(mem);
-        let f = vm
-            .ffi
-            .sym(if peek { "XPeekEvent" } else { "XNextEvent" })
-            .ok_or("primitiveNotDefinedError")?;
-        crate::ffi::Ffi::call(f, &[dpy, p])?;
+        #[cfg(feature = "native")]
+        let from_native = vm.native.is_some();
+        #[cfg(not(feature = "native"))]
+        let from_native = false;
+        if from_native {
+            #[cfg(feature = "native")]
+            crate::native::next_event_into(vm, p, peek)?;
+        } else {
+            let f = vm
+                .ffi
+                .sym(if peek { "XPeekEvent" } else { "XNextEvent" })
+                .ok_or("primitiveNotDefinedError")?;
+            crate::ffi::Ffi::call(f, &[dpy, p])?;
+        }
         let ty = unsafe { *(p as *const i32) };
         let pv = args[1].as_obj().ok_or("badTypeError")?.borrow().payload;
         if pv.kind() != PayKind::Vector || ty as usize >= pv.vector_len() {
