@@ -1594,8 +1594,8 @@ fn glue_call(vm: &mut Vm, name: &str, recv: &Value, args: &[Value]) -> Result<P,
         None => {
             let (f, cut) =
                 vm.ffi.split_glue(prim).ok_or_else(|| format!("unknown primitive '{}'", name))?;
-            let sel = &prim[cut..];
-            return untyped_glue(vm, name, f, sel, recv, args);
+            let (cname, sel) = prim.split_at(cut);
+            return untyped_glue(vm, name, f, cname, sel, recv, args);
         }
     };
     // The native canvas answers the X calls, and it has to be asked before
@@ -2362,10 +2362,22 @@ fn untyped_glue(
     vm: &mut Vm,
     name: &str,
     f: *mut std::os::raw::c_void,
+    cname: &str,
     sel: &str,
     recv: &Value,
     args: &[Value],
 ) -> Result<P, String> {
+    // The X macros come through here too -- `_XOpenDisplayResultProxy:` above
+    // all -- and dlsym finds them in libX11 whenever the host has one. Ask the
+    // native canvas first, or a Mac with XQuartz installed opens a real
+    // display (or fails to) rather than serf's own window.
+    #[cfg(feature = "native")]
+    let native = vm.native.is_some() && crate::native::claims(cname);
+    #[cfg(not(feature = "native"))]
+    let native = {
+        let _ = cname; // only the native path looks at the C name
+        false
+    };
     // as in glue_call: `...ResultProxy:` fills the last argument, the unary
     // `...ResultProxy` fills the receiver and passes nothing
     let by_receiver = !sel.ends_with("ResultProxy:") && sel.ends_with("ResultProxy");
@@ -2380,7 +2392,16 @@ fn untyped_glue(
     for a in &args[..n] {
         words.push(to_word(vm, a, &mut keep, &mut back)?);
     }
-    let mut r = crate::ffi::Ffi::call(f, &words)?;
+    let mut r = if native {
+        #[cfg(feature = "native")]
+        {
+            crate::native::call(vm, cname, &words)?
+        }
+        #[cfg(not(feature = "native"))]
+        unreachable!()
+    } else {
+        crate::ffi::Ffi::call(f, &words)?
+    };
     // A snapshot remembers the display it was saved on, which is somebody
     // else's machine; rather than make the world ask, fall back to $DISPLAY.
     // Set SERF_DISPLAY_STRICT to keep the world's own answer.

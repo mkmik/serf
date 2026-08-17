@@ -1,9 +1,10 @@
 //! The world's X calls, answered here instead of by an X server.
 //!
-//! `SERF_BACKEND=native` puts this in front of the FFI path in `prims.rs`. The
-//! world's own code does not change and neither does the image: the glue
-//! primitives it calls are the same, the C structs it pokes at are the same
-//! bytes, and only what sits behind `XFillRectangle` is different.
+//! The default on macOS, and `SERF_BACKEND=native` anywhere else, puts this in
+//! front of the FFI path in `prims.rs`. The world's own code does not change
+//! and neither does the image: the glue primitives it calls are the same, the
+//! C structs it pokes at are the same bytes, and only what sits behind
+//! `XFillRectangle` is different.
 //!
 //! Two things carry most of the weight:
 //!

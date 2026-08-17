@@ -266,7 +266,8 @@ case "${SERF_X11:-headless}" in
      fi ;;
 esac
 if [ -n "$D" ]; then
-  out=$(DISPLAY=$D $R self/x11-demo.self 2>&1 | tail -1)
+  # explicit: on macOS the native canvas would otherwise answer these calls
+  out=$(SERF_BACKEND=x11 DISPLAY=$D $R self/x11-demo.self 2>&1 | tail -1)
   [ "$out" = "drew" ] || { echo "x11 demo failed on $D: $out"; exit 1; }
   echo "x11 demo ok ($D)"
 fi

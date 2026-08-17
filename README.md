@@ -32,14 +32,16 @@ cargo install selflang     # crates.io already had a `serf`; the binary is still
 ## Run the Self 4.4 demo world
 
 The snapshots are too big to ship in the crate, so point serf at one in the
-repo, and start XQuartz (macOS) or use your X display (Linux):
+repo (on Linux, with an X display to draw on):
 
 ```sh
 serf https://github.com/mkmik/serf/raw/main/Demo-4.4.snap
 ```
 
 The world takes the process over from there: it prints the Self 4.4 banner on
-the terminal and opens its desktop on `$DISPLAY`.
+the terminal and opens its desktop — on macOS in a window of serf's own, drawn
+without an X server, and on Linux on `$DISPLAY`. `SERF_BACKEND=native` or
+`=x11` asks for either one where the default is not what you want.
 
 ![The Self 4.4 demo world, booted by serf](https://raw.githubusercontent.com/mkmik/serf/main/shots/19-demo-4.4.png)
 

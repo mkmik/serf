@@ -103,14 +103,18 @@ DISPLAY=:99 xwd -root -silent > shot.xwd               # look at the result
 
 The world draws the way X does — `XCreateGC`, `XFillRectangle`, `XCopyArea`,
 `XLoadQueryFont` with an XLFD and then `XDrawString` — but nothing says an X
-server has to be behind that. `SERF_BACKEND=native` answers those calls in serf
+server has to be behind that. The native backend answers those calls in serf
 itself, onto a buffer of `0x00RRGGBB` pixels, with text from the fonts installed
 on the host. No Self code changes: it is the same interface the image already
 codes against.
 
+It is the default on macOS, which ships no X server; elsewhere ask for it with
+`SERF_BACKEND=native`. `SERF_BACKEND=x11` goes back to a real server either way.
+
 ```sh
-SERF_BACKEND=native ./target/release/serf morphic.snap
-SERF_SHOT=f.png SERF_BACKEND=native ./target/release/serf Demo-4.4.snap
+./target/release/serf morphic.snap                     # native, on macOS
+SERF_BACKEND=native ./target/release/serf morphic.snap # native, anywhere
+SERF_SHOT=f.png ./target/release/serf Demo-4.4.snap
 
 ./target/release/serf --draw-demo draw.png    # every drawing call, one sheet
 ./target/release/serf --text-demo fonts.png   # the fonts the world asks for
