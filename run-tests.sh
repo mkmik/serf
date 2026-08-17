@@ -234,6 +234,14 @@ if command -v python3 >/dev/null && command -v curl >/dev/null; then
   n=0
   while ! grep -q "port" "$T/www.log" 2>/dev/null && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
   port=$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$T/www.log")
+  # Without this, a server that never came up is reported as two fetches of a
+  # URL with an empty port, which says nothing about which of the two failed.
+  [ -n "$port" ] || {
+    echo "url fetch: python printed no port in 10s; its output was:"
+    cat "$T/www.log"
+    kill $httpd 2>/dev/null
+    exit 1
+  }
   U="http://127.0.0.1:$port/hello.self"
   got=$(SERF_CACHE="$T/cache" $R "$U" 2>&1 | tail -1)
   # and again: the file is on disk, so this asks the server only whether it changed
