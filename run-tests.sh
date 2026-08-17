@@ -231,13 +231,17 @@ if command -v python3 >/dev/null && command -v curl >/dev/null; then
   # -u: the line naming the port is on stdout, which python buffers into a file
   python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$T/www" >"$T/www.log" 2>&1 &
   httpd=$!
+  # A minute rather than the ten seconds this used to allow: the first python3
+  # on a cold macOS runner takes tens of seconds to get as far as printing the
+  # port, and it had been failing there with an empty log. Waiting longer is
+  # free everywhere else, since the loop leaves the moment the line appears.
   n=0
-  while ! grep -q "port" "$T/www.log" 2>/dev/null && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+  while ! grep -q "port" "$T/www.log" 2>/dev/null && [ $n -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
   port=$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$T/www.log")
   # Without this, a server that never came up is reported as two fetches of a
   # URL with an empty port, which says nothing about which of the two failed.
   [ -n "$port" ] || {
-    echo "url fetch: python printed no port in 10s; its output was:"
+    echo "url fetch: python printed no port in 60s; its output was:"
     cat "$T/www.log"
     kill $httpd 2>/dev/null
     exit 1
