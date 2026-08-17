@@ -183,6 +183,16 @@ and copies that to the window, so a copy that worked a logical pixel at a time
 would flatten every glyph on the way. `SERF_SCALE=1` forces it off, which is the
 only way a headless run has of saying.
 
+Lines and polygon fills are the third. Bresenham run in the world's grid and then
+widened staircases in whole blocks — a diagonal line morph comes out visibly
+coarser than the text beside it — so the pen walks real pixels instead, and the
+scanline fill with it. A vertex means the centre of the block it names, and the
+pen is `scale` real pixels per logical one, so both cover the footprint a 1:1
+draw would leave and only the steps between get finer. They have to move
+together: the world fills a disc and then draws its outline over it, and a fill
+still stepping in blocks would show past the edge meant to cover it. Rectangles
+stay block-aligned, since an axis-aligned edge has no staircase to lose.
+
 ### Input, which is bytes rather than a call
 
 An event is the one place the world does not go through a function at all. It
