@@ -271,3 +271,15 @@ if [ -n "$D" ]; then
   [ "$out" = "drew" ] || { echo "x11 demo failed on $D: $out"; exit 1; }
   echo "x11 demo ok ($D)"
 fi
+
+# The same demo with no X server at all: the native canvas answers the calls
+# itself. Only where it is the default backend, since elsewhere it would want
+# the display the X leg just used. It opens a real window for a few seconds --
+# SERF_NATIVE=off skips it -- and SERF_SHOT writes what it drew, so a run with
+# nobody watching still says whether pixels came out.
+if [ "${SERF_NATIVE:-on}" != off ] && [ "$(uname)" = Darwin ]; then
+  out=$(SERF_BACKEND=native SERF_SHOT="$T/native.png" $R self/x11-demo.self 2>&1 | tail -1)
+  [ "$out" = "drew" ] || { echo "native demo failed: $out"; exit 1; }
+  [ -s "$T/native.png" ] || { echo "native demo wrote no shot"; exit 1; }
+  echo "native demo ok"
+fi

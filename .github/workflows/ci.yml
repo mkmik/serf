@@ -10,7 +10,14 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # macOS is not a second copy of the same run: it is the only place the
+    # native canvas is the default backend, so it is what says the X-free path
+    # still draws. It needs no X server, which is why it installs nothing.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       # run-tests.sh runs the heap and obj tests under Miri too -- that is what
@@ -23,8 +30,10 @@ jobs:
           components: miri, rust-src
       - uses: dtolnay/rust-toolchain@stable
       # The X11 foreign-call check needs a display; the suite brings up its own
-      # Xvfb and skips when the binary is missing.
-      - run: sudo apt-get update -qq && sudo apt-get install -qq -y xvfb
+      # Xvfb and skips when the binary is missing -- as it does on macOS, where
+      # the native canvas answers those same calls instead.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -qq -y xvfb
       - run: ./run-tests.sh
 
   # Every merge to main is a minor release. Lives here rather than in its own
