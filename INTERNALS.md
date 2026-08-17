@@ -207,6 +207,13 @@ Three things about that layout are not optional:
   come back out of the encoded keycode. Keycodes are derived from the keysym in
   two disjoint bands, because folding both into a low byte puts `XK_Return` on
   the same keycode as Ctrl-M.
+* **The editing keys are text, not keysyms.** Self reads them out of the bytes
+  `XLookupString` answers: `keyCapForCharacter:` calls 8 backspace, 9 tab, 13
+  enter, 27 escape and 127 delete, and every `^`-command from the control
+  character X folds a letter to. Answer no bytes for those, as a translation
+  that only passes printable characters does, and a text box takes letters and
+  edits nothing — no backspace, no Return, no `^k`. Arrows really do have no
+  text, in X either; the world reads those off the keysym.
 * **Events carry a timestamp**, at offset 56. Morphic tells a click from a
   double click from a press-and-hold by *when* they arrived, so a frozen clock
   makes every gesture identical — a single click does nothing at all and two in
@@ -216,18 +223,24 @@ Three things about that layout are not optional:
   nothing to the world: motion with a button held is a *drag*, so passing those
   on turns every click into one and picks morphs up instead of clicking them.
 
-Only a hand on the mouse can click a world, which makes a bug in what a click
-*does* the one kind this cannot chase on its own — so it can be told to click:
+Only a hand on the mouse and keyboard can drive a world, which makes a bug in
+what a click or a keystroke *does* the one kind this cannot chase on its own —
+so it can be told to click and to type:
 
 ```sh
-SERF_TRACE_INPUT=1 …    # every event as it is handed to the world
-SERF_CLICK=254,681@20   # click there after 20s; `x2` for twice
+SERF_TRACE_INPUT=1 …       # every event as it is handed to the world,
+                           # and every XLookupString the world reads back
+SERF_CLICK=254,681@20      # click there after 20s; `x2` for twice
+SERF_KEYS='abc\b^aZ@23'    # then type, at the same place, from 23s
 ```
 
 `SERF_CLICK` spreads its press and release over time on purpose. A real click is
 a press, a pause and a release, and the world sees each in a different turn of
 its own loop; firing them into the queue together is a different gesture, and
-one the world reads differently.
+one the world reads differently. `SERF_KEYS` types one key per 80ms: `\r`, `\b`,
+`\t`, `\e` and `\L\R\U\D` for the keys an editor steers by, `^a` for that key
+with Control held. With `SERF_SHOT=…`, that is a whole editing session with
+nobody watching — which is how the text boxes above were found not to edit.
 
 ### What is deliberately not there
 
