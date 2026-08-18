@@ -293,6 +293,16 @@ pub fn describe(vm: &Vm, u: Unwind) -> String {
     }
 }
 
+/// `SERF_TRACE_SEL=error:` -- dump the Self stack, receivers and all, every
+/// time that selector is sent. An `error:` the world raises is caught and
+/// printed by the world, so the interpreter's own trace never sees it, and all
+/// that reaches the terminal is a message and a receiver. This says where it
+/// came from. Read once per `run_stack` so a send pays a local compare.
+fn trace_sel() -> Option<&'static str> {
+    static S: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::env::var("SERF_TRACE_SEL").ok()).as_deref()
+}
+
 fn err(frames: &[Frame], msg: String) -> Unwind {
     let trace = frames
         .iter()
@@ -363,6 +373,7 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
     let mut lex_level: usize = 0;
     let mut delegatee: Option<Rc<str>> = None;
     let mut resend = false;
+    let traced = trace_sel();
 
     loop {
         // The safepoint. Allocation only ever asks for a collection; it
@@ -639,6 +650,23 @@ pub fn run_stack(vm: &mut Vm, frames: &mut Vec<Frame>) -> Result<Outcome, Unwind
                                 cur_resend = false;
                                 continue;
                             }
+                        }
+                    }
+
+                    if traced.is_some_and(|s| s == &*cur_sel) {
+                        eprintln!(
+                            "serf: '{}' sent to {:.100} from",
+                            cur_sel,
+                            default_print_string(vm, &cur_recv)
+                        );
+                        for f in frames.iter().rev().take(40) {
+                            eprintln!(
+                                "  at {} ({}:{}) in {:.100}",
+                                f.method.sel,
+                                f.method.file,
+                                f.method.line,
+                                default_print_string(vm, &act_recv(f.scope))
+                            );
                         }
                     }
 

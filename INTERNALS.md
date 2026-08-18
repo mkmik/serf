@@ -239,17 +239,32 @@ so it can be told to click and to type:
 ```sh
 SERF_TRACE_INPUT=1 …       # every event as it is handed to the world,
                            # and every XLookupString the world reads back
-SERF_CLICK=254,681@20      # click there after 20s; `x2` for twice
-SERF_KEYS='abc\b^aZ@23'    # then type, at the same place, from 23s
+SERF_CLICK=254,681@20      # click there after 20s; `x2` for twice,
+                           # `b2` for the middle button, `;` for the next click
+SERF_KEYS='abc\b^aZ@23'    # then type, at the last place clicked, from 23s
 ```
 
 `SERF_CLICK` spreads its press and release over time on purpose. A real click is
 a press, a pause and a release, and the world sees each in a different turn of
 its own loop; firing them into the queue together is a different gesture, and
-one the world reads differently. `SERF_KEYS` types one key per 80ms: `\r`, `\b`,
-`\t`, `\e` and `\L\R\U\D` for the keys an editor steers by, `^a` for that key
-with Control held. With `SERF_SHOT=…`, that is a whole editing session with
-nobody watching — which is how the text boxes above were found not to edit.
+one the world reads differently. Points are in the window's own coordinates,
+which on a retina display are half of what `SERF_SHOT` writes.
+
+A whole gesture goes in one variable, because the world's own menu takes two
+clicks in two places: `SERF_CLICK='400,400@8b2;398,279@12'` raises the
+background menu — X's *middle* button, not the right one, which drags out a
+selection carpet — and then picks the item that landed under the second point.
+
+`SERF_KEYS` types one key per 80ms: `\r`, `\b`, `\t`, `\e` and `\L\R\U\D` for the
+keys an editor steers by, `^a` for that key with Control held. With
+`SERF_SHOT=…`, that is a whole editing session with nobody watching — which is
+how the text boxes above were found not to edit.
+
+When something in the world raises an error rather than misdrawing, the world
+catches it and prints a message and a receiver, and no stack. `SERF_TRACE_SEL=`
+a selector dumps the Self stack, receivers and all, every time that selector is
+sent — `SERF_TRACE_SEL=error:` is how a `ui2Button` was found asking a menu that
+had already popped down which world it was in.
 
 ### What is deliberately not there
 

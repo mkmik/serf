@@ -195,11 +195,18 @@ impl Parser {
             }
         };
         self.i += 1;
-        let mut args = vec![self.binary()?];
+        // Each argument is a whole expression, not just a binary one, which is
+        // what `Parser::parseExpr` recurses into for one (parser.cpp). So a
+        // *lower*case keyword in argument position opens a nested message --
+        // `a attach: b newOutlinerFor: c InWorld: d` is `a attach: (b
+        // newOutlinerFor: c InWorld: d)` -- while a capitalised one belongs to
+        // the message being parsed here, because the nested `kw_tail` starts
+        // only on a `Kw` and hands a `CapKw` straight back to the loop below.
+        let mut args = vec![self.expr()?];
         while let Tok::CapKw(k) = self.tok().clone() {
             self.i += 1;
             sel.push_str(&k);
-            args.push(self.binary()?);
+            args.push(self.expr()?);
         }
         let kind = match recv {
             Some(_) => SendKind::Normal,

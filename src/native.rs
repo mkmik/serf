@@ -73,9 +73,10 @@ pub struct Native {
     /// what `XSelectInput` last asked for, so `XGetWindowAttributes` can say
     selected: u64,
     /// `SERF_CLICK=x,y[@seconds]`: clicks to make once the world is up, so a
-    /// misbehaving one can be reproduced without a hand on the mouse. Only the
-    /// world can be clicked, and only a person can click it -- which makes a
-    /// bug in what a click does the one kind this cannot chase on its own.
+    /// misbehaving one can be reproduced without a hand on the mouse. A whole
+    /// gesture fits, buttons and all, because the interesting bugs are in what
+    /// the *second* click does: the world's own menu is button 2, and it takes
+    /// one click to raise it and another somewhere else to pick from it.
     ///
     /// Spread over time on purpose. A real click is a press, a pause, and a
     /// release, and the world sees each in a different turn of its own loop;
@@ -838,36 +839,67 @@ fn scripted_input() -> Vec<(std::time::Instant, crate::events::Event)> {
     out
 }
 
-/// Where a scripted click aims, `SERF_CLICK=x,y...`, which is also where the
-/// scripted keys are typed: a keystroke goes to the world's keyboard focus, but
-/// the event still carries a place, and a hand types where it just clicked.
-fn click_at() -> Option<(i32, i32)> {
-    let v = std::env::var("SERF_CLICK").ok()?;
-    let (x, y) = v.split(['@', 'x']).next()?.split_once(',')?;
-    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+/// One `x,y[@seconds][xN][b<button>]` out of `SERF_CLICK`.
+struct Click {
+    x: i32,
+    y: i32,
+    after: f64,
+    times: u64,
+    button: u32,
 }
 
-/// `SERF_CLICK=x,y[@seconds][xN]` -- N clicks at that point, starting then.
+fn clicks() -> Vec<Click> {
+    let Ok(v) = std::env::var("SERF_CLICK") else { return vec![] };
+    parse_clicks(&v)
+}
+
+fn parse_clicks(v: &str) -> Vec<Click> {
+    v.split(';')
+        .filter_map(|part| {
+            let (part, button) = part.rsplit_once('b').unwrap_or((part, "1"));
+            let (part, times) = part.split_once('x').unwrap_or((part, "1"));
+            let (at, after) = part.split_once('@').unwrap_or((part, "20"));
+            let (x, y) = at.split_once(',')?;
+            Some(Click {
+                x: x.trim().parse().ok()?,
+                y: y.trim().parse().ok()?,
+                after: after.trim().parse().unwrap_or(20.0),
+                times: times.trim().parse().unwrap_or(1),
+                button: button.trim().parse().unwrap_or(1),
+            })
+        })
+        .collect()
+}
+
+/// Where the scripted keys are typed: a keystroke goes to the world's keyboard
+/// focus, but the event still carries a place, and a hand types where it last
+/// clicked.
+fn click_at() -> Option<(i32, i32)> {
+    clicks().last().map(|c| (c.x, c.y))
+}
+
+/// `SERF_CLICK=x,y[@seconds][xN][b<button>]` -- N clicks at that point with
+/// that button, starting then; `;` joins several into one gesture, which is
+/// what popping up a menu at one place and picking an item at another takes.
 /// A press, a pause, a release, and a gap before the next, because that is
 /// what a hand does and what the world is written to recognise.
 fn scripted_clicks() -> Vec<(std::time::Instant, crate::events::Event)> {
-    use crate::events::{Event, Pointer, BUTTON1_MASK};
-    let Ok(v) = std::env::var("SERF_CLICK") else { return vec![] };
-    let (v, times) = v.split_once('x').unwrap_or((v.as_str(), "1"));
-    let (_, after) = v.split_once('@').unwrap_or((v, "20"));
-    let Some((x, y)) = click_at() else { return vec![] };
-    let start =
-        std::time::Instant::now() + Duration::from_secs_f64(after.trim().parse().unwrap_or(20.0));
-    let at = Pointer { x, y, x_root: x, y_root: y, state: 0 };
-    let down = Pointer { state: BUTTON1_MASK, ..at };
-    let mut out = vec![(start, Event::Motion { window: 1, at })];
-    for i in 0..times.trim().parse().unwrap_or(1) {
-        let base = start + Duration::from_millis(120 + i * 400);
-        out.push((base, Event::Button { press: true, window: 1, at, button: 1 }));
-        out.push((
-            base + Duration::from_millis(90),
-            Event::Button { press: false, window: 1, at: down, button: 1 },
-        ));
+    use crate::events::{Event, Pointer};
+    let now = std::time::Instant::now();
+    let mut out = vec![];
+    for c in clicks() {
+        let start = now + Duration::from_secs_f64(c.after);
+        let at = Pointer { x: c.x, y: c.y, x_root: c.x, y_root: c.y, state: 0 };
+        let down = Pointer { state: crate::window::button_bit(c.button), ..at };
+        out.push((start, Event::Motion { window: 1, at }));
+        for i in 0..c.times {
+            let base = start + Duration::from_millis(120 + i * 400);
+            out.push((base, Event::Button { press: true, window: 1, at, button: c.button }));
+            out.push((
+                base + Duration::from_millis(90),
+                Event::Button { press: false, window: 1, at: down, button: c.button },
+            ));
+        }
     }
     out
 }
@@ -952,6 +984,21 @@ fn drain(n: &mut Native) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scripted gesture is only worth having if it lands where it says, and
+    /// every field of one is optional, so the defaults are the contract:
+    /// button 1, once, twenty seconds in.
+    #[test]
+    fn a_gesture_parses_into_the_clicks_it_names() {
+        let c = parse_clicks("400,400@8b2;398,279@12");
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].x, c[0].y, c[0].after, c[0].times, c[0].button), (400, 400, 8.0, 1, 2));
+        assert_eq!((c[1].x, c[1].y, c[1].after, c[1].times, c[1].button), (398, 279, 12.0, 1, 1));
+
+        let d = parse_clicks("10,20x3");
+        assert_eq!((d[0].after, d[0].times, d[0].button), (20.0, 3, 1));
+        assert!(parse_clicks("nonsense").is_empty(), "a place that is not a point is no click");
+    }
 
     /// Handles are what the world hands back, so a drawable must never be
     /// mistaken for a GC and index 0 must not be a null pointer -- a `proxy`
