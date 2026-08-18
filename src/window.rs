@@ -74,7 +74,7 @@ fn x_button(b: MouseButton) -> Option<u32> {
 
 /// The bit a held button contributes to an event's `state`. Buttons 1..5 sit in
 /// bits 8..12, so a wheel "button" has one too.
-fn button_bit(button: u32) -> u32 {
+pub fn button_bit(button: u32) -> u32 {
     if (1..=5).contains(&button) {
         1 << (7 + button)
     } else {

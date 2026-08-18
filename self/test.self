@@ -1,8 +1,11 @@
 "Self-hosted test suite. Run: cargo run --release -- self/test.self
  Any failure raises, which makes the VM exit non-zero.
 
- Note the parentheses around keyword sends used as keyword arguments: as in
- the real Self grammar, `a: b c: d` is one message, never two nested ones."
+ Note the parentheses around keyword sends used as keyword arguments. A
+ keyword argument is a whole expression (`Parser::parseExpr` recurses into
+ one), so a *lower*case keyword there opens a nested message and swallows the
+ capitalised parts that follow: `a: b c: d E: f` is `a: (b c:E: d f)`, never
+ `a:E:`. The parentheses say which one was meant."
 
 globals _AddSlots: ( | t = (| parent* = traits object.
     n <- 0.
@@ -13,6 +16,17 @@ globals _AddSlots: ( | t = (| parent* = traits object.
                     , ' want ' , want printString ].
         self ).
 | ) | ).
+
+"--- keyword nesting. Every ui2 button script in the 4.4 world is stored as
+ source and reparsed on the click, and the world writes them unparenthesised
+ (`event sourceHand attach: selfObjectModel newOutlinerFor: m InWorld: w`), so
+ an argument that stops at a binary expression loses the whole menu"
+globals _AddSlots: ( | k = (| parent* = traits object.
+    a: x       = ( 'a:'   , x ).
+    b: x C: y  = ( 'b:C:' , x , y ).
+| ) | ).
+t check: 'kw arg nests'  Is: (k a: k b: 'p' C: 'q')   Should: 'a:b:C:pq'.
+t check: 'CapKw is mine' Is: (k b: 'p' C: 'q')        Should: 'b:C:pq'.
 
 "--- literals, arithmetic, precedence (binary is strictly left to right)"
 t check: 'add'      Is: 3 + 4            Should: 7.
