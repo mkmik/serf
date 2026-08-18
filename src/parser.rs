@@ -4,7 +4,7 @@
 //! body, which the compiler inlines; `(| slots |)` has no body and becomes a
 //! constant object; in slot position a body makes it a method.
 
-use crate::lexer::{lex, Spanned, Tok};
+use crate::lexer::{lex, lex_script, Spanned, Tok};
 
 #[derive(Debug, Clone)]
 pub enum SendKind {
@@ -32,6 +32,8 @@ pub struct SlotDecl {
     pub parent: bool,
     pub mutable: bool,
     pub init: Option<Expr>,
+    /// the `{ '...' }` group this slot stands in, if any
+    pub anno: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub struct ObjLit {
     pub slots: Vec<SlotDecl>,
     pub body: Vec<Expr>,
     pub line: u32,
+    /// what `{} = '...'` in the slot list said
+    pub anno: Option<Vec<u8>>,
 }
 
 /// Source line a statement starts on, for error traces.
@@ -61,8 +65,29 @@ pub struct Parser {
     i: usize,
 }
 
+/// Nested `{ }` groups join their annotations with DEL, as
+/// `extend_annotation` does in vm/src/any/parser/expr.cpp -- which is why a
+/// world's annotations read as `ModuleInfo: ...\x7fVisibility: public`.
+fn extend_anno(outer: &[u8], s: &[u8]) -> Vec<u8> {
+    if outer.is_empty() {
+        return s.to_vec();
+    }
+    let mut v = outer.to_vec();
+    v.push(0x7f);
+    v.extend_from_slice(s);
+    v
+}
+
 pub fn parse_program(src: &[u8]) -> Result<Vec<Expr>, String> {
     let mut p = Parser { t: lex(src)?, i: 0 };
+    let body = p.statements(&Tok::Eof)?;
+    Ok(body)
+}
+
+/// The same, for a file: its statements are separated by newlines as well as
+/// by periods. See `lex_script`.
+pub fn parse_script(src: &[u8]) -> Result<Vec<Expr>, String> {
+    let mut p = Parser { t: lex_script(src)?, i: 0 };
     let body = p.statements(&Tok::Eof)?;
     Ok(body)
 }
@@ -115,10 +140,6 @@ impl Parser {
         }
         false
     }
-    /// A slot list ends at a bare `|`; `||` and friends are binary selectors.
-    fn at_bar(&self) -> bool {
-        self.tok() == &Tok::Op("|".to_string())
-    }
     fn eat_exact_op(&mut self, s: &str) -> bool {
         if self.tok() == &Tok::Op(s.to_string()) {
             self.i += 1;
@@ -133,7 +154,7 @@ impl Parser {
     fn statements(&mut self, close: &Tok) -> Result<Vec<Expr>, String> {
         let mut out = vec![];
         loop {
-            while self.tok() == &Tok::Dot {
+            while self.tok() == &Tok::Dot || self.tok() == &Tok::Accept {
                 self.i += 1;
             }
             if self.tok() == close {
@@ -148,7 +169,13 @@ impl Parser {
                 self.expr()?
             };
             out.push(e);
-            if self.tok() != &Tok::Dot && self.tok() != close {
+            // A script is a sequence of expressions, and the `.` between them
+            // is optional: evalExpressions in shell.cpp reads one expression
+            // at a time and readExpr eats a `.` only if there is one. That is
+            // how a fileout's header -- two string literals, no period --
+            // reads. Inside a `( )` a period is still required, as parseBody
+            // has it.
+            if close != &Tok::Eof && self.tok() != &Tok::Dot && self.tok() != close {
                 return self.err("expected '.' between statements");
             }
         }
@@ -195,11 +222,16 @@ impl Parser {
             }
         };
         self.i += 1;
-        let mut args = vec![self.binary()?];
+        // an argument is a whole expression, not just a binary one: `a foo: b
+        // bar: c` is `a foo: (b bar: c)`, which is how a fileout writes
+        // `bootstrap define: ... ToBe: bootstrap addSlotsTo: ... From: ...`.
+        // A `Bar:` part is not a keyword, so it still binds to the innermost
+        // keyword message being built -- parseExpr in parser.cpp.
+        let mut args = vec![self.expr()?];
         while let Tok::CapKw(k) = self.tok().clone() {
             self.i += 1;
             sel.push_str(&k);
-            args.push(self.binary()?);
+            args.push(self.expr()?);
         }
         let kind = match recv {
             Some(_) => SendKind::Normal,
@@ -217,11 +249,21 @@ impl Parser {
                     Tok::Op(o) => o,
                     _ => unreachable!(),
                 };
-                let arg = self.unary()?;
+                let arg = self.binary_arg()?;
                 Expr::Send { recv: None, sel: op, args: vec![arg], kind, line }
             } else {
                 self.unary()?
             }
+        } else if matches!(self.tok(), Tok::Op(o) if o != "|") {
+            // nothing to the left of the operator: `+ 1` is `self + 1`, the
+            // implicit-self binary send parseBinary makes. A bare `|` is not
+            // an operator here -- it closes a slot list.
+            let op = match self.bump() {
+                Tok::Op(o) => o,
+                _ => unreachable!(),
+            };
+            let arg = self.binary_arg()?;
+            Expr::Send { recv: None, sel: op, args: vec![arg], kind: SendKind::ImplicitSelf, line }
         } else {
             self.unary()?
         };
@@ -232,7 +274,7 @@ impl Parser {
             }
             let line = self.line();
             self.i += 1;
-            let arg = self.unary()?;
+            let arg = self.binary_arg()?;
             e = Expr::Send {
                 recv: Some(Box::new(e)),
                 sel: op,
@@ -242,6 +284,17 @@ impl Parser {
             };
         }
         Ok(e)
+    }
+
+    /// The right of a binary send: a unary expression, or a whole keyword
+    /// message where one starts -- `a + foo: b` is `a + (self foo: b)`, which
+    /// is how `textBox origin + offsetOfItem: i` reads. parseBinary again.
+    fn binary_arg(&mut self) -> Result<Expr, String> {
+        if matches!(self.tok(), Tok::Kw(_)) {
+            self.expr()
+        } else {
+            self.unary()
+        }
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
@@ -313,35 +366,65 @@ impl Parser {
     /// Opening delimiter already consumed.
     fn object(&mut self, close: &Tok) -> Result<ObjLit, String> {
         let line = self.line();
-        let mut o = ObjLit { args: vec![], slots: vec![], body: vec![], line };
+        let mut o = ObjLit { args: vec![], slots: vec![], body: vec![], line, anno: None };
         if self.eat_op_prefix('|') {
-            self.slots(&mut o)?;
+            self.slots(&mut o, &[], &Tok::Op("|".to_string()))?;
         }
         o.body = self.statements(close)?;
         self.expect(close, "a closing delimiter")?;
         Ok(o)
     }
 
-    fn slots(&mut self, o: &mut ObjLit) -> Result<(), String> {
+    /// A slot list, or the inside of a `{ '...' ... }` group: same grammar,
+    /// different terminator. `close` is the bare `|` that ends a slot list --
+    /// `||` and friends are binary selectors -- or the `}` that ends a group.
+    /// Every slot in a group carries its annotation, groups nest, and `{} =
+    /// '...'` anywhere in them is the object's own annotation.
+    fn slots(&mut self, o: &mut ObjLit, anno: &[u8], close: &Tok) -> Result<(), String> {
         loop {
             while self.tok() == &Tok::Dot {
                 self.i += 1;
             }
-            if self.at_bar() {
+            if self.tok() == close {
                 self.i += 1;
                 return Ok(());
             }
             if self.tok() == &Tok::Eof {
                 return self.err("unterminated slot list");
             }
-            self.one_slot(o)?;
-            if self.tok() != &Tok::Dot && !self.at_bar() {
+            if self.tok() == &Tok::LBrace {
+                self.i += 1;
+                if self.tok() == &Tok::RBrace {
+                    self.i += 1;
+                    if !self.eat_exact_op("=") {
+                        return self.err("expected '=' after '{}'");
+                    }
+                    o.anno = Some(self.anno_string()?);
+                } else {
+                    let inner = extend_anno(anno, &self.anno_string()?);
+                    self.slots(o, &inner, &Tok::RBrace)?;
+                }
+                continue; // an annotation is not a slot: no '.' need follow it
+            }
+            self.one_slot(o, anno)?;
+            if self.tok() != &Tok::Dot && self.tok() != close {
                 return self.err("expected '.' or '|' after a slot");
             }
         }
     }
 
-    fn one_slot(&mut self, o: &mut ObjLit) -> Result<(), String> {
+    fn anno_string(&mut self) -> Result<Vec<u8>, String> {
+        match self.tok().clone() {
+            Tok::Str(s) => {
+                self.i += 1;
+                Ok(s)
+            }
+            _ => self.err("expected a string holding an annotation"),
+        }
+    }
+
+    fn one_slot(&mut self, o: &mut ObjLit, anno: &[u8]) -> Result<(), String> {
+        let anno = (!anno.is_empty()).then(|| anno.to_vec());
         match self.tok().clone() {
             Tok::Arg(n) => {
                 self.i += 1;
@@ -353,12 +436,24 @@ impl Parser {
                 let parent = self.eat_op_prefix('*');
                 if self.eat_exact_op("=") {
                     let init = self.expr()?;
-                    o.slots.push(SlotDecl { name: n, parent, mutable: false, init: Some(init) });
+                    o.slots.push(SlotDecl {
+                        name: n,
+                        parent,
+                        mutable: false,
+                        init: Some(init),
+                        anno,
+                    });
                 } else if self.eat_exact_op("<-") {
                     let init = self.expr()?;
-                    o.slots.push(SlotDecl { name: n, parent, mutable: true, init: Some(init) });
+                    o.slots.push(SlotDecl {
+                        name: n,
+                        parent,
+                        mutable: true,
+                        init: Some(init),
+                        anno,
+                    });
                 } else {
-                    o.slots.push(SlotDecl { name: n, parent, mutable: true, init: None });
+                    o.slots.push(SlotDecl { name: n, parent, mutable: true, init: None, anno });
                 }
                 Ok(())
             }
@@ -376,6 +471,7 @@ impl Parser {
                     parent: false,
                     mutable: false,
                     init: Some(body),
+                    anno,
                 });
                 Ok(())
             }
@@ -395,6 +491,7 @@ impl Parser {
                     parent: false,
                     mutable: false,
                     init: Some(body),
+                    anno,
                 });
                 Ok(())
             }
@@ -427,5 +524,75 @@ impl Parser {
         all.extend(o.args.drain(..));
         o.args = all;
         Ok(Expr::ObjLit(Box::new(o)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn anno(a: &Option<Vec<u8>>) -> &str {
+        a.as_ref().map_or("", |a| std::str::from_utf8(a).unwrap())
+    }
+
+    #[test]
+    fn annotations_reach_the_object_and_its_slots() {
+        let o =
+            parse_body(b"| {} = 'mine'. { 'outer' { 'inner' a = 1. } b = 2. } c = 3. |").unwrap();
+        assert_eq!(anno(&o.anno), "mine");
+        let got: Vec<(&str, &str)> =
+            o.slots.iter().map(|d| (d.name.as_str(), anno(&d.anno))).collect();
+        // nested groups join with DEL, as extend_annotation does
+        assert_eq!(got, vec![("a", "outer\u{7f}inner"), ("b", "outer"), ("c", "")]);
+    }
+
+    /// Every `bootstrap read: 'module' From: 'directory'` in a fileout.
+    fn reads(src: &[u8]) -> Vec<(String, String)> {
+        let src = String::from_utf8_lossy(src).into_owned();
+        src.split("bootstrap read: '")
+            .skip(1)
+            .filter_map(|part| {
+                let (module, rest) = part.split_once('\'')?;
+                let (dir, _) = rest.trim_start().strip_prefix("From: '")?.split_once('\'')?;
+                Some((module.to_string(), dir.to_string()))
+            })
+            .collect()
+    }
+
+    /// What the syntax is for: the fileouts a Self 4 world is built from
+    /// parse. That set is what worldBuilder.self reads, and what those read in
+    /// turn -- 354 files, the rest of `objects/` being tutorial prose and Self
+    /// 3 leftovers the reference VM does not parse either. Skipped when the
+    /// reference submodule is not checked out.
+    #[test]
+    fn the_fileouts_a_world_is_built_from_parse() {
+        let root = std::path::Path::new("reference/self/objects");
+        let Ok(top) = std::fs::read(root.join("worldBuilder.self")) else { return };
+        let mut todo = reads(&top);
+        let mut files: Vec<std::path::PathBuf> = vec![];
+        while let Some((module, dir)) = todo.pop() {
+            let p = root.join(dir).join(module + ".self");
+            if files.contains(&p) {
+                continue;
+            }
+            let src = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {}", p.display(), e));
+            files.push(p);
+            todo.extend(reads(&src));
+        }
+        assert!(files.len() > 300, "only {} modules: the walk broke", files.len());
+        let bad: Vec<String> = files
+            .iter()
+            .filter_map(|f| {
+                let e = parse_script(&std::fs::read(f).unwrap()).err()?;
+                Some(format!("{}: {}", f.display(), e))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} of {} fileouts failed:\n{}",
+            bad.len(),
+            files.len(),
+            bad.join("\n")
+        );
     }
 }

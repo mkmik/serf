@@ -32,23 +32,23 @@ t check: 'shift'    Is: 1 << 10          Should: 1024.
 t check: 'lsr'      Is: (-1 _IntLogicalShiftRight: 1)  Should: 4611686018427387903.
 t check: 'lsr0'     Is: (-1 _IntLogicalShiftRight: 0)  Should: -1.
 t check: 'lsl wrap' Is: (1 _IntLogicalShiftLeft: 62)   Should: -4611686018427387904.
-t check: 'asl ovf'  Is: (1 _IntArithmeticShiftLeft: 62 IfFail: [|:e| 'ovf'])
-                    Should: 'ovf'.
+(t check: 'asl ovf'  Is: (1 _IntArithmeticShiftLeft: 62 IfFail: [|:e| 'ovf'])
+                    Should: 'ovf').
 "a sum of two smallints can be too wide to be one, and a failing primitive
  names its error the way the world spells it -- `traits smallInt` compares
  against 'overflowError' and retries in bigInts when it matches -- and hands
  the fail block the selector as it was sent"
-t check: 'add ovf'  Is: ((1 << 61) _IntAdd: (1 << 61) IfFail: [|:e| e])
-                    Should: 'overflowError'.
-t check: 'fail name' Is: (1 _IntDiv: 0 IfFail: [|:e. :n| n])
-                    Should: '_IntDiv:IfFail:'.
+(t check: 'add ovf'  Is: ((1 << 61) _IntAdd: (1 << 61) IfFail: [|:e| e])
+                    Should: 'overflowError').
+(t check: 'fail name' Is: (1 _IntDiv: 0 IfFail: [|:e. :n| n])
+                    Should: '_IntDiv:IfFail:').
 t check: 'float'    Is: 2.0 ** 10        Should: 1024.0.
 
 "--- booleans and blocks. A block in a data slot is data: reading the slot
  answers the block, and only sending it `value` runs it. A method in a slot
  is code, and reading the slot runs it"
-t check: 'blockslot' Is: [| o | o: (| b <- 0 |). o b: [|:x| x + 1].
-                          (o b) value: 41 ] value                     Should: 42.
+(t check: 'blockslot' Is: [| o | o: (| b <- 0 |). o b: [|:x| x + 1].
+                          (o b) value: 41 ] value                     Should: 42).
 t check: 'methslot' Is: [| o | o: (| m = ( 7 ) |). o m ] value        Should: 7.
 t check: 'ifTrue'   Is: ((3 < 4) ifTrue: ['y'] False: ['n'])   Should: 'y'.
 t check: 'block0'   Is: [ 1 + 1 ] value                        Should: 2.
@@ -57,45 +57,45 @@ t check: 'shortcut' Is: false && [ _Error: 'not evaluated' ]    Should: false.
 t check: 'blocklcl' Is: [ | q <- 5 | q * 2 ] value             Should: 10.
 
 "--- closures over method locals, three levels deep"
-t check: 'nesting'  Is: (| parent* = traits object.
+(t check: 'nesting'  Is: (| parent* = traits object.
     deep = ( | a <- 1 | [ | b <- 10 | [ | c <- 100 | a + b + c ] value ] value ) |) deep
-                    Should: 111.
+                    Should: 111).
 
 globals _AddSlots: ( | mkCounter = (| parent* = traits object.
     make = ( | n <- 0 | [ n: n + 1. n ] ) |) | ).
-t check: 'closure'  Is: [ | c | c: mkCounter make. c value. c value. c value ] value
-                    Should: 3.
+(t check: 'closure'  Is: [ | c | c: mkCounter make. c value. c value. c value ] value
+                    Should: 3).
 
 "--- non-local return out of a nested block"
 globals _AddSlots: ( | finder = (| parent* = traits object.
     find: v In: vec = ( vec do: [|:e| (e = v) ifTrue: [ ^'found' ] ]. 'missing' ) |) | ).
-t check: 'nlr hit'  Is: (finder find: 3 In: ((vector copySize: 2) at: 0 Put: 3))
-                    Should: 'found'.
-t check: 'nlr miss' Is: (finder find: 9 In: ((vector copySize: 2) at: 0 Put: 3))
-                    Should: 'missing'.
-t check: 'nlr tail' Is: (| parent* = traits object.
+(t check: 'nlr hit'  Is: (finder find: 3 In: ((vector copySize: 2) at: 0 Put: 3))
+                    Should: 'found').
+(t check: 'nlr miss' Is: (finder find: 9 In: ((vector copySize: 2) at: 0 Put: 3))
+                    Should: 'missing').
+(t check: 'nlr tail' Is: (| parent* = traits object.
     run: b = ( b value ). go = ( run: [ ^'escaped' ] ) |) go
-                    Should: 'escaped'.
+                    Should: 'escaped').
 "go tail-calls run:, so its frame is gone by the time the block returns
  through it -- twice over, with a second tail call in between"
-t check: 'nlr through two tail calls' Is: (| parent* = traits object.
+(t check: 'nlr through two tail calls' Is: (| parent* = traits object.
     run: b = ( b value. 'wrong' ). mid: b = ( run: b ).
     go = ( mid: [ ^'through' ] ) |) go
-                    Should: 'through'.
+                    Should: 'through').
 "a block that outlives the activation it would return to: the tail call must
  not swallow the answer of the send it handed its frame to"
-t check: 'tail call keeps the answer' Is: (| parent* = traits object.
+(t check: 'tail call keeps the answer' Is: (| parent* = traits object.
     keep <- 0. stash: b = ( keep: b. 'stashed' ).
     go = ( stash: [ ^'wrong' ] ) |) go
-                    Should: 'stashed'.
+                    Should: 'stashed').
 
 "--- inheritance: undirected and directed resends"
 traits _AddSlots: ( | animal = (| parent* = traits object. speak = ( 'noise' ) |) | ).
 traits _AddSlots: ( | dog = (| parent* = traits animal. speak = ( 'woof/' , resend.speak ) |) | ).
 t check: 'resend'   Is: (| parent* = traits dog |) speak  Should: 'woof/noise'.
-t check: 'directed' Is: (| parent* = traits object.
+(t check: 'directed' Is: (| parent* = traits object.
     a* = (| f = ('A') |). b* = (| g = ('B') |). both = ( a.f , b.g ) |) both
-                    Should: 'AB'.
+                    Should: 'AB').
 
 "--- assignable slots and cloning"
 globals _AddSlots: ( | point = (| parent* = traits object. x <- 0. y <- 0.
@@ -119,42 +119,42 @@ t check: 'copyFrom' Is: ('hello' copyFrom: 1 To: 4)             Should: 'ell'.
 t check: 'size'     Is: 'hello' size                            Should: 5.
 t check: 'escapes'  Is: 'a\tb\nc' size                          Should: 5.
 t check: 'strcmp'   Is: 'abc' < 'abd'                           Should: true.
-t check: 'vecprint' Is: ((vector copySize: 2) at: 0 Put: 1) printString
-                    Should: '(1. nil. )'.
-t check: 'collect'  Is: ((((vector copySize: 0) copyAddLast: 1) copyAddLast: 2)
+(t check: 'vecprint' Is: ((vector copySize: 2) at: 0 Put: 1) printString
+                    Should: '(1. nil. )').
+(t check: 'collect'  Is: ((((vector copySize: 0) copyAddLast: 1) copyAddLast: 2)
                          collect: [|:e| e * 10]) printString
-                    Should: '(10. 20. )'.
-t check: 'inject'   Is: ((((vector copySize: 0) copyAddLast: 1) copyAddLast: 2)
+                    Should: '(10. 20. )').
+(t check: 'inject'   Is: ((((vector copySize: 0) copyAddLast: 1) copyAddLast: 2)
                          inject: 0 Into: [|:a. :b| a + b])
-                    Should: 3.
-t check: 'includes' Is: (((vector copySize: 1) at: 0 Put: 7) includes: 7)
-                    Should: true.
+                    Should: 3).
+(t check: 'includes' Is: (((vector copySize: 1) at: 0 Put: 7) includes: 7)
+                    Should: true).
 "a C integer inside a byte vector: the width is in bits, the index in bytes,
  the order the machine's. This is what a bigInt keeps its digits in"
-t check: 'cint'     Is: [| b | b: 'abcd' copy.
+(t check: 'cint'     Is: [| b | b: 'abcd' copy.
                           b _CUnsignedIntSize: 32 At: 0 Put: 305419896.
-                          b _CUnsignedIntSize: 32 At: 0 ] value       Should: 305419896.
-t check: 'cint sgn' Is: [| b | b: 'abcd' copy.
+                          b _CUnsignedIntSize: 32 At: 0 ] value       Should: 305419896).
+(t check: 'cint sgn' Is: [| b | b: 'abcd' copy.
                           b _CSignedIntSize: 8 At: 0 Put: 255.
-                          b _CSignedIntSize: 8 At: 0 ] value          Should: -1.
-t check: 'cint end' Is: [| b | b: 'abcd' copy.
+                          b _CSignedIntSize: 8 At: 0 ] value          Should: -1).
+(t check: 'cint end' Is: [| b | b: 'abcd' copy.
                           b _CUnsignedIntSize: 32 At: 1 IfFail: [|:e| e] ] value
-                    Should: 'badIndexError'.
+                    Should: 'badIndexError').
 
 "--- loops run in constant space: whileTrue: recurses in tail position"
-t check: 'bigloop'  Is: ((| parent* = traits object.
+(t check: 'bigloop'  Is: ((| parent* = traits object.
     sum: n = ( | i <- 0. s <- 0 | [ i < n ] whileTrue: [ s: s + i. i: i + 1 ]. s ) |)
     sum: 200000)
-                    Should: 19999900000.
-t check: 'timesRep' Is: [ | k | k: 0. 5 timesRepeat: [ k: k + 2 ]. k ] value
-                    Should: 10.
-t check: 'to:By:'   Is: [ | k | k: 0. 10 to: 1 By: -3 Do: [|:i| k: k + i ]. k ] value
-                    Should: 22.
+                    Should: 19999900000).
+(t check: 'timesRep' Is: [ | k | k: 0. 5 timesRepeat: [ k: k + 2 ]. k ] value
+                    Should: 10).
+(t check: 'to:By:'   Is: [ | k | k: 0. 10 to: 1 By: -3 Do: [|:i| k: k + i ]. k ] value
+                    Should: 22).
 
 "--- recursion"
-t check: 'fib'      Is: ((| parent* = traits object.
+(t check: 'fib'      Is: ((| parent* = traits object.
     fib: n = ( n < 2 ifTrue: [ n ] False: [ (fib: n - 1) + (fib: n - 2) ] ) |) fib: 20)
-                    Should: 6765.
+                    Should: 6765).
 
 "--- inline caches: one send site, sent to over and over. Every check below
      runs the *same* `o v` in `fetch:`, so the site's cached hit is what is

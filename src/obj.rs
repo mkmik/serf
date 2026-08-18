@@ -243,6 +243,20 @@ pub fn reshape(o: Oop, slots: &[Slot]) -> Oop {
     let n = h.alloc_or_tenure(shape);
     write_slots(n, slots);
     copy_payload_across(o, n);
+    if heap::is_annotated(o) {
+        // An annotation is indexed by slot, and reshaping renumbers the slots
+        // -- adding one to `traits vector` must not shift its ModuleInfo onto
+        // the neighbour, or drop it. Carry each across by name; the object's
+        // own goes straight over. ponytail: O(slots^2), and only for an
+        // annotated object -- slot lists are tens of slots long.
+        heap::set_obj_anno(n, heap::obj_anno(o));
+        let old = slot_count(o);
+        for (j, s) in slots.iter().enumerate() {
+            if let Some(i) = (0..old).find(|&i| slot_name(o, i) == s.name) {
+                heap::set_slot_anno(n, j, heap::slot_anno(o, i));
+            }
+        }
+    }
     heap::set_hash(n, heap::hash(o));
     heap::set_aux(n, heap::aux(o));
     n
@@ -787,6 +801,27 @@ mod tests {
     /// The shape of a real world in miniature -- a lobby whose parent is
     /// globals, a traits chain three deep, a string, a vector, a method object
     /// and a block holding the activation it closed over -- collected until it
+    /// An annotation is indexed by slot, so growing an object renumbers them:
+    /// `_AddSlots:` on a module must leave every ModuleInfo on the slot that
+    /// had it, not one slot over and not nowhere.
+    #[test]
+    fn growing_an_object_carries_its_annotations() {
+        let note = make(&[], Payload::None, false);
+        let mine = make(&[], Payload::None, false);
+        let o = annotate(make(
+            &[s("a", SlotKind::Data, Val::Int(1)), s("b", SlotKind::Data, Val::Int(2))],
+            Payload::None,
+            false,
+        ));
+        heap::set_obj_anno(o, Oop::from(mine));
+        heap::set_slot_anno(o, 1, Oop::from(note));
+        let n = grow(o, &[s("c", SlotKind::Data, Val::Int(3))]);
+        assert_eq!(heap::obj_anno(n), Oop::from(mine), "the object's own annotation was dropped");
+        assert!(heap::slot_anno(n, 0).is_null(), "an annotation appeared on 'a'");
+        assert_eq!(heap::slot_anno(n, 1), Oop::from(note), "'b' lost its annotation");
+        assert!(heap::slot_anno(n, 2).is_null(), "the new slot came with one");
+    }
+
     /// has been moved, tenured and swept around, with lookup checked at every
     /// step. This is the last thing that could say the layout does not carry
     /// what Self actually needs.

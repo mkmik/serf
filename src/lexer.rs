@@ -19,9 +19,14 @@ pub enum Tok {
     RParen,
     LBrack,
     RBrack,
+    /// `{` and `}`, which only ever bracket slot annotations
+    LBrace,
+    RBrace,
     Dot,
     /// the `.` of `parent.selector`
     Delegate,
+    /// a newline outside every bracket, which ends a statement in a file
+    Accept,
     Eof,
 }
 
@@ -69,10 +74,27 @@ pub struct Lexer<'a> {
     i: usize,
     line: u32,
     out: Vec<Spanned>,
+    /// how deep in `( )` and `[ ]` the scanner is, and whether a newline out
+    /// there ends a statement
+    depth: i32,
+    script: bool,
 }
 
 pub fn lex(src: &[u8]) -> Result<Vec<Spanned>, String> {
-    let mut l = Lexer { s: src, i: 0, line: 1, out: vec![] };
+    lex_as(src, false)
+}
+
+/// Lex a file rather than a string. A file's top-level expressions are
+/// separated by newlines outside any bracket, not by periods -- that is the
+/// ACCEPT token `Scanner::get_token` hands the parser for anything but a
+/// string scanner, and it is what lets a Self 4 fileout write one
+/// `bootstrap addSlotsTo: ( | ... | )` per paragraph with no `.` in sight.
+pub fn lex_script(src: &[u8]) -> Result<Vec<Spanned>, String> {
+    lex_as(src, true)
+}
+
+fn lex_as(src: &[u8], script: bool) -> Result<Vec<Spanned>, String> {
+    let mut l = Lexer { s: src, i: 0, line: 1, out: vec![], depth: 0, script };
     l.run()?;
     l.out.push(Spanned { tok: Tok::Eof, line: l.line });
     Ok(l.out)
@@ -118,6 +140,11 @@ impl<'a> Lexer<'a> {
                     self.line += 1;
                     self.i += 1;
                     had_space = true;
+                    // one is as good as ten: blank lines say nothing more
+                    let last = self.out.last().map(|s| &s.tok);
+                    if self.script && self.depth <= 0 && !matches!(last, None | Some(Tok::Accept)) {
+                        self.push(Tok::Accept);
+                    }
                 } else if c.is_ascii_whitespace() {
                     self.i += 1;
                     had_space = true;
@@ -145,26 +172,40 @@ impl<'a> Lexer<'a> {
             match c {
                 b'(' => {
                     self.i += 1;
+                    self.depth += 1;
                     self.push(Tok::LParen);
                 }
                 b')' => {
                     self.i += 1;
+                    self.depth -= 1;
                     self.push(Tok::RParen);
                 }
                 b'[' => {
                     self.i += 1;
+                    self.depth += 1;
                     self.push(Tok::LBrack);
                 }
                 b']' => {
                     self.i += 1;
+                    self.depth -= 1;
                     self.push(Tok::RBrack);
                 }
-                b'{' | b'}' => return Err(self.err("annotations are not supported")),
+                b'{' => {
+                    self.i += 1;
+                    self.push(Tok::LBrace);
+                }
+                b'}' => {
+                    self.i += 1;
+                    self.push(Tok::RBrace);
+                }
                 b'\'' => self.read_string()?,
                 b'.' => {
-                    // `p.sel` delegates; `p. sel` separates statements
+                    // `p.sel` delegates; `p. sel` separates statements. The
+                    // selector may be an operator -- `resend.,` and `p.+` are
+                    // resends of a binary message -- so a punctuation char
+                    // after the dot delegates too, as read_name has it.
                     let delegating = !had_space
-                        && is_id_start(self.at(1))
+                        && (is_id_start(self.at(1)) || is_punct(self.at(1)))
                         && matches!(
                             self.out.last().map(|s| &s.tok),
                             Some(Tok::Name(_)) | Some(Tok::Resend)

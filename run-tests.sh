@@ -200,6 +200,25 @@ if [ -f core.snap ]; then
   [ "$got" = "$want" ] || { echo "parsing: got [$got] want [$want]"; exit 1; }
   echo "parsing ok"
 
+  # A Self 4 fileout, read back by the world's own `bootstrap read:From:`:
+  # `{ }` annotations, statements separated by newlines rather than periods,
+  # and `_RunScript` to run the file. Re-filing `vector` into a world that
+  # has it already must rebuild it and leave the world standing, and the
+  # ModuleInfo the fileout writes on a slot has to arrive on that slot --
+  # which means surviving the reshape `_AddSlots:` does.
+  if [ -d reference/self/objects ]; then
+    got=$($R --load core.snap 2>/dev/null --run \
+      "bootstrap selfObjectsWorkingDir: 'reference/self/objects'.
+       bootstrap read: 'vector' From: 'core'.
+       ((reflect: globals modules vector) _MirrorAnnotationAt: 'directory') ,
+         ((vector copySize: 2) at: 0 Put: 7) printString" </dev/null | tail -1)
+    want="'ModuleInfo: Module: vector InitialContents: FollowSlot"
+    case "$got" in
+      "$want"*"a vector object(7, nil)'") echo "module file-in ok" ;;
+      *) echo "module file-in: got [$got] want [$want...]"; exit 1 ;;
+    esac
+  fi
+
   # Only a define moves the programming timestamp, as in the C++ VM, where
   # define_prim holds the sole increment_programming_timestamp call. Bumping it
   # for _AddSlots: too would leave the module cache obsolete after changes the

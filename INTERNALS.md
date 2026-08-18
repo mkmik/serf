@@ -534,6 +534,59 @@ Everything else stops at the first primitive serf lacks: a loaded world runs onl
 as far as the primitives it calls exist here. Activation mirrors are missing, so
 the debugger cannot show a stack.
 
+## Filing a module in from `objects/`
+
+A Self 4 world keeps itself as source: one transporter fileout per module under
+`objects/`, which the world reads back with `bootstrap read:From:`. serf reads
+them — this rebuilds `traits vector` and everything else that module holds, in a
+world that already had them:
+
+```sh
+./target/release/serf --load core.snap --run \
+  "bootstrap selfObjectsWorkingDir: 'reference/self/objects'.
+   bootstrap read: 'vector' From: 'core'"
+```
+
+What a fileout uses that serf's own world never did:
+
+* **`{ }` annotations.** `{ 'ModuleInfo: …' foo = 3. }` annotates every slot in
+  the group, `{} = '…'` annotates the object itself, and nested groups join with
+  DEL as `extend_annotation` does — which is why a world's annotations read
+  `ModuleInfo: …\x7fVisibility: public`. An assignable slot's `foo:` takes the
+  same annotation as `foo`, as the world's own do.
+* **A file's statements end at a newline.** The scanner hands the parser an
+  ACCEPT at a newline outside every bracket unless it is scanning a string, and
+  that, not a `.`, is what ends one `bootstrap addSlotsTo: ( | … | )` before the
+  next begins. `-e`, `--run` and the prompt are strings and are unchanged; a
+  `.self` file that wrapped a top-level message across lines has to keep the
+  break inside brackets, which is why `self/test.self` puts parentheses around
+  its multi-line checks.
+* **A keyword argument is a whole expression.** `a foo: b bar: c` is
+  `a foo: (b bar: c)`; a capitalised `Bar:` still binds to the innermost message,
+  so `bootstrap define: … ToBe: bootstrap addSlotsTo: … From: …` nests the way
+  the transporter meant it. Likewise a binary argument:
+  `textBox origin + offsetOfItem: i`.
+* **Implicit-self binary sends** — `(+ -1) countdown: b`, `= world bodies first`
+  — and a delegate before an operator, `resend., arg`.
+* **`_RunScript`**, which is what `read:From:` calls: read the file, run its
+  expressions against the world's lobby, answer the last one's value.
+* **An annotation surviving a slot being added.** The fileout annotates the slots
+  of a literal and `addSlotsTo:From:` moves them onto the module object; growing
+  an object renumbers its slots, and serf's `reshape` kept the annotated shape
+  while dropping every annotation in it. The C++ clones the map, annotation and
+  all.
+* **`foo: x` beside a constant `foo` is a send.** serf compiled it as an
+  assignment and refused, but a constant slot has no assignment slot, so it is an
+  ordinary send that lands on the receiver — `vector.self` has a local `error`
+  and sends `error:`.
+
+All 354 fileouts a world is built from — what `worldBuilder.self` reads,
+transitively — parse; `cargo test the_fileouts` is that check. Filing in is not
+far behind: 129 of the 135 modules in `objects/core` re-file into a loaded
+`core.snap`, and the six that do not stop on runtime gaps rather than on syntax
+(see [OPEN.md](OPEN.md)). The rest of `objects/` is tutorial prose and Self 3
+leftovers the reference VM does not parse either.
+
 ## Deliberately not here
 
 * **No JIT, and maps only as a key.** Every object still carries its own slot
@@ -541,8 +594,6 @@ the debugger cannot show a stack.
   on. A real map would share the descriptors too — see [MEMORY.md](MEMORY.md).
 * **No compaction and no finalization.** The old generation is swept into a free
   list, never compacted, and nothing runs when an object dies.
-* **No `{ }` slot annotations** in the parser, so the Self 4 world fileouts in
-  `objects/` don't load as-is. (Annotations *in an image* round-trip fine.)
 * **No `|` binary selector** — a bare `|` always closes a slot list. Use `bitOr:`.
 
 ## Sample
