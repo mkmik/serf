@@ -578,7 +578,8 @@ mod tests {
         let mut b = [0u8; events::EVENT_BYTES];
         for (key, text, sym) in [
             (ch("A"), "A", 'A' as u32),
-            (Key::Named(NamedKey::Enter), "", events::XK_RETURN),
+            (Key::Named(NamedKey::Enter), "\r", events::XK_RETURN),
+            (Key::Named(NamedKey::Backspace), "\u{8}", events::XK_BACKSPACE),
             (Key::Named(NamedKey::ArrowLeft), "", events::XK_LEFT),
         ] {
             let keysym = keysym_of(&key).unwrap();

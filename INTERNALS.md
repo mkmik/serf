@@ -162,12 +162,21 @@ it. Two things that are easy to get wrong:
 * **Grayscale antialiasing, never subpixel.** Morphic moves rendered pixels
   around constantly, and subpixel-filtered text refringes the moment it is
   blitted somewhere else.
+* **A fixed-pitch font has to be exactly fixed.** A world that asks for one
+  stops measuring: `larsText`, which is every shell and every editor pane,
+  asks once for `XTextWidth('m')` and puts column *n* — and the cursor — at
+  *n* times that. So such a face is given a whole-logical-pixel cell and its
+  glyphs are *drawn* on that grid. A scalable face's 7.8-pixel advance answers
+  8 and drifts a pixel every five characters otherwise, which is a cursor a
+  character or more away from its own text by the end of a line.
 
 Family names need one step of help: `fontdb` matches them with `==`, and the
 world spells them the way X did (`helvetica`, `lucidaTypewriter`), so they are
 resolved against the host's own spelling first. A family the host does not have
 falls back by shape rather than by name — the world's consoles have to stay
-monospaced.
+monospaced. That includes X's own core names, `6x13` and `9x15bold`: the Self
+4.4 shell asks for its text font by one of those and nothing else, and a
+proportional face behind that name is what the paragraph above is about.
 
 ### The display's scale
 
@@ -207,6 +216,13 @@ Three things about that layout are not optional:
   come back out of the encoded keycode. Keycodes are derived from the keysym in
   two disjoint bands, because folding both into a low byte puts `XK_Return` on
   the same keycode as Ctrl-M.
+* **The editing keys are text, not keysyms.** Self reads them out of the bytes
+  `XLookupString` answers: `keyCapForCharacter:` calls 8 backspace, 9 tab, 13
+  enter, 27 escape and 127 delete, and every `^`-command from the control
+  character X folds a letter to. Answer no bytes for those, as a translation
+  that only passes printable characters does, and a text box takes letters and
+  edits nothing — no backspace, no Return, no `^k`. Arrows really do have no
+  text, in X either; the world reads those off the keysym.
 * **Events carry a timestamp**, at offset 56. Morphic tells a click from a
   double click from a press-and-hold by *when* they arrived, so a frozen clock
   makes every gesture identical — a single click does nothing at all and two in
@@ -216,18 +232,24 @@ Three things about that layout are not optional:
   nothing to the world: motion with a button held is a *drag*, so passing those
   on turns every click into one and picks morphs up instead of clicking them.
 
-Only a hand on the mouse can click a world, which makes a bug in what a click
-*does* the one kind this cannot chase on its own — so it can be told to click:
+Only a hand on the mouse and keyboard can drive a world, which makes a bug in
+what a click or a keystroke *does* the one kind this cannot chase on its own —
+so it can be told to click and to type:
 
 ```sh
-SERF_TRACE_INPUT=1 …    # every event as it is handed to the world
-SERF_CLICK=254,681@20   # click there after 20s; `x2` for twice
+SERF_TRACE_INPUT=1 …       # every event as it is handed to the world,
+                           # and every XLookupString the world reads back
+SERF_CLICK=254,681@20      # click there after 20s; `x2` for twice
+SERF_KEYS='abc\b^aZ@23'    # then type, at the same place, from 23s
 ```
 
 `SERF_CLICK` spreads its press and release over time on purpose. A real click is
 a press, a pause and a release, and the world sees each in a different turn of
 its own loop; firing them into the queue together is a different gesture, and
-one the world reads differently.
+one the world reads differently. `SERF_KEYS` types one key per 80ms: `\r`, `\b`,
+`\t`, `\e` and `\L\R\U\D` for the keys an editor steers by, `^a` for that key
+with Control held. With `SERF_SHOT=…`, that is a whole editing session with
+nobody watching — which is how the text boxes above were found not to edit.
 
 ### What is deliberately not there
 

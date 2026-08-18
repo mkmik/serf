@@ -104,7 +104,7 @@ impl Native {
             win: None,
             scale: 1,
             selected: 0,
-            clicks: scripted_clicks(),
+            clicks: scripted_input(),
             gcs: vec![],
             atoms: vec![],
             font_of: HashMap::new(),
@@ -830,6 +830,23 @@ fn blit(
     }
 }
 
+/// Everything a scripted run does to the world, in the order it does it.
+fn scripted_input() -> Vec<(std::time::Instant, crate::events::Event)> {
+    let mut out = scripted_clicks();
+    out.extend(scripted_keys());
+    out.sort_by_key(|(t, _)| *t);
+    out
+}
+
+/// Where a scripted click aims, `SERF_CLICK=x,y...`, which is also where the
+/// scripted keys are typed: a keystroke goes to the world's keyboard focus, but
+/// the event still carries a place, and a hand types where it just clicked.
+fn click_at() -> Option<(i32, i32)> {
+    let v = std::env::var("SERF_CLICK").ok()?;
+    let (x, y) = v.split(['@', 'x']).next()?.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
 /// `SERF_CLICK=x,y[@seconds][xN]` -- N clicks at that point, starting then.
 /// A press, a pause, a release, and a gap before the next, because that is
 /// what a hand does and what the world is written to recognise.
@@ -837,9 +854,8 @@ fn scripted_clicks() -> Vec<(std::time::Instant, crate::events::Event)> {
     use crate::events::{Event, Pointer, BUTTON1_MASK};
     let Ok(v) = std::env::var("SERF_CLICK") else { return vec![] };
     let (v, times) = v.split_once('x').unwrap_or((v.as_str(), "1"));
-    let (at, after) = v.split_once('@').unwrap_or((v, "20"));
-    let Some((x, y)) = at.split_once(',') else { return vec![] };
-    let (Ok(x), Ok(y)) = (x.trim().parse::<i32>(), y.trim().parse::<i32>()) else { return vec![] };
+    let (_, after) = v.split_once('@').unwrap_or((v, "20"));
+    let Some((x, y)) = click_at() else { return vec![] };
     let start =
         std::time::Instant::now() + Duration::from_secs_f64(after.trim().parse().unwrap_or(20.0));
     let at = Pointer { x, y, x_root: x, y_root: y, state: 0 };
@@ -852,6 +868,64 @@ fn scripted_clicks() -> Vec<(std::time::Instant, crate::events::Event)> {
             base + Duration::from_millis(90),
             Event::Button { press: false, window: 1, at: down, button: 1 },
         ));
+    }
+    out
+}
+
+/// `SERF_KEYS=text[@seconds]` -- what to type once the world is up, a press and
+/// a release per key, 80ms apart. `\r`, `\b`, `\t`, `\e` and `\L\R\U\D` are the
+/// keys an editor steers by, `^a` is that key with Control held, and every
+/// other character stands for itself.
+///
+/// Typing is the half of the world that a person had to be present for, and it
+/// is where a text box being unable to edit text went unnoticed: the click that
+/// puts the caret in one could be scripted, the Return that ends the line
+/// could not.
+fn scripted_keys() -> Vec<(std::time::Instant, crate::events::Event)> {
+    use crate::events::{
+        Event, Pointer, CONTROL_MASK, XK_BACKSPACE, XK_DOWN, XK_ESCAPE, XK_LEFT, XK_RETURN,
+        XK_RIGHT, XK_TAB, XK_UP,
+    };
+    let Ok(v) = std::env::var("SERF_KEYS") else { return vec![] };
+    let (text, after) = v.rsplit_once('@').unwrap_or((v.as_str(), "24"));
+    let start =
+        std::time::Instant::now() + Duration::from_secs_f64(after.trim().parse().unwrap_or(24.0));
+    let (x, y) = click_at().unwrap_or((0, 0));
+    let mut out = vec![];
+    let mut cs = text.chars();
+    let mut i = 0;
+    while let Some(c) = cs.next() {
+        let mut state = 0;
+        let keysym = match c {
+            '\\' => match cs.next() {
+                Some('r') | Some('n') => XK_RETURN,
+                Some('b') => XK_BACKSPACE,
+                Some('t') => XK_TAB,
+                Some('e') => XK_ESCAPE,
+                Some('L') => XK_LEFT,
+                Some('R') => XK_RIGHT,
+                Some('U') => XK_UP,
+                Some('D') => XK_DOWN,
+                Some(c) => c as u32,
+                None => break,
+            },
+            '^' => match cs.next() {
+                Some(c) => {
+                    state = CONTROL_MASK;
+                    c as u32
+                }
+                None => break,
+            },
+            c => c as u32,
+        };
+        let at = Pointer { x, y, x_root: x, y_root: y, state };
+        let t = start + Duration::from_millis(80 * i);
+        out.push((t, Event::Key { press: true, window: 1, at, keysym }));
+        out.push((
+            t + Duration::from_millis(40),
+            Event::Key { press: false, window: 1, at, keysym },
+        ));
+        i += 1;
     }
     out
 }

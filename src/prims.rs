@@ -1864,6 +1864,11 @@ fn native_wrap(
                 #[cfg(feature = "native")]
                 {
                     let (text, keysym) = crate::native::lookup_string_at(evt);
+                    // the other end of SERF_TRACE_INPUT: what the world reads
+                    // back for a key, which is where an editing key goes missing
+                    if std::env::var_os("SERF_TRACE_INPUT").is_some() {
+                        eprintln!("XLookupString -> keysym={:#x} text={:?}", keysym, text);
+                    }
                     ks = keysym as u64;
                     let take = text.len().min(buf.len());
                     buf[..take].copy_from_slice(&text[..take]);

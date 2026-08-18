@@ -332,18 +332,48 @@ pub fn encode_at(e: &Event, buf: &mut [u8], time: u64) {
 /// `XEvent` proxy it was filling in. So the keysym has to come back out of the
 /// keycode, which is what makes that mapping's two bands worth keeping apart.
 ///
+/// Which keys have text at all is not a detail: Self reads its editing keys out
+/// of these bytes, not out of the keysym. `keyCapForCharacter:` in the world
+/// answers backspace for 8, tab for 9, enter for 13, escape for 27 and delete
+/// for 127, and a control character while Control is held is how every `kbd`
+/// command is bound. Answer no bytes for those and a text box takes letters but
+/// will not delete one, end a line, or move by a word.
+///
 /// ponytail: Latin-1 only, because the call is the 8-bit one and the world's
-/// strings are bytes. A key with no printable character of its own answers no
-/// bytes and its keysym, which is what X does for a function key -- so nothing
-/// downstream meets a case it has not already seen.
+/// strings are bytes. A key that has no character even in X -- an arrow, a
+/// function key -- still answers none, and the world falls back to the keysym.
 pub fn lookup_string(buf: &[u8]) -> (Vec<u8>, u32) {
     let t = get(buf, "XEvent", "type") as i64;
     if t != KEY_PRESS && t != KEY_RELEASE {
         return (vec![], 0);
     }
     let keysym = Event::keysym(get(buf, "XKeyEvent", "keycode") as u32);
-    let printable = matches!(keysym, 0x20..=0x7e | 0xa0..=0xff);
-    (if printable { vec![keysym as u8] } else { vec![] }, keysym)
+    let c = match keysym {
+        // the five keys X gives a character of their own: the low seven bits of
+        // the keysym *are* that character, Delete's 0xffff included
+        XK_BACKSPACE | XK_TAB | XK_RETURN | XK_ESCAPE | XK_DELETE => (keysym & 0x7f) as u8,
+        0x20..=0x7e | 0xa0..=0xff => keysym as u8,
+        _ => return (vec![], keysym),
+    };
+    (vec![control(c, get(buf, "XKeyEvent", "state") as u32)], keysym)
+}
+
+/// What a held Control does to a character, `XkbToControl`: `@` through `~` and
+/// space lose bits 5 and 6, so Ctrl-A is 1 and Ctrl-K is 11, which is what the
+/// world's editor steers by. The digits are X's own oddities, kept because a
+/// world that learned them from X will use them.
+fn control(c: u8, state: u32) -> u8 {
+    if state & CONTROL_MASK == 0 {
+        return c;
+    }
+    match c {
+        b'@'..=b'~' | b' ' => c & 0x1f,
+        b'2' => 0,
+        b'3'..=b'7' => c - (b'3' - 0x1b),
+        b'8' => 0x7f,
+        b'/' => b'_' & 0x1f,
+        _ => c,
+    }
 }
 
 /// The queue behind `XPending`, `XNextEvent` and friends.
@@ -709,21 +739,37 @@ mod tests {
     /// A key that types a character and one that does not, which is the split
     /// every text editor in the world cares about -- and `XLookupString` has to
     /// make it from the encoded event alone, because that is all it is given.
+    ///
+    /// The keys an editor steers by are on the *text* side of that split, in X
+    /// and so here: Self reads backspace, tab, enter, escape and delete out of
+    /// the bytes, and a text box that gets none of them takes letters and edits
+    /// nothing.
     #[test]
     fn lookup_string_works_from_the_encoded_event() {
         let at = Pointer { x: 0, y: 0, x_root: 0, y_root: 0, state: SHIFT_MASK };
         let mut b = [0u8; EVENT_BYTES];
-        let mut round = |keysym| {
+        let mut round = |keysym, state| {
+            let at = Pointer { state, ..at };
             encode(&Event::Key { press: true, window: win(), at, keysym }, &mut b);
             lookup_string(&b)
         };
-        assert_eq!(round('A' as u32), (b"A".to_vec(), 'A' as u32));
-        assert_eq!(round('a' as u32), (b"a".to_vec(), 'a' as u32));
-        assert_eq!(round(0xe9), (vec![0xe9], 0xe9), "Latin-1 above 0x7f is still text");
-        assert_eq!(round(XK_RETURN), (vec![], XK_RETURN));
-        assert_eq!(round(XK_DELETE), (vec![], XK_DELETE));
-        // a control character has a keysym but no printable byte, as in X
-        assert_eq!(round(0x03), (vec![], 0x03));
+        assert_eq!(round('A' as u32, SHIFT_MASK), (b"A".to_vec(), 'A' as u32));
+        assert_eq!(round('a' as u32, 0), (b"a".to_vec(), 'a' as u32));
+        assert_eq!(round(0xe9, 0), (vec![0xe9], 0xe9), "Latin-1 above 0x7f is still text");
+        assert_eq!(round(XK_BACKSPACE, 0), (vec![8], XK_BACKSPACE));
+        assert_eq!(round(XK_TAB, 0), (vec![9], XK_TAB));
+        assert_eq!(round(XK_RETURN, 0), (vec![13], XK_RETURN));
+        assert_eq!(round(XK_ESCAPE, 0), (vec![27], XK_ESCAPE));
+        assert_eq!(round(XK_DELETE, 0), (vec![127], XK_DELETE));
+        // an arrow really has no character, in X either: the world reads those
+        // off the keysym instead
+        assert_eq!(round(XK_LEFT, 0), (vec![], XK_LEFT));
+        // and Control folds a letter to its control character, which is how
+        // every one of the world's `kbd` commands is bound
+        assert_eq!(round('a' as u32, CONTROL_MASK), (vec![1], 'a' as u32));
+        assert_eq!(round('k' as u32, CONTROL_MASK), (vec![11], 'k' as u32));
+        assert_eq!(round('A' as u32, CONTROL_MASK | SHIFT_MASK), (vec![1], 'A' as u32));
+        assert_eq!(round('a' as u32, 0), (vec![b'a'], 'a' as u32), "and only while it is held");
 
         // and nothing but a key answers anything
         encode(&Event::Motion { window: win(), at }, &mut b);
