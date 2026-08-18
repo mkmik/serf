@@ -162,12 +162,21 @@ it. Two things that are easy to get wrong:
 * **Grayscale antialiasing, never subpixel.** Morphic moves rendered pixels
   around constantly, and subpixel-filtered text refringes the moment it is
   blitted somewhere else.
+* **A fixed-pitch font has to be exactly fixed.** A world that asks for one
+  stops measuring: `larsText`, which is every shell and every editor pane,
+  asks once for `XTextWidth('m')` and puts column *n* — and the cursor — at
+  *n* times that. So such a face is given a whole-logical-pixel cell and its
+  glyphs are *drawn* on that grid. A scalable face's 7.8-pixel advance answers
+  8 and drifts a pixel every five characters otherwise, which is a cursor a
+  character or more away from its own text by the end of a line.
 
 Family names need one step of help: `fontdb` matches them with `==`, and the
 world spells them the way X did (`helvetica`, `lucidaTypewriter`), so they are
 resolved against the host's own spelling first. A family the host does not have
 falls back by shape rather than by name — the world's consoles have to stay
-monospaced.
+monospaced. That includes X's own core names, `6x13` and `9x15bold`: the Self
+4.4 shell asks for its text font by one of those and nothing else, and a
+proportional face behind that name is what the paragraph above is about.
 
 ### The display's scale
 

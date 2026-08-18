@@ -38,6 +38,9 @@ struct Spec {
     weight: Weight,
     style: Style,
     px: f32,
+    /// logical pixels per character for a fixed-pitch face, 0 for a
+    /// proportional one -- see `cell_of`
+    cell: f32,
 }
 
 impl Spec {
@@ -96,15 +99,37 @@ struct Xlfd {
     weight: Weight,
     style: Style,
     px: f32,
+    /// the name itself said fixed pitch, whatever the host has by that name
+    fixed: bool,
+}
+
+/// `6x13`, `9x15bold`: X's own names for its fixed-pitch bitmap fonts, and
+/// still what a world asks for when it wants a terminal face -- the Self 4.4
+/// shell asks for `6x13` by that name and nothing else. The height is the
+/// pixel size. The width is not passed on: a scalable face will not have that
+/// advance, and the world reads the advance back through `XTextWidth` anyway.
+/// What matters is that it is *fixed*, because the editors that ask for one
+/// place every column at a multiple of a single character's width.
+fn core_bitmap(name: &str) -> Option<(f32, bool)> {
+    let (rest, bold) = match name.strip_suffix("bold") {
+        Some(r) => (r, true),
+        None => (name, false),
+    };
+    let (w, h) = rest.split_once('x')?;
+    w.parse::<u32>().ok()?;
+    Some((h.parse::<u32>().ok()?.max(1) as f32, bold))
 }
 
 fn parse_xlfd(name: &str) -> Xlfd {
     if !name.starts_with('-') {
+        let core = core_bitmap(name);
+        let (px, bold) = core.unwrap_or((DEFAULT_PX, false));
         return Xlfd {
-            family: name.to_string(),
-            weight: Weight::NORMAL,
+            family: if core.is_some() { String::new() } else { name.to_string() },
+            weight: if bold { Weight::BOLD } else { Weight::NORMAL },
             style: Style::Normal,
-            px: DEFAULT_PX,
+            px,
+            fixed: core.is_some(),
         };
     }
     let f: Vec<&str> = name.split('-').collect();
@@ -121,6 +146,7 @@ fn parse_xlfd(name: &str) -> Xlfd {
             _ => Style::Normal,
         },
         px: at(7).parse().ok().filter(|p: &f32| *p > 0.0).unwrap_or(DEFAULT_PX),
+        fixed: false,
     }
 }
 
@@ -129,7 +155,9 @@ fn parse_xlfd(name: &str) -> Xlfd {
 /// text morph's cursor and its selection drift off the glyphs they belong to.
 struct Laid {
     buffer: Buffer,
-    width: i32,
+    /// real pixels the run advances, unrounded: the caller rounds, and a
+    /// fixed-pitch cell is measured off it
+    width: f32,
     ascent: i32,
     descent: i32,
 }
@@ -190,11 +218,35 @@ impl Fonts {
     /// world gets text either way, which is what X's own font server did.
     pub fn load(&mut self, xlfd: &str) -> usize {
         let x = parse_xlfd(xlfd);
-        let face = resolve(self.system.db(), &x.family);
+        let face = if x.fixed { Face::Mono } else { resolve(self.system.db(), &x.family) };
         // the size the world asked for is in its pixels, not the display's
         let px = x.px * self.scale;
-        self.specs.push(Spec { face, weight: x.weight, style: x.style, px });
-        self.specs.len() - 1
+        self.specs.push(Spec { face, weight: x.weight, style: x.style, px, cell: 0.0 });
+        let f = self.specs.len() - 1;
+        self.specs[f].cell = self.cell_of(f);
+        f
+    }
+
+    /// Logical pixels per character, for a face whose narrowest glyph advances
+    /// as far as its widest -- and 0 for a proportional one, which is measured
+    /// as it is drawn.
+    ///
+    /// The world's editors take a fixed-pitch font at its word: `larsText`
+    /// asks once for `XTextWidth('m')` and then puts column *n* at *n* times
+    /// that, cursor included. A face whose real advance is 7.8 pixels answers
+    /// 8 and drifts a pixel every five characters, so the cursor ends up a
+    /// character or more from the glyph it belongs to. Rounding the advance to
+    /// a whole logical pixel and *drawing* on that grid is what makes the
+    /// world's arithmetic land where the ink is -- which is what a core X
+    /// bitmap font, with its integer advance, gave it.
+    fn cell_of(&mut self, f: usize) -> f32 {
+        const N: f32 = 10.0;
+        let wide = self.lay(f, b"MMMMMMMMMM").width;
+        let thin = self.lay(f, b"iiiiiiiiii").width;
+        if wide <= 0.0 || (wide - thin).abs() > 0.5 {
+            return 0.0;
+        }
+        (wide / N / self.scale).round().max(1.0)
     }
 
     /// `XFontStruct` ascent and descent, so one probe glyph is enough to ask:
@@ -208,13 +260,20 @@ impl Fonts {
     }
 
     /// `XTextWidth`, in whole pixels because the caller is a 32-bit Self world.
-    /// ponytail: rounded up to a whole logical pixel, so a run can be up to
-    /// `scale - 1` real pixels wider than the box the world reserved for it.
-    /// That is less than one of the world's own pixels, and rounding the other
-    /// way clips the last glyph -- which is the visible failure.
+    /// A fixed-pitch face answers its cell times the length -- arithmetic, not
+    /// a measurement, because that is what the world is about to do with it.
+    ///
+    /// ponytail: a proportional run is rounded up to a whole logical pixel, so
+    /// it can be up to `scale - 1` real pixels wider than the box the world
+    /// reserved for it. That is less than one of the world's own pixels, and
+    /// rounding the other way clips the last glyph -- the visible failure.
     pub fn width(&mut self, f: usize, s: &[u8]) -> i32 {
+        let cell = self.specs[f].cell;
+        if cell > 0.0 {
+            return (s.len() as f32 * cell) as i32;
+        }
         let (scale, l) = (self.scale, self.lay(f, s));
-        (l.width as f32 / scale).ceil() as i32
+        (l.width / scale).ceil() as i32
     }
 
     /// `XDrawString(dpy, drawable, gc, x, y, s, n)`: `y` is the baseline, as X
@@ -226,13 +285,20 @@ impl Fonts {
         // the layout is already at the display's resolution, so the pen starts
         // there too -- `Canvas::blend` takes real pixels for exactly this
         let scale = self.scale;
+        let cell = (self.specs[f].cell * scale) as i32;
         let (x, y) = ((x as f32 * scale) as i32, (y as f32 * scale) as i32);
         let (system, cache) = (&mut self.system, &mut self.cache);
+        let mut nth = 0;
         for run in l.buffer.layout_runs() {
             for g in run.glyphs {
                 // offset (0, 0) puts the glyphs where X wants them: relative to
                 // the baseline, with no line box in the way
                 let p = g.physical((0.0, 0.0), 1.0);
+                // on the cell grid the world measured, when there is one, so
+                // that column n of a fixed-pitch line is drawn where n times
+                // XTextWidth says it is
+                let pen = if cell > 0 { nth * cell } else { p.x };
+                nth += 1;
                 let Some(img) = cache.get_image(system, p.cache_key).as_ref() else { continue };
                 let (gw, gh) = (img.placement.width as i32, img.placement.height as i32);
                 // ponytail: a colour bitmap is an emoji strike, and this draws
@@ -240,7 +306,7 @@ impl Fonts {
                 if img.content != SwashContent::Mask || gw == 0 || gh == 0 {
                     continue;
                 }
-                let (ox, oy) = (x + p.x + img.placement.left, y + p.y - img.placement.top);
+                let (ox, oy) = (x + pen + img.placement.left, y + p.y - img.placement.top);
                 for (i, &cov) in img.data.iter().enumerate() {
                     let i = i as i32;
                     c.blend(gc, ox + i % gw, oy + i / gw, gc.fg, cov);
@@ -265,10 +331,8 @@ impl Fonts {
             buf.shape_until_scroll(&mut self.system, false);
             let (width, ascent, descent) =
                 match buf.line_layout(&mut self.system, 0).and_then(|l| l.first()) {
-                    Some(l) => {
-                        (l.w.ceil() as i32, l.max_ascent.ceil() as i32, l.max_descent.ceil() as i32)
-                    }
-                    None => (0, spec.px.ceil() as i32, 0),
+                    Some(l) => (l.w, l.max_ascent.ceil() as i32, l.max_descent.ceil() as i32),
+                    None => (0.0, spec.px.ceil() as i32, 0),
                 };
             self.laid.insert(key.clone(), Laid { buffer: buf, width, ascent, descent });
         }
@@ -541,5 +605,44 @@ mod tests {
         }
         assert!(ink > 50, "text drew {} pixels of ink", ink);
         assert_eq!(escaped, 0, "{} of {} ink pixels fell outside the box", escaped, ink);
+    }
+
+    /// A world that asks for a fixed-pitch font then does its own arithmetic on
+    /// it: `larsText` asks once for `XTextWidth('m')` and puts column *n* --
+    /// and the cursor -- at *n* times that. So a run has to measure exactly
+    /// that many cells, and the ink has to land on the same grid. `6x13` is X's
+    /// own name for such a font and is what the Self 4.4 shell asks for by
+    /// name; resolving it to a proportional face put its cursor half a line
+    /// past the text it belonged to.
+    #[test]
+    fn a_fixed_pitch_run_is_a_whole_number_of_cells() {
+        let mut fonts = Fonts::new();
+        if fonts.is_empty() {
+            return; // no fonts installed; nothing to check
+        }
+        let f = fonts.load("6x13");
+        let cell = fonts.width(f, b"m");
+        assert!(cell > 0, "no width for a fixed-pitch font");
+        assert_eq!(fonts.width(f, b"i"), cell, "one width for every character");
+        for n in [1, 2, 7, 16, 40] {
+            let s = vec![b'x'; n];
+            assert_eq!(fonts.width(f, &s), cell * n as i32, "{} characters", n);
+        }
+
+        // and the glyphs are drawn on that grid rather than on the face's own
+        // advance, which is what the arithmetic above is promised
+        let n = 10;
+        let mut c = Canvas::new(cell * n + 40, 40, 0xFFFFFF);
+        let gc = Gc { fg: 0x000000, font: Some(f), ..Gc::default() };
+        fonts.draw(&mut c, &gc, 0, 30, &vec![b'x'; n as usize]);
+        let ink = |x: i32| (0..c.h).any(|y| c.px[(y * c.w + x) as usize] != 0xFFFFFF);
+        let last = (0..c.w).filter(|&x| ink(x)).next_back().unwrap_or(0);
+        assert!(
+            last >= cell * (n - 1) && last < cell * n,
+            "{} glyphs of {}px ended at {}, not in their last cell",
+            n,
+            cell,
+            last
+        );
     }
 }
