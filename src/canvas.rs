@@ -344,12 +344,18 @@ impl Canvas {
         if n < 3 {
             return;
         }
-        // scanned in real pixels, and with the same centre-of-the-block reading
-        // of a vertex that `line` uses: the world fills a disc and then draws
-        // its outline over it, so a fill that stepped in whole logical blocks
-        // would leave its own coarser staircase sticking out past the edge.
-        let (h, s) = (self.scale / 2, self.scale);
-        let to_real = |v: &[i32]| v[..n].iter().map(|c| c * s + h).collect::<Vec<i32>>();
+        // Scanned in real pixels, so an edge staircases at the display's own
+        // resolution rather than in logical blocks: the world fills a disc and
+        // draws its outline over it, and a coarser fill sticks out past the edge
+        // meant to cover it. A vertex is the *corner* of its block though, not
+        // the centre `line` steps between -- half-open on both axes, that covers
+        // exactly what `fill_rect` would. Centred, the shape lands half a
+        // logical pixel down and right, and the half hanging off the bottom is
+        // outside the rectangle the world thinks it painted, so the world's own
+        // repair never takes it back: one row of a window left on the desktop
+        // per frame of the animation that closes it.
+        let s = self.scale;
+        let to_real = |v: &[i32]| v[..n].iter().map(|c| c * s).collect::<Vec<i32>>();
         let (xs, ys) = (to_real(xs), to_real(ys));
         let (lo, hi) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap());
         let mut cross: Vec<i32> = vec![];
@@ -727,6 +733,17 @@ mod tests {
         c.fill_polygon(&g, &[0, 8, 0], &[0, 4, 4]);
         assert_eq!(c.at(4, 3), 0xFF0000, "the fill stepped a whole logical block");
         assert_eq!(c.at(6, 3), 0, "the fill leaked past its own edge");
+
+        // ...but still on the world's own grid: a polygon around a logical
+        // rectangle covers what `fill_rect` covers, not that shifted half a
+        // block. The half that hangs off the bottom is outside the rectangle
+        // the world repairs, so it stays on the screen -- one row of a window
+        // left behind per frame of the animation that closes it.
+        let mut poly = Canvas::scaled(8, 6, 0, 2);
+        poly.fill_polygon(&g, &[1, 6, 6, 1], &[1, 1, 4, 4]);
+        let mut rect = Canvas::scaled(8, 6, 0, 2);
+        rect.fill_rect(&g, 1, 1, 5, 3);
+        assert_eq!(poly.px, rect.px, "a polygon fill is off its logical block");
     }
 
     /// Morphic draws into a backing pixmap and copies it to the window, so a
